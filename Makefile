@@ -38,6 +38,6 @@ type-check:
 	PYTHONPATH=. uv run ty check src
 
 clean:
-	docker-compose -f dev/docker-compose.yml down -v
+	docker compose -f dev/docker-compose.yml down -v
 	rm -rf .pytest_cache .venv
 

@@ -1,15 +1,14 @@
 import logging
 import psycopg
-from pgvector.psycopg import register_vector
+from pgvector.psycopg import register_vector_async as register_vector
 from src.config import settings
 
 logger = logging.getLogger(__name__)
 
 
 async def connect_db(url: str, **kwargs):
-    """Connect to database and register pgvector."""
+    """Connect to database."""
     conn = await psycopg.AsyncConnection.connect(url, **kwargs)
-    await register_vector(conn)
     return conn
 
 
@@ -38,50 +37,66 @@ async def setup_sink():
             # Extensions
             await cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
 
+        # Register pgvector ONLY after it exists in the DB
+        await register_vector(conn)
+
+        async with conn.cursor() as cur:
             # Tables
-            await cur.execute("""
+            await cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS users (
                     id INT PRIMARY KEY,
                     email TEXT,
                     processed BOOLEAN DEFAULT FALSE
                 )
-            """)
-            await cur.execute("""
+            """
+            )
+            await cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS users_replica (
                     id INT PRIMARY KEY,
                     transformed_email TEXT,
                     embedding vector(3),
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
-            """)
+            """
+            )
 
             # Notification Trigger
-            await cur.execute("""
+            await cur.execute(
+                """
                 CREATE OR REPLACE FUNCTION notify_new_user_raw() RETURNS trigger AS $$
                 BEGIN
                     PERFORM pg_notify('new_raw_data', '');
                     RETURN NEW;
                 END;
                 $$ LANGUAGE plpgsql;
-            """)
-            await cur.execute("""
+            """
+            )
+            await cur.execute(
+                """
                 DROP TRIGGER IF EXISTS trg_new_user_raw ON users;
                 CREATE TRIGGER trg_new_user_raw 
                 AFTER INSERT OR UPDATE ON users 
                 FOR EACH ROW EXECUTE FUNCTION notify_new_user_raw();
-            """)
+            """
+            )
 
             # Subscription
             await cur.execute(
                 f"SELECT 1 FROM pg_subscription WHERE subname = '{settings.subscription_name}'"
             )
             if not await cur.fetchone():
-                logger.info(f"Creating subscription {settings.subscription_name}...")
-                await cur.execute(f"""
+                logger.info(
+                    f"Creating subscription {settings.subscription_name}..."
+                )
+                await cur.execute(
+                    f"""
                     CREATE SUBSCRIPTION {settings.subscription_name} 
                     CONNECTION '{settings.source_url}' 
                     PUBLICATION {settings.publication_name}
-                """)
+                """
+                )
             else:
                 await cur.execute(
                     f"ALTER SUBSCRIPTION {settings.subscription_name} ENABLE"

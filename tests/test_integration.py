@@ -1,5 +1,6 @@
 import pytest
 import asyncio
+from pgvector.psycopg import register_vector_async as register_vector
 from src.config import settings
 from src.database import setup_source, setup_sink, connect_db
 from src.main import process_cycle
@@ -18,6 +19,13 @@ async def test_full_replication_flow():
     # 1. Setup
     await setup_source()
     await setup_sink()
+
+    # Clean up from previous runs
+    async with await connect_db(settings.source_url, autocommit=True) as conn:
+        await conn.execute("TRUNCATE TABLE users CASCADE")
+    async with await connect_db(settings.sink_url, autocommit=True) as conn:
+        await conn.execute("TRUNCATE TABLE users CASCADE")
+        await conn.execute("TRUNCATE TABLE users_replica CASCADE")
 
     # 2. Insert test data into Source
     async with await connect_db(settings.source_url, autocommit=True) as conn:
@@ -48,6 +56,7 @@ async def test_full_replication_flow():
 
     # 5. Verify transformed data in Sink users_replica
     async with await connect_db(settings.sink_url) as conn:
+        await register_vector(conn)
         async with conn.cursor() as cur:
             await cur.execute(
                 "SELECT transformed_email, embedding FROM users_replica WHERE id = (SELECT id FROM users WHERE email = 'TEST@INTEGRATION.COM')"

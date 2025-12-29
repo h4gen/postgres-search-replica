@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import signal
+from pgvector.psycopg import register_vector_async as register_vector
 from src.config import settings
 from src.database import (
     setup_source,
@@ -23,6 +24,7 @@ async def process_cycle():
     """Single cycle of transformation and movement."""
     try:
         async with await connect_db(settings.sink_url, autocommit=True) as conn:
+            await register_vector(conn)
             rows = await get_unprocessed_rows(conn)
             if not rows:
                 return
@@ -54,6 +56,7 @@ async def run_daemon():
 
     async def notification_worker():
         async with await connect_db(settings.sink_url, autocommit=True) as conn:
+            await register_vector(conn)
             await conn.execute("LISTEN new_raw_data")
             async for _ in conn.notifies():
                 await process_cycle()
