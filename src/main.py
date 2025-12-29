@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import signal
-import psycopg
 from src.config import settings
 from src.database import (
     setup_source,
@@ -10,6 +9,7 @@ from src.database import (
     get_unprocessed_rows,
     mark_rows_processed,
     upsert_replica_batch,
+    connect_db,
 )
 from src.transformer import transform_user_data
 
@@ -22,9 +22,7 @@ logger = logging.getLogger(__name__)
 async def process_cycle():
     """Single cycle of transformation and movement."""
     try:
-        async with await psycopg.AsyncConnection.connect(
-            settings.sink_url, autocommit=True
-        ) as conn:
+        async with await connect_db(settings.sink_url, autocommit=True) as conn:
             rows = await get_unprocessed_rows(conn)
             if not rows:
                 return
@@ -55,9 +53,7 @@ async def run_daemon():
     stop_event = asyncio.Event()
 
     async def notification_worker():
-        async with await psycopg.AsyncConnection.connect(
-            settings.sink_url, autocommit=True
-        ) as conn:
+        async with await connect_db(settings.sink_url, autocommit=True) as conn:
             await conn.execute("LISTEN new_raw_data")
             async for _ in conn.notifies():
                 await process_cycle()
