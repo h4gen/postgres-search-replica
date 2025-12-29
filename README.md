@@ -19,18 +19,30 @@ We use a `Makefile` to encapsulate best practices and common tasks.
 
 ### Common Commands
 - `make dev` - Spin up the local development environment (Source + Sink + Daemon).
+- `make test` - Run both unit and integration tests.
 - `make test-unit` - Run fast unit tests for transformation logic.
 - `make test-integration` - Run full end-to-end replication tests (requires `make dev`).
+- `make lint` - Run `ruff` linter and formatter checks.
+- `make type-check` - Run `ty` type checker for Python type safety.
 - `make down` - Stop the dev environment.
-- `make clean` - Full cleanup including database volumes.
+- `make clean` - Full cleanup including database volumes and temporary files.
 
 ## Configuration
 
-Settings are managed via Pydantic and can be overridden by environment variables or a `.env` file. See `src/config.py` for all available options.
+Settings are managed via Pydantic and can be overridden by environment variables, a `.env` file, or a `.env.development` file. Key options:
+- `SOURCE_URL`: URL of the source PostgreSQL database.
+- `SINK_URL`: URL of the sink PostgreSQL database.
+- `PUBLICATION_NAME`: PostgreSQL publication name (default: `pub_users`).
+- `SUBSCRIPTION_NAME`: PostgreSQL subscription name (default: `sub_users`).
+- `BATCH_SIZE`: Number of rows to process in one transformation cycle (default: `50`).
 
-## Testing
+See `src/config.py` for all available options and defaults.
 
-The project uses `pytest` with a clear separation between:
-- **Unit Tests**: Test the Polars logic in isolation.
-- **Integration Tests**: Verify the actual WAL replication flow between two database instances.
+## CI/CD
+
+The project includes a GitHub Actions workflow (`.github/workflows/ci.yml`) that:
+- Starts the full infrastructure using `make dev`.
+- Waits for databases to be ready using `pg_isready`.
+- Runs the complete test suite (`unit` and `integration`).
+- Performs automated cleanup.
 
