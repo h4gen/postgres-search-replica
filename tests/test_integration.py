@@ -2,7 +2,7 @@ import pytest
 import asyncio
 from pgvector.psycopg import register_vector_async as register_vector
 from src.config import settings
-from src.database import setup_source, setup_sink, connect_db
+from src.database import connect_db
 from src.main import process_cycle
 
 

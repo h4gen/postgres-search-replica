@@ -21,11 +21,12 @@ async def setup_source():
                 f"SELECT 1 FROM pg_publication WHERE pubname = '{settings.publication_name}'"
             )
             if not await cur.fetchone():
+                cols = ", ".join(settings.publication_columns)
                 logger.info(
-                    f"Creating publication {settings.publication_name} on Source..."
+                    f"Creating publication {settings.publication_name} on Source for columns ({cols})..."
                 )
                 await cur.execute(
-                    f"CREATE PUBLICATION {settings.publication_name} FOR TABLE users (id, email)"
+                    f"CREATE PUBLICATION {settings.publication_name} FOR TABLE users ({cols})"
                 )
 
 
@@ -117,8 +118,9 @@ async def disable_subscription():
 
 async def get_unprocessed_rows(conn):
     """Fetch rows from users that haven't been transformed yet."""
+    cols = ", ".join(settings.publication_columns)
     async with conn.cursor() as cur:
-        await cur.execute("SELECT id, email FROM users WHERE processed = FALSE")
+        await cur.execute(f"SELECT {cols} FROM users WHERE processed = FALSE")
         return await cur.fetchall()
 
 

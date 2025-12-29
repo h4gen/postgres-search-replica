@@ -5,6 +5,7 @@ class Settings(BaseSettings):
     source_url: str
     sink_url: str
     publication_name: str = "pub_users"
+    publication_columns: list[str] = ["id", "email"]
     subscription_name: str = "sub_users"
     batch_size: int = 50
 
