@@ -14,11 +14,13 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uv/bin/uv
 WORKDIR /app
 
 # Copy dependency files
-COPY pyproject.toml .
+COPY pyproject.toml uv.lock ./
 
 # Use uv to manage the environment
-# uv sync will create a .venv in the working directory
-RUN /uv/bin/uv sync
+RUN /uv/bin/uv sync --frozen
+
+# Set PYTHONPATH to include the app directory
+ENV PYTHONPATH=/app
 
 # Copy source code and entrypoint
 COPY src/ ./src/
@@ -27,4 +29,3 @@ RUN chmod +x entrypoint.sh
 
 # Set the entrypoint
 ENTRYPOINT ["./entrypoint.sh"]
-

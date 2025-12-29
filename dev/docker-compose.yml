@@ -7,20 +7,21 @@ services:
     # Enable logical replication on the source
     command: ["postgres", "-c", "wal_level=logical"]
     volumes:
-      - ./source/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./source_mock.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
       - "5433:5432"
 
   sink:
     build: 
-      context: ./sink
+      context: ..
+      dockerfile: Dockerfile
     environment:
       POSTGRES_PASSWORD: password
       POSTGRES_DB: search_replica_db
+      # Using the container names in the same network
       SOURCE_URL: postgresql://postgres:password@source:5432/production_db
       SINK_URL: postgresql://postgres:password@localhost:5432/search_replica_db
     depends_on:
       - source
     ports:
       - "5434:5432"
-
