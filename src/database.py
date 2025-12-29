@@ -112,7 +112,10 @@ async def setup_sink():
             )
             if not await cur.fetchone():
                 options = ", ".join(
-                    [f"{k} = {v}" for k, v in settings.subscription_options.items()]
+                    [
+                        f"{k} = {v}"
+                        for k, v in settings.subscription_options.items()
+                    ]
                 )
                 logger.info(
                     f"Creating subscription {settings.subscription_name} WITH ({options})..."
@@ -126,7 +129,9 @@ async def setup_sink():
                 """
                 )
             else:
-                logger.info(f"Refreshing subscription {settings.subscription_name}...")
+                logger.info(
+                    f"Refreshing subscription {settings.subscription_name}..."
+                )
                 await cur.execute(
                     f"ALTER SUBSCRIPTION {settings.subscription_name} ENABLE"
                 )
@@ -177,7 +182,9 @@ async def check_and_protect_source():
                             "Emergency shutdown: Dropping subscription to protect Source DB disk space."
                         )
                         await drop_subscription_completely()
-                        raise RuntimeError("Self-destructed to protect Source DB.")
+                        raise RuntimeError(
+                            "Self-destructed to protect Source DB."
+                        )
                     elif lag_mb > (settings.max_slot_wal_keep_size_mb * 0.8):
                         logger.warning(
                             f"High replication lag detected: {lag_mb:.1f} MB (Limit: {settings.max_slot_wal_keep_size_mb} MB)"
@@ -195,7 +202,7 @@ async def get_unprocessed_rows(conn):
     cols = ", ".join(settings.publication_columns)
     async with conn.cursor() as cur:
         await cur.execute(
-            f"SELECT {cols} FROM {settings.sink_raw_table} WHERE processed = FALSE LIMIT %s",
+            f"SELECT {cols} FROM {settings.sink_raw_table} WHERE processed = FALSE FOR UPDATE SKIP LOCKED LIMIT %s",
             (settings.batch_size,),
         )
         return await cur.fetchall()

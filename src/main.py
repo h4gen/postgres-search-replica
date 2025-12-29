@@ -25,26 +25,32 @@ logger = logging.getLogger(__name__)
 async def process_cycle():
     """Single cycle of transformation and movement."""
     try:
-        async with await connect_db(settings.sink_url, autocommit=True) as conn:
-            await register_vector(conn)
+        # Phase 1: Fetch (Fast, short lock)
+        async with await connect_db(settings.sink_url) as conn:
             rows = await get_unprocessed_rows(conn)
             if not rows:
                 return
 
-            # Transform (isolated logic)
-            batch = transform_data(rows)
+        # Phase 2: Transform (Slow, external APIs, NO DB connection held)
+        batch = transform_data(rows)
 
-            # Upsert & Mark
-            await upsert_replica_batch(conn, batch)
-            ids = [r[settings.id_column] for r in batch]
-            await mark_rows_processed(conn, ids)
+        # Phase 3: Atomic Commit (Fast)
+        async with await connect_db(settings.sink_url) as conn:
+            await register_vector(conn)
+            async with conn.transaction():
+                # Upsert and Mark processed succeed or fail together
+                await upsert_replica_batch(conn, batch)
+                ids = [r[settings.id_column] for r in batch]
+                await mark_rows_processed(conn, ids)
 
             logger.info(f"Successfully processed {len(batch)} rows.")
     except Exception as e:
         logger.error(f"Error in processing cycle: {e}")
 
 
-async def run_daemon(loop: asyncio.AbstractEventLoop, handle_exit: Callable[[], None]):
+async def run_daemon(
+    loop: asyncio.AbstractEventLoop, handle_exit: Callable[[], None]
+):
     """Main loop for the replicator daemon."""
     await setup_source()
     await setup_sink()
@@ -58,7 +64,6 @@ async def run_daemon(loop: asyncio.AbstractEventLoop, handle_exit: Callable[[], 
 
     async def notification_worker():
         async with await connect_db(settings.sink_url, autocommit=True) as conn:
-            await register_vector(conn)
             await conn.execute(f"LISTEN {settings.notify_channel}")
             async for _ in conn.notifies():
                 await process_cycle()
