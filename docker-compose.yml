@@ -1,0 +1,26 @@
+services:
+  source:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: production_db
+    # Enable logical replication on the source
+    command: ["postgres", "-c", "wal_level=logical"]
+    volumes:
+      - ./source/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5433:5432"
+
+  sink:
+    build: 
+      context: ./sink
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: search_replica_db
+      SOURCE_URL: postgresql://postgres:password@source:5432/production_db
+      SINK_URL: postgresql://postgres:password@localhost:5432/search_replica_db
+    depends_on:
+      - source
+    ports:
+      - "5434:5432"
+
