@@ -11,6 +11,7 @@ from src.database import (
     mark_rows_processed,
     upsert_replica_batch,
     connect_db,
+    check_and_protect_source,
 )
 from src.transformer import transform_user_data
 
@@ -65,7 +66,19 @@ async def run_daemon():
 
     async def polling_worker():
         while not stop_event.is_set():
-            await process_cycle()
+            try:
+                # Watchdog: Protect source from lag
+                await check_and_protect_source()
+                await process_cycle()
+            except RuntimeError as e:
+                if "Self-destructed" in str(e):
+                    logger.critical(f"Daemon stopping: {e}")
+                    stop_event.set()
+                    # Trigger shutdown of the other task
+                    loop.call_soon(handle_exit)
+                    break
+            except Exception as e:
+                logger.error(f"Error in polling worker: {e}")
             await asyncio.sleep(30)  # Polling every 30s as fallback
 
     try:

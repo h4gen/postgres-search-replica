@@ -152,6 +152,51 @@ async def drop_subscription_completely():
         logger.warning(f"Failed to drop subscription: {e}")
 
 
+async def check_and_protect_source():
+    """
+    Monitor replication lag on Source and self-destruct if it exceeds safety limits.
+    Returns True if safe, raises Exception if self-destruct triggered.
+    """
+    try:
+        async with await connect_db(settings.source_url) as conn:
+            async with conn.cursor() as cur:
+                # Query lag for our specific slot
+                # We use pg_wal_lsn_diff to get bytes between current WAL and slot's restart_lsn
+                await cur.execute(
+                    """
+                    SELECT 
+                        pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) / 1024 / 1024 as lag_mb
+                    FROM pg_replication_slots 
+                    WHERE slot_name = %s
+                """,
+                    (settings.subscription_name,),
+                )
+                res = await cur.fetchone()
+                if res:
+                    lag_mb = res[0]
+                    if lag_mb > settings.max_slot_wal_keep_size_mb:
+                        logger.critical(
+                            f"REPLICATION LAG ({lag_mb:.1f} MB) EXCEEDED SAFETY LIMIT ({settings.max_slot_wal_keep_size_mb} MB)!"
+                        )
+                        logger.critical(
+                            "Emergency shutdown: Dropping subscription to protect Source DB disk space."
+                        )
+                        await drop_subscription_completely()
+                        raise RuntimeError(
+                            "Self-destructed to protect Source DB."
+                        )
+                    elif lag_mb > (settings.max_slot_wal_keep_size_mb * 0.8):
+                        logger.warning(
+                            f"High replication lag detected: {lag_mb:.1f} MB (Limit: {settings.max_slot_wal_keep_size_mb} MB)"
+                        )
+        return True
+    except Exception as e:
+        if "Self-destructed" in str(e):
+            raise
+        logger.warning(f"Failed to check replication lag: {e}")
+        return True
+
+
 async def get_unprocessed_rows(conn):
     """Fetch rows from users that haven't been transformed yet."""
     cols = ", ".join(settings.publication_columns)

@@ -8,6 +8,13 @@ A professional-grade PostgreSQL read replica with real-time Polars transformatio
 - **Async Python**: A robust daemon using `psycopg3` async notifications.
 - **Polars**: High-performance, type-safe data transformations.
 - **pgvector**: Integrated vector storage for search embeddings.
+- **PG 15 Row Filtering**: Selective replication to minimize network traffic and processing load.
+
+## Key Features (Enterprise Ready)
+
+- **Source Protection (Self-Cleaning)**: The replicator automatically drops its subscription and slot upon graceful shutdown (`SIGTERM`/`SIGINT`), ensuring the Source DB never accumulates WAL logs or runs out of disk space.
+- **Smart Reconciliation**: Only updates embeddings and timestamps if the source data has actually changed, significantly reducing Sink DB load.
+- **Zero-Touch Config**: Automatically synchronizes publication columns and filters from Python settings to the database on startup.
 
 ## Development
 
@@ -33,8 +40,12 @@ Settings are managed via Pydantic and can be overridden by environment variables
 - `SOURCE_URL`: URL of the source PostgreSQL database.
 - `SINK_URL`: URL of the sink PostgreSQL database.
 - `PUBLICATION_NAME`: PostgreSQL publication name (default: `pub_users`).
+- `PUBLICATION_COLUMNS`: List of columns to replicate (default: None).
+- `PUBLICATION_WHERE`: Optional PG 15 row filter clause (e.g., `id > 100`).
 - `SUBSCRIPTION_NAME`: PostgreSQL subscription name (default: `sub_users`).
+- `SUBSCRIPTION_OPTIONS`: Dict of subscription parameters (e.g., `{"streaming": "'on'"}`).
 - `BATCH_SIZE`: Number of rows to process in one transformation cycle (default: `50`).
+- `MAX_SLOT_WAL_KEEP_SIZE_MB`: Safety limit for WAL retention on the Source (default: `1024`).
 
 See `src/config.py` for all available options and defaults.
 
