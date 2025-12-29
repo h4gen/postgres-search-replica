@@ -32,14 +32,14 @@ async def setup_source():
                     f"Creating publication {settings.publication_name} on Source for columns ({cols}){where_clause}..."
                 )
                 await cur.execute(
-                    f"CREATE PUBLICATION {settings.publication_name} FOR TABLE users ({cols}){where_clause}"
+                    f"CREATE PUBLICATION {settings.publication_name} FOR TABLE {settings.source_table} ({cols}){where_clause}"
                 )
             else:
                 logger.info(
                     f"Syncing publication {settings.publication_name} with columns ({cols}){where_clause}..."
                 )
                 await cur.execute(
-                    f"ALTER PUBLICATION {settings.publication_name} SET TABLE users ({cols}){where_clause}"
+                    f"ALTER PUBLICATION {settings.publication_name} SET TABLE {settings.source_table} ({cols}){where_clause}"
                 )
 
 
@@ -57,21 +57,21 @@ async def setup_sink():
         async with conn.cursor() as cur:
             # Tables
             await cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    id INT PRIMARY KEY,
-                    email TEXT,
+                f"""
+                CREATE TABLE IF NOT EXISTS {settings.sink_raw_table} (
+                    {settings.id_column} INT PRIMARY KEY,
+                    {settings.content_column} TEXT,
                     processed BOOLEAN DEFAULT FALSE
                 )
             """
             )
 
             await cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users_replica (
-                    id INT PRIMARY KEY,
-                    transformed_email TEXT,
-                    embedding vector(3),
+                f"""
+                CREATE TABLE IF NOT EXISTS {settings.sink_replica_table} (
+                    {settings.id_column} INT PRIMARY KEY,
+                    {settings.target_content_column} TEXT,
+                    {settings.embedding_column} vector({settings.embedding_dimension}),
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """
@@ -79,30 +79,30 @@ async def setup_sink():
 
             # Notification Trigger
             await cur.execute(
-                """
-                CREATE OR REPLACE FUNCTION notify_new_user_raw() RETURNS trigger AS $$
+                f"""
+                CREATE OR REPLACE FUNCTION notify_new_raw_data() RETURNS trigger AS $$
                 BEGIN
                     IF (TG_OP = 'UPDATE') THEN
                         -- Only reset if actual data changed
-                        IF (OLD.email IS DISTINCT FROM NEW.email) THEN
+                        IF (OLD.{settings.content_column} IS DISTINCT FROM NEW.{settings.content_column}) THEN
                             NEW.processed := FALSE;
                         END IF;
                     END IF;
-                    PERFORM pg_notify('new_raw_data', '');
+                    PERFORM pg_notify('{settings.notify_channel}', '');
                     RETURN NEW;
                 END;
                 $$ LANGUAGE plpgsql;
             """
             )
             await cur.execute(
-                """
-                DROP TRIGGER IF EXISTS trg_new_user_raw ON users;
-                CREATE TRIGGER trg_new_user_raw 
-                BEFORE INSERT OR UPDATE ON users 
-                FOR EACH ROW EXECUTE FUNCTION notify_new_user_raw();
+                f"""
+                DROP TRIGGER IF EXISTS trg_new_raw_data ON {settings.sink_raw_table};
+                CREATE TRIGGER trg_new_raw_data 
+                BEFORE INSERT OR UPDATE ON {settings.sink_raw_table} 
+                FOR EACH ROW EXECUTE FUNCTION notify_new_raw_data();
                 
                 -- Ensure trigger fires even for native replication
-                ALTER TABLE users ENABLE ALWAYS TRIGGER trg_new_user_raw;
+                ALTER TABLE {settings.sink_raw_table} ENABLE ALWAYS TRIGGER trg_new_raw_data;
             """
             )
 
@@ -112,10 +112,7 @@ async def setup_sink():
             )
             if not await cur.fetchone():
                 options = ", ".join(
-                    [
-                        f"{k} = {v}"
-                        for k, v in settings.subscription_options.items()
-                    ]
+                    [f"{k} = {v}" for k, v in settings.subscription_options.items()]
                 )
                 logger.info(
                     f"Creating subscription {settings.subscription_name} WITH ({options})..."
@@ -129,9 +126,7 @@ async def setup_sink():
                 """
                 )
             else:
-                logger.info(
-                    f"Refreshing subscription {settings.subscription_name}..."
-                )
+                logger.info(f"Refreshing subscription {settings.subscription_name}...")
                 await cur.execute(
                     f"ALTER SUBSCRIPTION {settings.subscription_name} ENABLE"
                 )
@@ -182,9 +177,7 @@ async def check_and_protect_source():
                             "Emergency shutdown: Dropping subscription to protect Source DB disk space."
                         )
                         await drop_subscription_completely()
-                        raise RuntimeError(
-                            "Self-destructed to protect Source DB."
-                        )
+                        raise RuntimeError("Self-destructed to protect Source DB.")
                     elif lag_mb > (settings.max_slot_wal_keep_size_mb * 0.8):
                         logger.warning(
                             f"High replication lag detected: {lag_mb:.1f} MB (Limit: {settings.max_slot_wal_keep_size_mb} MB)"
@@ -198,10 +191,13 @@ async def check_and_protect_source():
 
 
 async def get_unprocessed_rows(conn):
-    """Fetch rows from users that haven't been transformed yet."""
+    """Fetch rows from raw sink table that haven't been transformed yet."""
     cols = ", ".join(settings.publication_columns)
     async with conn.cursor() as cur:
-        await cur.execute(f"SELECT {cols} FROM users WHERE processed = FALSE")
+        await cur.execute(
+            f"SELECT {cols} FROM {settings.sink_raw_table} WHERE processed = FALSE LIMIT %s",
+            (settings.batch_size,),
+        )
         return await cur.fetchall()
 
 
@@ -209,7 +205,8 @@ async def mark_rows_processed(conn, ids):
     """Mark a batch of rows as processed in the raw table."""
     async with conn.cursor() as cur:
         await cur.execute(
-            "UPDATE users SET processed = TRUE WHERE id = ANY(%s)", (ids,)
+            f"UPDATE {settings.sink_raw_table} SET processed = TRUE WHERE {settings.id_column} = ANY(%s)",
+            (ids,),
         )
 
 
@@ -217,14 +214,14 @@ async def upsert_replica_batch(conn, batch):
     """Perform a bulk upsert into the final replica table."""
     async with conn.cursor() as cur:
         await cur.executemany(
-            """
-            INSERT INTO users_replica (id, transformed_email, embedding, updated_at)
-            VALUES (%(id)s, %(transformed_email)s, %(embedding)s, CURRENT_TIMESTAMP)
-            ON CONFLICT (id) DO UPDATE SET
-                transformed_email = EXCLUDED.transformed_email,
-                embedding = EXCLUDED.embedding,
+            f"""
+            INSERT INTO {settings.sink_replica_table} ({settings.id_column}, {settings.target_content_column}, {settings.embedding_column}, updated_at)
+            VALUES (%({settings.id_column})s, %({settings.target_content_column})s, %({settings.embedding_column})s, CURRENT_TIMESTAMP)
+            ON CONFLICT ({settings.id_column}) DO UPDATE SET
+                {settings.target_content_column} = EXCLUDED.{settings.target_content_column},
+                {settings.embedding_column} = EXCLUDED.{settings.embedding_column},
                 updated_at = EXCLUDED.updated_at
-            WHERE users_replica.transformed_email IS DISTINCT FROM EXCLUDED.transformed_email
+            WHERE {settings.sink_replica_table}.{settings.target_content_column} IS DISTINCT FROM EXCLUDED.{settings.target_content_column}
         """,
             batch,
         )

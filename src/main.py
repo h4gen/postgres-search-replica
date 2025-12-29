@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import signal
+from typing import Callable
 from pgvector.psycopg import register_vector_async as register_vector  # type: ignore
 from src.config import settings
 from src.database import (
@@ -13,7 +14,7 @@ from src.database import (
     connect_db,
     check_and_protect_source,
 )
-from src.transformer import transform_user_data
+from src.transformer import transform_data
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -31,11 +32,11 @@ async def process_cycle():
                 return
 
             # Transform (isolated logic)
-            batch = transform_user_data(rows)
+            batch = transform_data(rows)
 
             # Upsert & Mark
             await upsert_replica_batch(conn, batch)
-            ids = [r["id"] for r in batch]
+            ids = [r[settings.id_column] for r in batch]
             await mark_rows_processed(conn, ids)
 
             logger.info(f"Successfully processed {len(batch)} rows.")
@@ -43,7 +44,9 @@ async def process_cycle():
         logger.error(f"Error in processing cycle: {e}")
 
 
-async def run_daemon():
+async def run_daemon(
+    loop: asyncio.AbstractEventLoop, handle_exit: Callable[[], None]
+):
     """Main loop for the replicator daemon."""
     await setup_source()
     await setup_sink()
@@ -58,7 +61,7 @@ async def run_daemon():
     async def notification_worker():
         async with await connect_db(settings.sink_url, autocommit=True) as conn:
             await register_vector(conn)
-            await conn.execute("LISTEN new_raw_data")
+            await conn.execute(f"LISTEN {settings.notify_channel}")
             async for _ in conn.notifies():
                 await process_cycle()
                 if stop_event.is_set():
@@ -95,11 +98,11 @@ async def main():
     await setup_source()
     await setup_sink()
 
-    task = asyncio.create_task(run_daemon())
-
     def handle_exit():
         logger.info("Shutdown signal received...")
         task.cancel()
+
+    task = asyncio.create_task(run_daemon(loop, handle_exit))
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, handle_exit)

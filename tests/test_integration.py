@@ -17,9 +17,9 @@ def get_internal_source_url():
 async def test_full_replication_flow():
     """
     Integration test:
-    1. Wait for native replication to Sink (users table)
+    1. Wait for native replication to Sink (raw table)
     2. Run process_cycle()
-    3. Verify data in users_replica
+    3. Verify data in replica table
     """
     from src.database import setup_source, setup_sink
 
@@ -27,7 +27,6 @@ async def test_full_replication_flow():
     await setup_source()
 
     # setup_sink creates subscription on container -> needs 'source' hostname
-    # We patch settings.source_url only for this call
     from unittest.mock import patch
 
     with patch.object(settings, "source_url", get_internal_source_url()):
@@ -35,64 +34,64 @@ async def test_full_replication_flow():
 
     # Clean up from previous runs
     async with await connect_db(settings.source_url, autocommit=True) as conn:
-        await conn.execute("TRUNCATE TABLE users CASCADE")
+        await conn.execute(f"TRUNCATE TABLE {settings.source_table} CASCADE")
     async with await connect_db(settings.sink_url, autocommit=True) as conn:
-        await conn.execute("TRUNCATE TABLE users CASCADE")
-        await conn.execute("TRUNCATE TABLE users_replica CASCADE")
+        await conn.execute(f"TRUNCATE TABLE {settings.sink_raw_table} CASCADE")
+        await conn.execute(f"TRUNCATE TABLE {settings.sink_replica_table} CASCADE")
 
     # 2. Insert test data into Source
     async with await connect_db(settings.source_url, autocommit=True) as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO users (name, email) VALUES ('Test User', 'TEST@INTEGRATION.COM')"
+                f"INSERT INTO {settings.source_table} (name, {settings.content_column}) VALUES ('Test User', 'TEST@INTEGRATION.COM')"
             )
 
-    # 3. Wait for native replication (Postgres -> Postgres)
-    # We poll the 'users' table in the Sink
+    # 3. Wait for native replication
     max_retries = 10
     found = False
     async with await connect_db(settings.sink_url) as conn:
         for _ in range(max_retries):
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT 1 FROM users WHERE email = 'TEST@INTEGRATION.COM'"
+                    f"SELECT 1 FROM {settings.sink_raw_table} WHERE {settings.content_column} = 'TEST@INTEGRATION.COM'"
                 )
                 if await cur.fetchone():
                     found = True
                     break
             await asyncio.sleep(1)
 
-    assert found, "Native replication failed to move data to Sink 'users' table"
+    assert found, (
+        f"Native replication failed to move data to Sink {settings.sink_raw_table} table"
+    )
 
     # 4. Run transformation cycle
     await process_cycle()
 
-    # 5. Verify transformed data in Sink users_replica
+    # 5. Verify transformed data in Sink replica table
     async with await connect_db(settings.sink_url) as conn:
         await register_vector(conn)
         async with conn.cursor() as cur:
             await cur.execute(
-                "SELECT transformed_email, embedding FROM users_replica WHERE id = (SELECT id FROM users WHERE email = 'TEST@INTEGRATION.COM')"
+                f"SELECT {settings.target_content_column}, {settings.embedding_column} FROM {settings.sink_replica_table} WHERE {settings.id_column} = (SELECT {settings.id_column} FROM {settings.sink_raw_table} WHERE {settings.content_column} = 'TEST@INTEGRATION.COM')"
             )
             row = await cur.fetchone()
 
             assert row is not None
-            assert row[0] == "test@masked-replica.com"
-            # Now that we use register_vector, row[1] should be a list/numpy array
-            assert len(row[1]) == 3  # Our dummy embedding size
+            assert row[0] == "test@integration.com"
+            assert len(row[1]) == settings.embedding_dimension
 
 
 @pytest.mark.asyncio
 async def test_filtered_replication_flow():
     """
     Test PG 15 Row Filtering:
-    1. Set filter to only replicate users with email containing 'KEEP'
+    1. Set filter to only replicate users with content containing 'KEEP'
     2. Insert matching and non-matching data
     3. Verify only matching data arrived
     """
     # Override settings for this test
     original_filter = settings.publication_where
-    settings.publication_where = "email LIKE '%KEEP%'"
+    settings.publication_where = f"{settings.content_column} LIKE '%KEEP%'"
 
     try:
         from src.database import setup_source, setup_sink
@@ -106,23 +105,19 @@ async def test_filtered_replication_flow():
             await setup_sink()
 
         # Clean up
-        async with await connect_db(
-            settings.source_url, autocommit=True
-        ) as conn:
-            await conn.execute("TRUNCATE TABLE users CASCADE")
+        async with await connect_db(settings.source_url, autocommit=True) as conn:
+            await conn.execute(f"TRUNCATE TABLE {settings.source_table} CASCADE")
         async with await connect_db(settings.sink_url, autocommit=True) as conn:
-            await conn.execute("TRUNCATE TABLE users CASCADE")
+            await conn.execute(f"TRUNCATE TABLE {settings.sink_raw_table} CASCADE")
 
         # Insert matching and non-matching data
-        async with await connect_db(
-            settings.source_url, autocommit=True
-        ) as conn:
+        async with await connect_db(settings.source_url, autocommit=True) as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "INSERT INTO users (name, email) VALUES ('Keep Me', 'KEEP@ME.COM')"
+                    f"INSERT INTO {settings.source_table} (name, {settings.content_column}) VALUES ('Keep Me', 'KEEP@ME.COM')"
                 )
                 await cur.execute(
-                    "INSERT INTO users (name, email) VALUES ('Ignore Me', 'IGNORE@ME.COM')"
+                    f"INSERT INTO {settings.source_table} (name, {settings.content_column}) VALUES ('Ignore Me', 'IGNORE@ME.COM')"
                 )
 
         # Wait and verify
@@ -132,7 +127,7 @@ async def test_filtered_replication_flow():
             for _ in range(10):
                 async with conn.cursor() as cur:
                     await cur.execute(
-                        "SELECT 1 FROM users WHERE email = 'KEEP@ME.COM'"
+                        f"SELECT 1 FROM {settings.sink_raw_table} WHERE {settings.content_column} = 'KEEP@ME.COM'"
                     )
                     if await cur.fetchone():
                         found_keep = True
@@ -144,11 +139,9 @@ async def test_filtered_replication_flow():
             # Verify non-matching one is NOT there
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT 1 FROM users WHERE email = 'IGNORE@ME.COM'"
+                    f"SELECT 1 FROM {settings.sink_raw_table} WHERE {settings.content_column} = 'IGNORE@ME.COM'"
                 )
-                assert (
-                    await cur.fetchone() is None
-                ), "Non-matching data was replicated"
+                assert await cur.fetchone() is None, "Non-matching data was replicated"
 
     finally:
         # Restore original filter and reset DB
@@ -156,7 +149,11 @@ async def test_filtered_replication_flow():
         from src.database import setup_source, setup_sink
 
         await setup_source()
-        await setup_sink()
+        # setup_sink needs 'source' hostname for the subscription CONNECTION string
+        from unittest.mock import patch
+
+        with patch.object(settings, "source_url", get_internal_source_url()):
+            await setup_sink()
 
 
 @pytest.mark.asyncio
@@ -184,24 +181,24 @@ async def test_reconciliation_efficiency():
         await setup_sink()
 
     async with await connect_db(settings.source_url, autocommit=True) as conn:
-        await conn.execute("TRUNCATE TABLE users CASCADE")
+        await conn.execute(f"TRUNCATE TABLE {settings.source_table} CASCADE")
     async with await connect_db(settings.sink_url, autocommit=True) as conn:
-        await conn.execute("TRUNCATE TABLE users_replica CASCADE")
+        await conn.execute(f"TRUNCATE TABLE {settings.sink_replica_table} CASCADE")
         # Disable trigger again to be absolutely sure the daemon doesn't touch it
-        await conn.execute("ALTER TABLE users DISABLE TRIGGER trg_new_user_raw")
+        await conn.execute(
+            f"ALTER TABLE {settings.sink_raw_table} DISABLE TRIGGER trg_new_raw_data"
+        )
 
     try:
         # 2. Insert and process
-        async with await connect_db(
-            settings.source_url, autocommit=True
-        ) as conn:
+        async with await connect_db(settings.source_url, autocommit=True) as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "INSERT INTO users (name, email) VALUES ('Stable User', 'stable@test.com') RETURNING id"
+                    f"INSERT INTO {settings.source_table} (name, {settings.content_column}) VALUES ('Stable User', 'stable@test.com') RETURNING {settings.id_column}"
                 )
                 res = await cur.fetchone()
                 assert res is not None
-                user_id = res[0]
+                record_id = res[0]
 
         # Wait for replication to raw table
         max_retries = 10
@@ -210,7 +207,8 @@ async def test_reconciliation_efficiency():
             async with await connect_db(settings.sink_url) as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(
-                        "SELECT 1 FROM users WHERE id = %s", (user_id,)
+                        f"SELECT 1 FROM {settings.sink_raw_table} WHERE {settings.id_column} = %s",
+                        (record_id,),
                     )
                     if await cur.fetchone():
                         found = True
@@ -221,7 +219,8 @@ async def test_reconciliation_efficiency():
         # Make sure processed is FALSE before we run cycle
         async with await connect_db(settings.sink_url, autocommit=True) as conn:
             await conn.execute(
-                "UPDATE users SET processed = FALSE WHERE id = %s", (user_id,)
+                f"UPDATE {settings.sink_raw_table} SET processed = FALSE WHERE {settings.id_column} = %s",
+                (record_id,),
             )
 
         await process_cycle()
@@ -230,21 +229,21 @@ async def test_reconciliation_efficiency():
         async with await connect_db(settings.sink_url) as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT updated_at, embedding, transformed_email FROM users_replica WHERE id = %s",
-                    (user_id,),
+                    f"SELECT updated_at, {settings.embedding_column}, {settings.target_content_column} FROM {settings.sink_replica_table} WHERE {settings.id_column} = %s",
+                    (record_id,),
                 )
                 row1 = await cur.fetchone()
                 assert row1 is not None
-                ts1, emb1, email1 = row1
+                ts1, emb1, content1 = row1
 
         # 4. Simulate a restart/re-processing (TRUNCATE raw + Re-insert same data)
         async with await connect_db(settings.sink_url, autocommit=True) as conn:
             async with conn.cursor() as cur:
-                await cur.execute("TRUNCATE TABLE users")
+                await cur.execute(f"TRUNCATE TABLE {settings.sink_raw_table}")
                 # We insert the data exactly as it was on the Source
                 await cur.execute(
-                    "INSERT INTO users (id, email, processed) VALUES (%s, %s, FALSE)",
-                    (user_id, "stable@test.com"),
+                    f"INSERT INTO {settings.sink_raw_table} ({settings.id_column}, {settings.content_column}, processed) VALUES (%s, %s, FALSE)",
+                    (record_id, "stable@test.com"),
                 )
 
         # Process manually
@@ -254,28 +253,24 @@ async def test_reconciliation_efficiency():
         async with await connect_db(settings.sink_url) as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT updated_at, embedding, transformed_email FROM users_replica WHERE id = %s",
-                    (user_id,),
+                    f"SELECT updated_at, {settings.embedding_column}, {settings.target_content_column} FROM {settings.sink_replica_table} WHERE {settings.id_column} = %s",
+                    (record_id,),
                 )
                 row2 = await cur.fetchone()
                 assert row2 is not None
-                ts2, emb2, email2 = row2
+                ts2, emb2, content2 = row2
 
-                assert (
-                    email1 == email2
-                ), f"Email changed! '{email1}' != '{email2}'"
+                assert content1 == content2, (
+                    f"Content changed! '{content1}' != '{content2}'"
+                )
                 assert ts1 == ts2, f"Timestamp changed! {ts1} != {ts2}"
-                assert list(emb1) == list(
-                    emb2
-                ), "Embedding changed for identical data!"
+                assert list(emb1) == list(emb2), "Embedding changed for identical data!"
 
         # 6. Update Source and re-process
-        async with await connect_db(
-            settings.source_url, autocommit=True
-        ) as conn:
+        async with await connect_db(settings.source_url, autocommit=True) as conn:
             await conn.execute(
-                "UPDATE users SET email = 'CHANGED@test.com' WHERE id = %s",
-                (user_id,),
+                f"UPDATE {settings.source_table} SET {settings.content_column} = 'CHANGED@test.com' WHERE {settings.id_column} = %s",
+                (record_id,),
             )
 
         # Wait for replication to raw table
@@ -283,7 +278,8 @@ async def test_reconciliation_efficiency():
         # Force processed=FALSE because trigger is disabled
         async with await connect_db(settings.sink_url, autocommit=True) as conn:
             await conn.execute(
-                "UPDATE users SET processed = FALSE WHERE id = %s", (user_id,)
+                f"UPDATE {settings.sink_raw_table} SET processed = FALSE WHERE {settings.id_column} = %s",
+                (record_id,),
             )
 
         await process_cycle()
@@ -292,8 +288,8 @@ async def test_reconciliation_efficiency():
         async with await connect_db(settings.sink_url) as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT updated_at FROM users_replica WHERE id = %s",
-                    (user_id,),
+                    f"SELECT updated_at FROM {settings.sink_replica_table} WHERE {settings.id_column} = %s",
+                    (record_id,),
                 )
                 row3 = await cur.fetchone()
                 assert row3 is not None
@@ -304,7 +300,7 @@ async def test_reconciliation_efficiency():
         # Re-enable trigger
         async with await connect_db(settings.sink_url, autocommit=True) as conn:
             await conn.execute(
-                "ALTER TABLE users ENABLE ALWAYS TRIGGER trg_new_user_raw"
+                f"ALTER TABLE {settings.sink_raw_table} ENABLE ALWAYS TRIGGER trg_new_raw_data"
             )
 
 
@@ -331,9 +327,7 @@ async def test_wal_watchdog_self_destruct():
                 "SELECT 1 FROM pg_replication_slots WHERE slot_name = %s",
                 (settings.subscription_name,),
             )
-            assert (
-                await cur.fetchone() is not None
-            ), "Replication slot should exist"
+            assert await cur.fetchone() is not None, "Replication slot should exist"
 
     async with await connect_db(settings.sink_url) as conn:
         async with conn.cursor() as cur:
@@ -348,9 +342,7 @@ async def test_wal_watchdog_self_destruct():
     settings.max_slot_wal_keep_size_mb = -1  # Force immediate self-destruct
 
     try:
-        with pytest.raises(
-            RuntimeError, match="Self-destructed to protect Source DB"
-        ):
+        with pytest.raises(RuntimeError, match="Self-destructed to protect Source DB"):
             await check_and_protect_source()
 
         # 3. Verify cleanup: subscription and slot should be gone
@@ -360,9 +352,9 @@ async def test_wal_watchdog_self_destruct():
                     "SELECT 1 FROM pg_replication_slots WHERE slot_name = %s",
                     (settings.subscription_name,),
                 )
-                assert (
-                    await cur.fetchone() is None
-                ), "Replication slot should have been dropped"
+                assert await cur.fetchone() is None, (
+                    "Replication slot should have been dropped"
+                )
 
         async with await connect_db(settings.sink_url) as conn:
             async with conn.cursor() as cur:
@@ -370,9 +362,9 @@ async def test_wal_watchdog_self_destruct():
                     "SELECT 1 FROM pg_subscription WHERE subname = %s",
                     (settings.subscription_name,),
                 )
-                assert (
-                    await cur.fetchone() is None
-                ), "Subscription should have been dropped"
+                assert await cur.fetchone() is None, (
+                    "Subscription should have been dropped"
+                )
 
     finally:
         # Restore settings and ensure cleanup
