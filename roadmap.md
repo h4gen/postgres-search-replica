@@ -31,16 +31,21 @@ This document outlines the architectural and operational requirements to move th
     - **Implementation**: Add a lightweight HTTP endpoint (e.g., using `FastAPI` or a background thread).
     - **Why**: Required for Kubernetes/orchestrator liveness checks to automate restarts.
 
-## Chapter 3: Security & Database Management
-- **Schema Migrations**:
-    - **Implementation**: Move from hardcoded `CREATE TABLE` logic in `database.py` to **Alembic**.
-    - **Why**: Enterprise environments require versioned, auditable, and reversible schema changes that can be integrated into CI/CD.
+## Chapter 3: Declarative Schema & Security
+*Zero-Touch configuration where the code manages the database state.*
+
+- **Automated Schema Evolution**:
+    - **Implementation**: Instead of static `CREATE TABLE`, implement a reconciliation loop at startup. Compare `PUBLICATION_COLUMNS` from settings with the existing sink table schema.
+    - **Why**: Allows users to add columns to the replication list via environment variables without manually running SQL migrations. The daemon auto-applies `ALTER TABLE ... ADD COLUMN`.
+- **Upstream Change Detection**:
+    - **Implementation**: Perform "Pre-flight checks" on the Source DB to verify that configured columns exist and data types are compatible.
+    - **Why**: Prevents the pipeline from starting in a broken state or crashing unexpectedly when the source schema diverges from the replica configuration.
 - **Connection Pooling**:
     - **Implementation**: Use `psycopg_pool` instead of raw `AsyncConnection`.
     - **Why**: Prevents connection exhaustion and reduces the overhead of repeatedly opening/closing handshakes with the Sink DB.
 - **Secrets Management**:
     - **Implementation**: Support fetching `SOURCE_URL` and `SINK_URL` from a secret manager (AWS Secrets Manager, HashiCorp Vault) rather than plain environment variables.
-    - **Why**: Compliance and security best practices for handling database credentials.
+    - **Why**: Compliance and security best practices for handling database credentials in enterprise environments.
 
 ## Chapter 4: Performance & Scalability
 - **Decoupled Producer/Consumer**:
