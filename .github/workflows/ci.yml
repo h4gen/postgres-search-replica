@@ -10,33 +10,6 @@ jobs:
   test:
     runs-on: ubuntu-latest
     
-    services:
-      source:
-        image: postgres:15-alpine
-        env:
-          POSTGRES_PASSWORD: password
-          POSTGRES_DB: production_db
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5433:5432
-
-      sink:
-        image: postgres:15-alpine
-        env:
-          POSTGRES_PASSWORD: password
-          POSTGRES_DB: search_replica_db
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5434:5432
-
     steps:
     - uses: actions/checkout@v4
 
@@ -46,25 +19,25 @@ jobs:
         enable-cache: true
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: astral-sh/setup-python@v5
       with:
         python-version-file: ".python-version"
 
     - name: Install dependencies
       run: uv sync --extra test
 
-    - name: Run Unit Tests
-      run: uv run pytest tests/test_transformer.py
+    - name: Start Infrastructure
+      run: make dev
 
-    - name: Initialize Databases for Integration Tests
-      run: |
-        # Setup Source
-        PGPASSWORD=password psql -h localhost -p 5433 -U postgres -d production_db -f dev/source_mock.sql
-        # Setup Sink is handled by the replicator code itself in setup_sink()
+    - name: Run Unit Tests
+      run: PYTHONPATH=. uv run pytest tests/test_transformer.py
 
     - name: Run Integration Tests
       env:
         SOURCE_URL: postgresql://postgres:password@localhost:5433/production_db
         SINK_URL: postgresql://postgres:password@localhost:5434/search_replica_db
-      run: uv run pytest tests/test_integration.py
+      run: PYTHONPATH=. uv run pytest tests/test_integration.py
 
+    - name: Shutdown Infrastructure
+      if: always()
+      run: make down
