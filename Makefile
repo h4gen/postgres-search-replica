@@ -17,10 +17,10 @@ help:
 	@echo "  make clean            - Remove volumes and temporary files"
 
 dev:
-	docker-compose -f dev/docker-compose.yml up --build -d
+	docker compose -f dev/docker-compose.yml up --build -d
 
 down:
-	docker-compose -f dev/docker-compose.yml down
+	docker compose -f dev/docker-compose.yml down
 
 test: test-unit test-integration
 
