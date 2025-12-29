@@ -10,16 +10,10 @@ from src.main import process_cycle
 async def test_full_replication_flow():
     """
     Integration test:
-    1. Setup Source & Sink
-    2. Insert data into Source
-    3. Wait for native replication to Sink (users table)
-    4. Run process_cycle()
-    5. Verify data in users_replica
+    1. Wait for native replication to Sink (users table)
+    2. Run process_cycle()
+    3. Verify data in users_replica
     """
-    # 1. Setup
-    await setup_source()
-    await setup_sink()
-
     # Clean up from previous runs
     async with await connect_db(settings.source_url, autocommit=True) as conn:
         await conn.execute("TRUNCATE TABLE users CASCADE")
