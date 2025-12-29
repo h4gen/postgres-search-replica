@@ -1,13 +1,14 @@
 # Search Replica Daemon
 
-A professional-grade PostgreSQL read replica with real-time Polars transformation and pgvector support.
+A professional-grade PostgreSQL read replica with real-time Polars transformation, decoupled vectorization, and pgvector support.
 
 ## Architecture
 
 - **Native Bridge**: Uses PostgreSQL Native Logical Replication for data movement.
 - **Async Python**: A robust daemon using `psycopg3` async notifications.
-- **Polars**: High-performance, type-safe data transformations.
+- **Polars**: High-performance tyoe-safe batch data transformations.
 - **pgvector**: Integrated vector storage for search embeddings.
+- **Decoupled Vectorizers**: Extensible embedding logic (Dummy, OpenAI, etc.).
 - **PG 15 Row Filtering**: Selective replication to minimize network traffic and processing load.
 
 ## Key Features (Enterprise Ready)
@@ -15,8 +16,10 @@ A professional-grade PostgreSQL read replica with real-time Polars transformatio
 - **Source Protection (Watchdog)**: The replicator actively monitors its own replication lag. If the lag exceeds `MAX_SLOT_WAL_KEEP_SIZE_MB`, it triggers a self-destruct by dropping its subscription and slot. This ensures the Source DB never runs out of disk space, even if the replicator falls behind.
 - **Graceful Cleanup**: Automatically drops the replication slot upon normal shutdown (`SIGTERM`/`SIGINT`) to prevent WAL accumulation while offline.
 - **Smart Reconciliation**: Only updates embeddings and timestamps if the source data has actually changed, significantly reducing Sink DB load.
+- **Batch Processing**: Processes data in batches (configurable via `BATCH_SIZE`) for efficient transformation and API-friendly vectorization.
 - **Zero-Touch & Low Privilege**: No `SUPERUSER` rights or global server configuration changes required on the Source DB. All protection logic is handled by the replicator.
 - **Zero-Touch Config**: Automatically synchronizes publication columns and filters from Python settings to the database on startup.
+- **Fully Configurable Schema**: Table and column names are entirely configurable via environment variables.
 
 ## Development
 
@@ -38,24 +41,35 @@ We use a `Makefile` to encapsulate best practices and common tasks.
 
 ## Configuration
 
-Settings are managed via Pydantic and can be overridden by environment variables, a `.env` file, or a `.env.development` file. Key options:
+Settings are managed via Pydantic and can be overridden by environment variables, a `.env` file, or a `.env.development` file.
+
+### Schema Settings
+- `SOURCE_TABLE`: Name of the table on the source database (default: `users`).
+- `SINK_RAW_TABLE`: Name of the raw landing table on the sink (default: `users`).
+- `SINK_REPLICA_TABLE`: Name of the final search replica table (default: `users_replica`).
+- `ID_COLUMN`: Name of the primary key column (default: `id`).
+- `CONTENT_COLUMN`: Column used for generating embeddings (default: `email`).
+- `TARGET_CONTENT_COLUMN`: Transformed text column in the replica (default: `transformed_email`).
+- `EMBEDDING_COLUMN`: Name of the vector column (default: `embedding`).
+- `EMBEDDING_DIMENSION`: Dimension of the vector (default: `3`).
+
+### Replication Settings
 - `SOURCE_URL`: URL of the source PostgreSQL database.
 - `SINK_URL`: URL of the sink PostgreSQL database.
 - `PUBLICATION_NAME`: PostgreSQL publication name (default: `pub_users`).
-- `PUBLICATION_COLUMNS`: List of columns to replicate (default: None).
+- `PUBLICATION_COLUMNS`: List of columns to replicate (default: `["id", "email"]`).
 - `PUBLICATION_WHERE`: Optional PG 15 row filter clause (e.g., `id > 100`).
 - `SUBSCRIPTION_NAME`: PostgreSQL subscription name (default: `sub_users`).
 - `SUBSCRIPTION_OPTIONS`: Dict of subscription parameters (e.g., `{"streaming": "'on'"}`).
 - `BATCH_SIZE`: Number of rows to process in one transformation cycle (default: `50`).
-- `MAX_SLOT_WAL_KEEP_SIZE_MB`: Safety threshold for the Watchdog. If replication lag exceeds this, the slot is automatically dropped to save Source disk space (default: `1024`).
+- `MAX_SLOT_WAL_KEEP_SIZE_MB`: Safety threshold for the Watchdog (default: `1024`).
+
+### Vectorizer Settings
+- `VECTORIZER_TYPE`: Choice of vectorization strategy. Currently supported: `dummy`.
+- `NOTIFY_CHANNEL`: PostgreSQL notification channel (default: `new_raw_data`).
 
 See `src/config.py` for all available options and defaults.
 
 ## CI/CD
 
-The project includes a GitHub Actions workflow (`.github/workflows/ci.yml`) that:
-- Starts the full infrastructure using `make dev`.
-- Waits for databases to be ready using `pg_isready`.
-- Runs the complete test suite (`unit` and `integration`).
-- Performs automated cleanup.
-
+The project includes a GitHub Actions workflow (`.github/workflows/ci.yml`) that performs automated building, infra setup, and testing.

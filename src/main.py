@@ -44,9 +44,7 @@ async def process_cycle():
         logger.error(f"Error in processing cycle: {e}")
 
 
-async def run_daemon(
-    loop: asyncio.AbstractEventLoop, handle_exit: Callable[[], None]
-):
+async def run_daemon(loop: asyncio.AbstractEventLoop, handle_exit: Callable[[], None]):
     """Main loop for the replicator daemon."""
     await setup_source()
     await setup_sink()
