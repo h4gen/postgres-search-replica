@@ -12,8 +12,10 @@ A professional-grade PostgreSQL read replica with real-time Polars transformatio
 
 ## Key Features (Enterprise Ready)
 
-- **Source Protection (Self-Cleaning)**: The replicator automatically drops its subscription and slot upon graceful shutdown (`SIGTERM`/`SIGINT`), ensuring the Source DB never accumulates WAL logs or runs out of disk space.
+- **Source Protection (Watchdog)**: The replicator actively monitors its own replication lag. If the lag exceeds `MAX_SLOT_WAL_KEEP_SIZE_MB`, it triggers a self-destruct by dropping its subscription and slot. This ensures the Source DB never runs out of disk space, even if the replicator falls behind.
+- **Graceful Cleanup**: Automatically drops the replication slot upon normal shutdown (`SIGTERM`/`SIGINT`) to prevent WAL accumulation while offline.
 - **Smart Reconciliation**: Only updates embeddings and timestamps if the source data has actually changed, significantly reducing Sink DB load.
+- **Zero-Touch & Low Privilege**: No `SUPERUSER` rights or global server configuration changes required on the Source DB. All protection logic is handled by the replicator.
 - **Zero-Touch Config**: Automatically synchronizes publication columns and filters from Python settings to the database on startup.
 
 ## Development
@@ -45,7 +47,7 @@ Settings are managed via Pydantic and can be overridden by environment variables
 - `SUBSCRIPTION_NAME`: PostgreSQL subscription name (default: `sub_users`).
 - `SUBSCRIPTION_OPTIONS`: Dict of subscription parameters (e.g., `{"streaming": "'on'"}`).
 - `BATCH_SIZE`: Number of rows to process in one transformation cycle (default: `50`).
-- `MAX_SLOT_WAL_KEEP_SIZE_MB`: Safety limit for WAL retention on the Source (default: `1024`).
+- `MAX_SLOT_WAL_KEEP_SIZE_MB`: Safety threshold for the Watchdog. If replication lag exceeds this, the slot is automatically dropped to save Source disk space (default: `1024`).
 
 See `src/config.py` for all available options and defaults.
 
