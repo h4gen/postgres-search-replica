@@ -2,7 +2,7 @@ import pytest
 import asyncio
 from pgvector.psycopg import register_vector_async as register_vector  # type: ignore
 from src.config import settings
-from src.database import connect_db
+from src.database import connect_db, check_and_protect_source
 from src.main import process_cycle
 
 
@@ -306,3 +306,78 @@ async def test_reconciliation_efficiency():
             await conn.execute(
                 "ALTER TABLE users ENABLE ALWAYS TRIGGER trg_new_user_raw"
             )
+
+
+@pytest.mark.asyncio
+async def test_wal_watchdog_self_destruct():
+    """
+    Test the Source Protection (Watchdog):
+    1. Set max_slot_wal_keep_size_mb to -1 to force self-destruct
+    2. Call check_and_protect_source()
+    3. Verify subscription and replication slot are dropped
+    """
+    from src.database import setup_source, setup_sink
+    from unittest.mock import patch
+
+    # 1. Setup (normal flow)
+    await setup_source()
+    with patch.object(settings, "source_url", get_internal_source_url()):
+        await setup_sink()
+
+    # Verify setup worked: check for slot and subscription
+    async with await connect_db(settings.source_url) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM pg_replication_slots WHERE slot_name = %s",
+                (settings.subscription_name,),
+            )
+            assert (
+                await cur.fetchone() is not None
+            ), "Replication slot should exist"
+
+    async with await connect_db(settings.sink_url) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM pg_subscription WHERE subname = %s",
+                (settings.subscription_name,),
+            )
+            assert await cur.fetchone() is not None, "Subscription should exist"
+
+    # 2. Trigger watchdog
+    original_max_size = settings.max_slot_wal_keep_size_mb
+    settings.max_slot_wal_keep_size_mb = -1  # Force immediate self-destruct
+
+    try:
+        with pytest.raises(
+            RuntimeError, match="Self-destructed to protect Source DB"
+        ):
+            await check_and_protect_source()
+
+        # 3. Verify cleanup: subscription and slot should be gone
+        async with await connect_db(settings.source_url) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT 1 FROM pg_replication_slots WHERE slot_name = %s",
+                    (settings.subscription_name,),
+                )
+                assert (
+                    await cur.fetchone() is None
+                ), "Replication slot should have been dropped"
+
+        async with await connect_db(settings.sink_url) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT 1 FROM pg_subscription WHERE subname = %s",
+                    (settings.subscription_name,),
+                )
+                assert (
+                    await cur.fetchone() is None
+                ), "Subscription should have been dropped"
+
+    finally:
+        # Restore settings and ensure cleanup
+        settings.max_slot_wal_keep_size_mb = original_max_size
+        # Re-run setup to leave DB in a clean state for other tests
+        await setup_source()
+        with patch.object(settings, "source_url", get_internal_source_url()):
+            await setup_sink()
