@@ -27,7 +27,19 @@ jobs:
       run: uv sync --extra test
 
     - name: Start Infrastructure
-      run: make dev
+      run: |
+        make dev
+        echo "Waiting for Postgres to be ready..."
+        # Wait for the containers to be healthy using pg_isready
+        until docker exec dev-source-1 pg_isready -U postgres; do
+          echo "Source DB not ready..."
+          sleep 2
+        done
+        until docker exec dev-sink-1 pg_isready -U postgres; do
+          echo "Sink DB not ready..."
+          sleep 2
+        done
+        echo "Infrastructure is ready!"
 
     - name: Run Unit Tests
       run: PYTHONPATH=. uv run pytest tests/test_transformer.py

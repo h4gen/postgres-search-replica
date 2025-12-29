@@ -87,13 +87,16 @@ async def setup_sink():
                 f"SELECT 1 FROM pg_subscription WHERE subname = '{settings.subscription_name}'"
             )
             if not await cur.fetchone():
+                conn_str = (
+                    settings.replication_source_url or settings.source_url
+                )
                 logger.info(
-                    f"Creating subscription {settings.subscription_name}..."
+                    f"Creating subscription {settings.subscription_name} using {conn_str}..."
                 )
                 await cur.execute(
                     f"""
                     CREATE SUBSCRIPTION {settings.subscription_name} 
-                    CONNECTION '{settings.source_url}' 
+                    CONNECTION '{conn_str}' 
                     PUBLICATION {settings.publication_name}
                 """
                 )

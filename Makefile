@@ -4,6 +4,7 @@
 export PYTHONPATH := .
 export SOURCE_URL ?= postgresql://postgres:password@localhost:5433/production_db
 export SINK_URL ?= postgresql://postgres:password@localhost:5434/search_replica_db
+export REPLICATION_SOURCE_URL ?= postgresql://postgres:password@source:5432/production_db
 
 help:
 	@echo "Available commands:"

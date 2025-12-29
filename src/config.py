@@ -4,6 +4,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     source_url: str
     sink_url: str
+    replication_source_url: str | None = None
     publication_name: str = "pub_users"
     subscription_name: str = "sub_users"
     batch_size: int = 50
