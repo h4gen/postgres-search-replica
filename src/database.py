@@ -1,6 +1,6 @@
 import logging
 import psycopg
-from pgvector.psycopg import register_vector_async as register_vector
+from pgvector.psycopg import register_vector_async as register_vector  # type: ignore
 from src.config import settings
 
 logger = logging.getLogger(__name__)

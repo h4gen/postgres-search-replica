@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import signal
-from pgvector.psycopg import register_vector_async as register_vector
+from pgvector.psycopg import register_vector_async as register_vector  # type: ignore
 from src.config import settings
 from src.database import (
     setup_source,

@@ -1,7 +1,6 @@
 import pytest
 import asyncio
-import os
-from pgvector.psycopg import register_vector_async as register_vector
+from pgvector.psycopg import register_vector_async as register_vector  # type: ignore
 from src.config import settings
 from src.database import connect_db
 from src.main import process_cycle
@@ -174,7 +173,6 @@ async def test_reconciliation_efficiency():
     from src.database import (
         setup_source,
         setup_sink,
-        drop_subscription_completely,
     )
 
     # setup_source needs localhost

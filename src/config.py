@@ -19,4 +19,4 @@ class Settings(BaseSettings):
     )
 
 
-settings = Settings()  # type: ignore[missing-argument]
+settings = Settings()  # type: ignore[call-arg]
