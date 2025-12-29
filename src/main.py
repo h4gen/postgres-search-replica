@@ -6,7 +6,7 @@ from src.config import settings
 from src.database import (
     setup_source,
     setup_sink,
-    disable_subscription,
+    drop_subscription_completely,
     get_unprocessed_rows,
     mark_rows_processed,
     upsert_replica_batch,
@@ -96,7 +96,7 @@ async def main():
     except asyncio.CancelledError:
         logger.info("Daemon task cancelled.")
     finally:
-        await disable_subscription()
+        await drop_subscription_completely()
 
 
 if __name__ == "__main__":

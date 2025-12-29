@@ -17,16 +17,29 @@ async def setup_source():
     logger.info("Setting up remote source publication...")
     async with await connect_db(settings.source_url, autocommit=True) as conn:
         async with conn.cursor() as cur:
+            cols = ", ".join(settings.publication_columns)
+            where_clause = (
+                f" WHERE ({settings.publication_where})"
+                if settings.publication_where
+                else ""
+            )
+
             await cur.execute(
                 f"SELECT 1 FROM pg_publication WHERE pubname = '{settings.publication_name}'"
             )
             if not await cur.fetchone():
-                cols = ", ".join(settings.publication_columns)
                 logger.info(
-                    f"Creating publication {settings.publication_name} on Source for columns ({cols})..."
+                    f"Creating publication {settings.publication_name} on Source for columns ({cols}){where_clause}..."
                 )
                 await cur.execute(
-                    f"CREATE PUBLICATION {settings.publication_name} FOR TABLE users ({cols})"
+                    f"CREATE PUBLICATION {settings.publication_name} FOR TABLE users ({cols}){where_clause}"
+                )
+            else:
+                logger.info(
+                    f"Syncing publication {settings.publication_name} with columns ({cols}){where_clause}..."
+                )
+                await cur.execute(
+                    f"ALTER PUBLICATION {settings.publication_name} SET TABLE users ({cols}){where_clause}"
                 )
 
 
@@ -52,6 +65,7 @@ async def setup_sink():
                 )
             """
             )
+
             await cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS users_replica (
@@ -68,6 +82,12 @@ async def setup_sink():
                 """
                 CREATE OR REPLACE FUNCTION notify_new_user_raw() RETURNS trigger AS $$
                 BEGIN
+                    IF (TG_OP = 'UPDATE') THEN
+                        -- Only reset if actual data changed
+                        IF (OLD.email IS DISTINCT FROM NEW.email) THEN
+                            NEW.processed := FALSE;
+                        END IF;
+                    END IF;
                     PERFORM pg_notify('new_raw_data', '');
                     RETURN NEW;
                 END;
@@ -78,8 +98,11 @@ async def setup_sink():
                 """
                 DROP TRIGGER IF EXISTS trg_new_user_raw ON users;
                 CREATE TRIGGER trg_new_user_raw 
-                AFTER INSERT OR UPDATE ON users 
+                BEFORE INSERT OR UPDATE ON users 
                 FOR EACH ROW EXECUTE FUNCTION notify_new_user_raw();
+                
+                -- Ensure trigger fires even for native replication
+                ALTER TABLE users ENABLE ALWAYS TRIGGER trg_new_user_raw;
             """
             )
 
@@ -88,32 +111,45 @@ async def setup_sink():
                 f"SELECT 1 FROM pg_subscription WHERE subname = '{settings.subscription_name}'"
             )
             if not await cur.fetchone():
+                options = ", ".join(
+                    [
+                        f"{k} = {v}"
+                        for k, v in settings.subscription_options.items()
+                    ]
+                )
                 logger.info(
-                    f"Creating subscription {settings.subscription_name}..."
+                    f"Creating subscription {settings.subscription_name} WITH ({options})..."
                 )
                 await cur.execute(
                     f"""
                     CREATE SUBSCRIPTION {settings.subscription_name} 
                     CONNECTION '{settings.source_url}' 
                     PUBLICATION {settings.publication_name}
+                    WITH ({options})
                 """
                 )
             else:
+                logger.info(
+                    f"Refreshing subscription {settings.subscription_name}..."
+                )
                 await cur.execute(
                     f"ALTER SUBSCRIPTION {settings.subscription_name} ENABLE"
                 )
+                await cur.execute(
+                    f"ALTER SUBSCRIPTION {settings.subscription_name} REFRESH PUBLICATION"
+                )
 
 
-async def disable_subscription():
-    """Gracefully disable subscription on shutdown."""
-    logger.info("Disabling subscription...")
+async def drop_subscription_completely():
+    """Drop subscription and slot from source on shutdown."""
+    logger.info("Dropping subscription and slot from source...")
     try:
         async with await connect_db(settings.sink_url, autocommit=True) as conn:
             await conn.execute(
-                f"ALTER SUBSCRIPTION {settings.subscription_name} DISABLE"
+                f"DROP SUBSCRIPTION IF EXISTS {settings.subscription_name}"
             )
     except Exception as e:
-        logger.warning(f"Failed to disable subscription: {e}")
+        logger.warning(f"Failed to drop subscription: {e}")
 
 
 async def get_unprocessed_rows(conn):
@@ -143,6 +179,7 @@ async def upsert_replica_batch(conn, batch):
                 transformed_email = EXCLUDED.transformed_email,
                 embedding = EXCLUDED.embedding,
                 updated_at = EXCLUDED.updated_at
+            WHERE users_replica.transformed_email IS DISTINCT FROM EXCLUDED.transformed_email
         """,
             batch,
         )
