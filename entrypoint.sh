@@ -17,11 +17,8 @@ fi
 
 # 2. Start pgai worker in background if requested
 if [ "$START_PGAI_WORKER" = "true" ]; then
-    echo "Starting pgai worker (pointing to localhost)..."
-    # Hardcoded to localhost as it's part of the same unit
-    /uv/bin/uv run pgai vectorizer worker \
-        --db-url "${SINK_URL:-postgresql://postgres:password@localhost:5432/search_replica_db}" \
-        --poll-interval 2s &
+    echo "Starting lightweight pgai worker daemon..."
+    /uv/bin/uv run python -m src.worker_daemon &
     WORKER_PID=$!
 fi
 
