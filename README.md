@@ -6,8 +6,17 @@ A professional-grade PostgreSQL search replica library with real-time vectorizat
 
 The project is built with a strong separation of concerns and follows a **Declarative "Chunk Decoration" Principle**. Instead of manually managing vectors, you define the desired state, and the library orchestrates the underlying PostgreSQL `pgai` and `pgvector` extensions.
 
-### The "Chunk Decoration" Principle
+It uses a **Hybrid Recovery Model** to ensure data consistency even after critical replication failures (e.g., when a replication slot is dropped to protect the source).
 
+...
+### Hybrid Recovery Model
+Enterprise-grade data movement requires more than just binary streaming. This library implements a state-machine for self-healing:
+1.  **LSN Anchoring**: Automatically creates replication slots on the source to bookmark the exact binary position.
+2.  **SQL Catch-up**: Uses idempotent Keyset Pagination (`WHERE id > last_id`) to bridge data gaps without holding the Source WAL open.
+3.  **Anti-Entropy (Ghost Cleaner)**: Performs checksum-based verification of ID chunks to find and delete "Ghost Records" (rows deleted on Source while the replica was offline).
+4.  **Zero-Loss Handover**: Seamlessly transitions from SQL catch-up to real-time binary streaming.
+
+### Chunk Decoration
 Traditional vector search often loses context when long documents are split into smaller chunks. This library uses a declarative template system to ensure every vector remains semantically linked to its source.
 
 1.  **The Work Column (`CONTENT_COLUMN`)**: This is your primary text data (e.g., `description`). It is automatically processed and split into pieces according to your `CHUNKING_STRATEGY`.
@@ -105,6 +114,9 @@ async def search_example():
 
 ## Key Features
 
+- **Hybrid Recovery & Self-Healing**: Automatically detect missing replication slots and bridge the gap using SQL catch-up followed by an LSN-anchored handover to native replication.
+- **Anti-Entropy (Ghost Cleaner)**: Checksum-based sweep to identify and prune records that were hard-deleted from the source while the daemon was offline.
+- **Dynamic Type Detection**: Automatically detect primary key types (including **UUID**, **BIGINT**, **TEXT**) and schema from the source database at runtime.
 - **Declarative Chunk Decoration**: Automatically combine metadata (e.g., `name`) with chunked text (e.g., `description`) using Python-style templates to preserve context across all vectors.
 - **Source Protection (Watchdog)**: Actively monitors replication lag. If the lag exceeds `MAX_SLOT_WAL_KEEP_SIZE_MB`, it triggers a self-destruct to ensure the Source DB never runs out of disk space.
 - **Connection Pooling**: Uses `psycopg-pool` for robust management of database connections, preventing exhaustion under high load.

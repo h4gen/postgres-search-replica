@@ -49,7 +49,7 @@ def main():
     subparsers = parser.add_subparsers(dest="command")
 
     # Start command
-    start_parser = subparsers.add_parser("start", help="Start the replication service")
+    subparsers.add_parser("start", help="Start the replication service")
     
     args = parser.parse_args()
 
