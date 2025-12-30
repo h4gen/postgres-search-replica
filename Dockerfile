@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y \
     python3-pip \
     python3-venv \
     postgresql-15-pgvector \
+    postgresql-plpython3-15 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv

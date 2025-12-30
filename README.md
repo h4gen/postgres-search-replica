@@ -1,14 +1,13 @@
 # Search Replica Daemon
 
-A professional-grade PostgreSQL read replica with real-time Polars transformation, decoupled vectorization, and pgvector support.
+A professional-grade PostgreSQL read replica with real-time vectorization using pgai, source database protection, and pgvector support.
 
 ## Architecture
 
 - **Native Bridge**: Uses PostgreSQL Native Logical Replication for data movement.
-- **Async Python**: A robust daemon using `psycopg3` async notifications.
-- **Polars**: High-performance tyoe-safe batch data transformations.
+- **Async Python Control Plane**: A robust daemon that orchestrates the replication lifecycle and monitors system health.
+- **pgai**: Leverages the `pgai` extension for declarative, database-native vectorization and background worker orchestration.
 - **pgvector**: Integrated vector storage for search embeddings.
-- **Decoupled Vectorizers**: Extensible embedding logic (Dummy, OpenAI, etc.).
 - **PG 15 Row Filtering**: Selective replication to minimize network traffic and processing load.
 
 ## Key Features (Enterprise Ready)
@@ -64,9 +63,12 @@ Settings are managed via Pydantic and can be overridden by environment variables
 - `BATCH_SIZE`: Number of rows to process in one transformation cycle (default: `50`).
 - `MAX_SLOT_WAL_KEEP_SIZE_MB`: Safety threshold for the Watchdog (default: `1024`).
 
-### Vectorizer Settings
-- `VECTORIZER_TYPE`: Choice of vectorization strategy. Currently supported: `dummy`.
-- `NOTIFY_CHANNEL`: PostgreSQL notification channel (default: `new_raw_data`).
+### Vectorizer Settings (pgai)
+- `EMBEDDING_PROVIDER`: The embedding provider to use (default: `ollama`).
+- `EMBEDDING_MODEL`: The model name (default: `nomic-embed-text`).
+- `EMBEDDING_DIMENSION`: Dimension of the vector (default: `768`).
+- `CHUNKING_STRATEGY`: Text splitting strategy (default: `recursive_character_text_splitter`).
+- `FORMATTING_TEMPLATE`: SQL template for the content before embedding (default: `$chunk`).
 
 See `src/config.py` for all available options and defaults.
 

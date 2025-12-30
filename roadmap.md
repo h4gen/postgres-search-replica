@@ -9,9 +9,11 @@ This document outlines the architectural and operational requirements to move th
 ## Chapter 1: Reliability & Fault Tolerance
 *Ensuring the system can survive external failures without manual intervention.*
 
+- **pgai Orchestration**:
+    - **Status**: Migrated.
+    - **Why**: Replaced custom Python loops with `pgai` background workers. This provides database-native retries, dead-letter queues, and atomic state tracking for embeddings.
 - **Robust Retry Mechanism**:
-    - **Implementation**: Integrate `tenacity` or similar library for exponential backoff on Database connections and Vectorizer API calls.
-    - **Why**: Prevents the daemon from crashing during transient network blips or provider rate-limits.
+    - **Implementation**: `pgai` handles vectorizer retries internally. The sidecar only needs to handle its own connection retries.
 - **Poison Pill Handling (DLQ)**:
     - **Implementation**: Add a `failure_count` and `last_error` column to the `sink_raw_table`. 
     - **Why**: If a specific row causes a transformation crash (e.g., malformed data), the system should skip it after $N$ attempts rather than blocking the entire pipeline indefinitely.
@@ -50,9 +52,9 @@ This document outlines the architectural and operational requirements to move th
     - **Why**: Compliance and security best practices for handling database credentials in enterprise environments.
 
 ## Chapter 4: Performance & Scalability
-- **Decoupled Producer/Consumer**:
-    - **Implementation**: Use an internal `asyncio.Queue` to separate the **Fetch** (fast) from the **Vectorization** (slow/API-bound).
-    - **Why**: Allows fetching the next batch while the current one is still waiting for an LLM response, maximizing throughput.
+- **Decoupled Compute**: 
+    - **Status**: Implemented via `ai-worker`.
+    - **Why**: Moving vectorization to dedicated worker containers allows scaling embedding compute independently of the database and sidecar.
 - **Embedding Cache**:
     - **Implementation**: Optional Redis layer to cache embeddings for identical content strings.
     - **Why**: Significantly reduces cost and latency if the source data contains many repeating text values (e.g., category names or status updates).

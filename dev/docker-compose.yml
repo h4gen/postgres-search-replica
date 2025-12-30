@@ -18,6 +18,7 @@ services:
     environment:
       POSTGRES_PASSWORD: password
       POSTGRES_DB: search_replica_db
+      START_POSTGRES: "true"
       # Using the container names in the same network
       SOURCE_URL: postgresql://postgres:password@source:5432/production_db
       SINK_URL: postgresql://postgres:password@localhost:5432/search_replica_db
@@ -25,3 +26,20 @@ services:
       - source
     ports:
       - "5434:5432"
+
+  ai-worker:
+    build: 
+      context: ..
+      dockerfile: Dockerfile
+    command: ["/uv/bin/uv", "run", "pgai", "vectorizer", "worker", "--db-url", "postgresql://postgres:password@sink:5432/search_replica_db", "--poll-interval", "2s"]
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    depends_on:
+      - sink
+      - ollama
+    restart: always
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
