@@ -1,7 +1,7 @@
 import logging
 import psycopg
 from pgvector.psycopg import register_vector_async as register_vector  # type: ignore
-from src.config import settings
+from .config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,9 @@ async def setup_source():
 async def setup_sink():
     """Initialize the sink table and subscription."""
     logger.info("Setting up local sink database...")
-    async with await connect_db(settings.sink_url, autocommit=True) as conn:
+    async with await connect_db(
+        settings.resolved_sink_url, autocommit=True
+    ) as conn:
         async with conn.cursor() as cur:
             # Extensions
             await cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
@@ -76,7 +78,7 @@ async def setup_sink():
                 import pgai
 
                 # pgai.install expects a database URL string
-                pgai.install(settings.sink_url)
+                pgai.install(settings.resolved_sink_url)
                 logger.info("Extension 'ai' installed successfully.")
 
             # Check if vectorizer already exists
@@ -91,7 +93,8 @@ async def setup_sink():
                 # We need to configure the ollama host for the worker
                 # In pgai, this is often done via environment variables for the worker,
                 # but we can also set it in the session if needed.
-                await cur.execute(f"""
+                await cur.execute(
+                    f"""
                     SELECT ai.create_vectorizer(
                         '{settings.sink_raw_table}'::regclass,
                         loading => ai.loading_column('{settings.content_column}'),
@@ -99,11 +102,13 @@ async def setup_sink():
                         chunking => ai.chunking_{settings.chunking_strategy}(),
                         formatting => ai.formatting_python_template('{settings.formatting_template}')
                     )
-                """)
+                """
+                )
 
             # Create the compatibility View
             embedding_table = f"{settings.sink_raw_table}_embedding"
-            await cur.execute(f"""
+            await cur.execute(
+                f"""
                 CREATE OR REPLACE VIEW {settings.sink_replica_table} AS
                 SELECT 
                     r.{settings.id_column},
@@ -111,11 +116,13 @@ async def setup_sink():
                     e.{settings.embedding_column}
                 FROM {settings.sink_raw_table} r
                 LEFT JOIN {embedding_table} e ON r.{settings.id_column} = e.{settings.id_column}
-            """)
+            """
+            )
 
             # IMPORTANT: Enable pgai triggers for native replication
             # We find all triggers starting with _vectorizer_ and enable them ALWAYS
-            await cur.execute(f"""
+            await cur.execute(
+                f"""
                 DO $$
                 DECLARE
                     trg_name TEXT;
@@ -129,7 +136,8 @@ async def setup_sink():
                         EXECUTE 'ALTER TABLE {settings.sink_raw_table} ENABLE ALWAYS TRIGGER ' || quote_ident(trg_name);
                     END LOOP;
                 END $$;
-            """)
+            """
+            )
 
             # Subscription
             await cur.execute(
@@ -137,7 +145,10 @@ async def setup_sink():
             )
             if not await cur.fetchone():
                 options = ", ".join(
-                    [f"{k} = {v}" for k, v in settings.subscription_options.items()]
+                    [
+                        f"{k} = {v}"
+                        for k, v in settings.subscription_options.items()
+                    ]
                 )
                 logger.info(
                     f"Creating subscription {settings.subscription_name} WITH ({options})..."
@@ -145,13 +156,15 @@ async def setup_sink():
                 await cur.execute(
                     f"""
                     CREATE SUBSCRIPTION {settings.subscription_name} 
-                    CONNECTION '{settings.source_url}' 
+                    CONNECTION '{settings.subscription_connection_url}' 
                     PUBLICATION {settings.publication_name}
                     WITH ({options})
                 """
                 )
             else:
-                logger.info(f"Refreshing subscription {settings.subscription_name}...")
+                logger.info(
+                    f"Refreshing subscription {settings.subscription_name}..."
+                )
                 await cur.execute(
                     f"ALTER SUBSCRIPTION {settings.subscription_name} ENABLE"
                 )
@@ -164,7 +177,9 @@ async def drop_subscription_completely():
     """Drop subscription and slot from source on shutdown."""
     logger.info("Dropping subscription and slot from source...")
     try:
-        async with await connect_db(settings.sink_url, autocommit=True) as conn:
+        async with await connect_db(
+            settings.resolved_sink_url, autocommit=True
+        ) as conn:
             await conn.execute(
                 f"DROP SUBSCRIPTION IF EXISTS {settings.subscription_name}"
             )
@@ -202,7 +217,9 @@ async def check_and_protect_source():
                             "Emergency shutdown: Dropping subscription to protect Source DB disk space."
                         )
                         await drop_subscription_completely()
-                        raise RuntimeError("Self-destructed to protect Source DB.")
+                        raise RuntimeError(
+                            "Self-destructed to protect Source DB."
+                        )
                     elif lag_mb > (settings.max_slot_wal_keep_size_mb * 0.8):
                         logger.warning(
                             f"High replication lag detected: {lag_mb:.1f} MB (Limit: {settings.max_slot_wal_keep_size_mb} MB)"

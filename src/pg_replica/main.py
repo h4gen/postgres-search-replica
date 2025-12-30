@@ -2,8 +2,8 @@ import asyncio
 import logging
 import signal
 from typing import Callable
-from src.config import settings
-from src.database import (
+from .config import settings
+from .database import (
     setup_source,
     setup_sink,
     drop_subscription_completely,

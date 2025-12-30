@@ -3,7 +3,7 @@ import logging
 import signal
 from datetime import timedelta
 from pgai.vectorizer.worker import Worker
-from src.config import settings
+from .config import settings
 
 # Configure logging to match the main daemon
 logging.basicConfig(

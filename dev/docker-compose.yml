@@ -18,17 +18,17 @@ services:
     environment:
       POSTGRES_PASSWORD: password
       POSTGRES_DB: search_replica_db
-      START_POSTGRES: "true"
-      START_PGAI_WORKER: "true"
-      # Using the container names in the same network
+      # Using 'local' tells PGSearchReplica to manage its own isolated Postgres
+      SINK_URL: local
+      # We still need the internal source URL for the subscription
+      SUBSCRIPTION_SOURCE_URL: postgresql://postgres:password@source:5432/production_db
       SOURCE_URL: postgresql://postgres:password@source:5432/production_db
-      SINK_URL: postgresql://postgres:password@localhost:5432/search_replica_db
       OLLAMA_HOST: http://ollama:11434
     depends_on:
       - source
       - ollama
     ports:
-      - "5434:5432"
+      - "5434:54322"
 
   ollama:
     image: ollama/ollama:latest
