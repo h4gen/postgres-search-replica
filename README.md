@@ -138,8 +138,12 @@ We use a `Makefile` to encapsulate best practices and common tasks.
 - `make dev` - Spin up the local development environment (Source + Sink + Daemon).
 - `make test` - Run integration tests.
 - `make lint` - Run `ruff` linter and formatter checks.
-- `make type-check` - Run `mypy` type checker.
+- `make type-check` - Run `ty` type checker.
 - `make clean` - Full cleanup including database volumes and temporary files.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for details on our development workflow and how to submit pull requests.
 
 ## Configuration
 
@@ -178,4 +182,4 @@ All logs are output as single-line JSON objects by default. This ensures seamles
 
 ## License
 
-MIT
+AGPL v3

@@ -2,7 +2,7 @@
 name = "pg-search-replica"
 version = "0.1.0"
 description = "PostgreSQL Search Replica with real-time vectorization using pgai"
-license = {text = "MIT"}
+license = {text = "AGPL-3.0-or-later"}
 requires-python = ">=3.11"
 dependencies = [
     "psycopg[binary]>=3.1.0",
