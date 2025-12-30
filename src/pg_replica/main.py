@@ -14,14 +14,23 @@ from .database import (
     check_and_protect_source,
     init_pools,
     close_pools,
+    check_slot_exists,
+    create_placeholder_slot,
+    run_sql_catchup,
+    find_and_fix_ghost_records,
+    update_replica_state,
+    setup_state_table,
+    ensure_sink_raw_table,
 )
-from .observability import update_replication_lag, update_pgai_pending, app as observability_app
+from .observability import (
+    update_replication_lag,
+    update_pgai_pending,
+    app as observability_app,
+)
 
 # Configure structured JSON logging
 logHandler = logging.StreamHandler(sys.stdout)
-formatter = JsonFormatter(
-    "%(asctime)s %(levelname)s %(name)s %(message)s"
-)
+formatter = JsonFormatter("%(asctime)s %(levelname)s %(name)s %(message)s")
 logHandler.setFormatter(formatter)
 
 # Clear existing handlers and set up our JSON handler
@@ -54,9 +63,6 @@ async def run_daemon(
     loop: asyncio.AbstractEventLoop, handle_exit: Callable[[], None]
 ) -> None:
     """Main loop for the replicator daemon."""
-    await setup_source(settings)
-    await setup_sink(settings)
-
     logger.info("Daemon started. Monitoring source health and pgai status...")
 
     stop_event = asyncio.Event()
@@ -108,13 +114,38 @@ async def main():
     max_retries = 5
     for i in range(max_retries):
         try:
+            # 1. Ensure publication exists
             await setup_source(settings)
+
+            # 2. Ensure state table exists
+            await setup_state_table(settings)
+
+            # 3. Check if we need recovery
+            slot_exists = await check_slot_exists(settings)
+            if not slot_exists:
+                logger.warning(
+                    "Replication slot missing. Entering Hybrid Recovery..."
+                )
+                # Ensure raw table exists before catchup
+                await ensure_sink_raw_table(settings)
+
+                # Create slot to anchor the LSN
+                lsn = await create_placeholder_slot(settings)
+                await update_replica_state(settings, lsn=lsn)
+
+                # SQL Catch-up (Idempotent)
+                await run_sql_catchup(settings)
+
+                # Anti-Entropy (Clean up deleted records while offline)
+                await find_and_fix_ghost_records(settings)
+
+            # 3. Setup sink (subscription) - handles copy_data based on slot status
             await setup_sink(settings)
             break
         except Exception as e:
             if i == max_retries - 1:
                 logger.critical(
-                    f"Failed to setup Source/Sink after {max_retries} attempts: {e}"
+                    f"Failed to setup Source/Sink/Recovery after {max_retries} attempts: {e}"
                 )
                 await close_pools()
                 return

@@ -301,7 +301,6 @@ async def test_wal_watchdog_self_destruct():
     Test the Source Protection (Watchdog).
     """
     from unittest.mock import patch
-    from pg_replica.database import init_pools, close_pools
 
     with patch.dict(
         "os.environ",

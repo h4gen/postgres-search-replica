@@ -13,6 +13,13 @@ from .database import (
     connect_db,
     init_pools,
     close_pools,
+    check_slot_exists,
+    create_placeholder_slot,
+    run_sql_catchup,
+    find_and_fix_ghost_records,
+    update_replica_state,
+    setup_state_table,
+    ensure_sink_raw_table,
 )
 from pgai.vectorizer.worker import Worker
 
@@ -43,7 +50,7 @@ class Orchestrator:
                 try:
                     async with await connect_db(
                         self.settings.resolved_sink_url
-                    ) as conn:
+                    ):
                         return True
                 except Exception:
                     pass
@@ -146,16 +153,43 @@ class Orchestrator:
         # 2. Initialize connection pools
         await init_pools(self.settings)
 
-        # 3. Setup Source/Sink (Idempotent)
+        # 3. Setup Source & Recovery Logic
         max_retries = 5
         for i in range(max_retries):
             try:
+                # Always ensure publication exists first
                 await setup_source(self.settings)
+
+                # Ensure state table exists before we try to check or update it
+                await setup_state_table(self.settings)
+
+                # Check if we need recovery
+                slot_exists = await check_slot_exists(self.settings)
+                if not slot_exists:
+                    logger.warning(
+                        "Replication slot missing. Entering Hybrid Recovery..."
+                    )
+                    # 1. Ensure raw table exists before catchup
+                    await ensure_sink_raw_table(self.settings)
+
+                    # 2. Create slot to anchor the LSN
+                    lsn = await create_placeholder_slot(self.settings)
+                    await update_replica_state(self.settings, lsn=lsn)
+
+                    # 3. SQL Catch-up (Idempotent)
+                    await run_sql_catchup(self.settings)
+
+                    # 4. Anti-Entropy (Clean up deleted records while offline)
+                    await find_and_fix_ghost_records(self.settings)
+
+                # Setup sink (subscription) - handles copy_data based on slot status
                 await setup_sink(self.settings)
                 break
             except Exception as e:
                 if i == max_retries - 1:
-                    raise RuntimeError(f"Failed to setup Source/Sink: {e}")
+                    raise RuntimeError(
+                        f"Failed to setup Source/Sink/Recovery: {e}"
+                    )
                 logger.warning(
                     f"Setup attempt {i+1} failed. Retrying in 5s... {e}"
                 )

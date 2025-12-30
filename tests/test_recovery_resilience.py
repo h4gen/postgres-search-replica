@@ -1,0 +1,256 @@
+import pytest
+import asyncio
+from pg_replica import PGSearchReplica, settings as global_settings
+from pg_replica.database import connect_db, check_slot_exists
+
+
+async def wait_for_pgai_sync(settings, expected_count=1, timeout=60):
+    """Wait for pgai vectorizer to finish processing all rows."""
+    import time
+
+    start_time = time.time()
+    embedding_table = f"{settings.sink_raw_table}_embedding"
+    while time.time() - start_time < timeout:
+        async with await connect_db(settings.resolved_sink_url) as conn:
+            async with conn.cursor() as cur:
+                try:
+                    await cur.execute(f"SELECT count(*) FROM {embedding_table}")
+                    res = await cur.fetchone()
+                    count = res[0] if res else 0
+                    if count >= expected_count:
+                        return True
+                except Exception:
+                    pass
+        await asyncio.sleep(2)
+    return False
+
+
+def get_internal_source_url(settings):
+    """Helper to translate localhost URL to internal Docker URL for subscription."""
+    return settings.source_url.replace("localhost:5433", "source:5432").replace(
+        "127.0.0.1:5433", "source:5432"
+    )
+
+
+@pytest.mark.asyncio
+async def test_uuid_recovery_flow():
+    """
+    Test that the system can recover and catch up using UUID primary keys.
+    """
+    from unittest.mock import patch
+
+    # 1. Setup Source table with UUIDs
+    custom_settings = global_settings.model_copy(
+        update={
+            "source_table": "uuid_products",
+            "sink_raw_table": "uuid_products",
+            "publication_name": "pub_uuid_products",
+            "subscription_name": "sub_uuid_products",
+            "id_column": "id",
+        }
+    )
+
+    with patch.dict(
+        "os.environ",
+        {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(custom_settings)},
+    ):
+        # Ensure source table exists
+        async with await connect_db(
+            custom_settings.source_url, autocommit=True
+        ) as conn:
+            await conn.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"')
+            await conn.execute("DROP TABLE IF EXISTS uuid_products CASCADE")
+            await conn.execute(
+                "CREATE TABLE uuid_products (id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), name TEXT, description TEXT)"
+            )
+            await conn.execute(
+                "INSERT INTO uuid_products (name, description) VALUES ('UUID Item', 'Testing UUID support')"
+            )
+
+        # Start replica in sync mode
+        async with PGSearchReplica(
+            sync=True, **custom_settings.model_dump()
+        ) as replica:
+            # Wait for initial sync
+            await wait_for_pgai_sync(replica.settings, expected_count=1)
+
+            # Verify data
+            results = await replica.search("UUID Item")
+            assert len(results) > 0
+            assert "UUID Item" in results[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_anti_entropy_ghost_cleaner():
+    """
+    Test that hard-deleted records are cleaned up by Anti-Entropy during recovery.
+    """
+    from unittest.mock import patch
+
+    custom_settings = global_settings.model_copy(
+        update={
+            "source_table": "ghost_products",
+            "sink_raw_table": "ghost_products",
+            "publication_name": "pub_ghost",
+            "subscription_name": "sub_ghost",
+        }
+    )
+
+    with patch.dict(
+        "os.environ",
+        {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(custom_settings)},
+    ):
+        # 1. Setup initial state with 2 items
+        async with await connect_db(
+            custom_settings.source_url, autocommit=True
+        ) as conn:
+            await conn.execute("DROP TABLE IF EXISTS ghost_products CASCADE")
+            await conn.execute(
+                "CREATE TABLE ghost_products (id INT PRIMARY KEY, name TEXT, description TEXT)"
+            )
+            await conn.execute(
+                "INSERT INTO ghost_products (id, name, description) VALUES (1, 'Item 1', 'Desc 1'), (2, 'Item 2', 'Desc 2')"
+            )
+
+        # Start and sync
+        async with PGSearchReplica(
+            sync=True, **custom_settings.model_dump()
+        ) as replica:
+            await wait_for_pgai_sync(replica.settings, expected_count=2)
+
+            # 2. Stop daemon and "Hard Delete" from Source
+            # Note: We stop the orchestrator manually to simulate crash/down-time
+            await replica.stop()
+
+            async with await connect_db(
+                custom_settings.source_url, autocommit=True
+            ) as conn:
+                await conn.execute("DELETE FROM ghost_products WHERE id = 1")
+                # Also drop slot to force recovery mode on restart
+                # Use a safe drop that doesn't fail if already gone
+                await conn.execute(
+                    f"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = '{custom_settings.subscription_name}'"
+                )
+
+            # 3. Restart and verify Ghost is gone
+            await replica.start(sync=True)
+
+            # Anti-Entropy should have deleted Item 1 from Sink
+            # We check the raw table in Sink
+            found = True
+            for _ in range(10):
+                async with await connect_db(
+                    replica.settings.resolved_sink_url
+                ) as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "SELECT count(*) FROM ghost_products WHERE id = 1"
+                        )
+                        res = await cur.fetchone()
+                        if res[0] == 0:
+                            found = False
+                            break
+                await asyncio.sleep(1)
+
+            assert not found, "Ghost record was not deleted by Anti-Entropy"
+
+            # Item 2 should still be there
+            async with await connect_db(
+                replica.settings.resolved_sink_url
+            ) as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT count(*) FROM ghost_products WHERE id = 2"
+                    )
+                    res = await cur.fetchone()
+                    assert res[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_self_destruct_and_auto_heal():
+    """
+    Full lifecycle test:
+    1. Replicate data
+    2. Trigger Watchdog self-destruct (nukes slot)
+    3. Restart daemon
+    4. Verify it healed itself via SQL catch-up
+    """
+    from unittest.mock import patch
+    from pg_replica.database import check_and_protect_source
+
+    custom_settings = global_settings.model_copy(
+        update={
+            "source_table": "heal_products",
+            "sink_raw_table": "heal_products",
+            "publication_name": "pub_heal",
+            "subscription_name": "sub_heal",
+            "max_slot_wal_keep_size_mb": -1,  # Trigger instant self-destruct
+        }
+    )
+
+    with patch.dict(
+        "os.environ",
+        {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(custom_settings)},
+    ):
+        # 1. Setup Source
+        async with await connect_db(
+            custom_settings.source_url, autocommit=True
+        ) as conn:
+            await conn.execute("DROP TABLE IF EXISTS heal_products CASCADE")
+            await conn.execute(
+                "CREATE TABLE heal_products (id INT PRIMARY KEY, name TEXT, description TEXT)"
+            )
+            await conn.execute(
+                "INSERT INTO heal_products (id, name, description) VALUES (1, 'Initial', 'Pre-destruct')"
+            )
+
+        # 2. Start and Sync
+        async with PGSearchReplica(
+            sync=True, **custom_settings.model_dump()
+        ) as replica:
+            await wait_for_pgai_sync(replica.settings, expected_count=1)
+
+            # 3. Trigger self-destruct
+            # We wait for the background monitor to trigger it or call it manually
+            # If the background worker hasn't triggered it yet, we call it here.
+            try:
+                await check_and_protect_source(replica.settings)
+            except RuntimeError as e:
+                if "Self-destructed" not in str(e):
+                    raise
+
+            # Verify slot is gone (either background worker or our call did it)
+            # Give it a few seconds for the background worker to finish if it started first
+            slot_still_exists = True
+            for _ in range(10):
+                if not await check_slot_exists(replica.settings):
+                    slot_still_exists = False
+                    break
+                await asyncio.sleep(1)
+
+            assert (
+                not slot_still_exists
+            ), "Replication slot was not dropped by Watchdog"
+
+            # 4. Insert data while "dead"
+            async with await connect_db(
+                custom_settings.source_url, autocommit=True
+            ) as conn:
+                await conn.execute(
+                    "INSERT INTO heal_products (id, name, description) VALUES (2, 'During Gap', 'Post-destruct')"
+                )
+
+            # 5. Restart (Daemon should auto-heal)
+            # We need to reset the safety limit for the restart to succeed
+            replica.settings.max_slot_wal_keep_size_mb = 1024
+            await replica.start(sync=True)
+
+            # Wait for catch-up and vectorization of new record
+            await wait_for_pgai_sync(replica.settings, expected_count=2)
+
+            # Verify both records are there
+            results = await replica.search("destruct")
+            assert len(results) >= 2
+            contents = [r["content"] for r in results]
+            assert any("Pre-destruct" in c for c in contents)
+            assert any("Post-destruct" in c for c in contents)
