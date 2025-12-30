@@ -1,7 +1,10 @@
 import asyncio
 import logging
 import signal
+import sys
+import uvicorn
 from typing import Callable
+from pythonjsonlogger.json import JsonFormatter
 from .config import settings
 from .database import (
     setup_source,
@@ -9,11 +12,23 @@ from .database import (
     drop_subscription_completely,
     connect_db,
     check_and_protect_source,
+    init_pools,
+    close_pools,
 )
+from .observability import update_replication_lag, update_pgai_pending, app as observability_app
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+# Configure structured JSON logging
+logHandler = logging.StreamHandler(sys.stdout)
+formatter = JsonFormatter(
+    "%(asctime)s %(levelname)s %(name)s %(message)s"
 )
+logHandler.setFormatter(formatter)
+
+# Clear existing handlers and set up our JSON handler
+root_logger = logging.getLogger()
+root_logger.handlers = [logHandler]
+root_logger.setLevel(logging.INFO)
+
 logger = logging.getLogger(__name__)
 
 
@@ -30,6 +45,7 @@ async def log_pgai_status():
                     logger.info(
                         f"pgai Status for {table}: {pending} items pending"
                     )
+                    update_pgai_pending(str(table), int(pending))
     except Exception as e:
         logger.warning(f"Failed to fetch pgai status: {e}")
 
@@ -49,7 +65,9 @@ async def run_daemon(
         while not stop_event.is_set():
             try:
                 # Watchdog: Protect source from lag
-                await check_and_protect_source(settings)
+                lag_mb = await check_and_protect_source(settings)
+                update_replication_lag(lag_mb)
+
                 # Observability: Log pgai status
                 await log_pgai_status()
             except RuntimeError as e:
@@ -72,6 +90,19 @@ async def run_daemon(
 async def main():
     loop = asyncio.get_running_loop()
 
+    # Initialize connection pools
+    await init_pools(settings)
+
+    # Start Health/Metrics server in the background
+    config = uvicorn.Config(
+        observability_app,
+        host=settings.observability_host,
+        port=settings.observability_port,
+        log_level="error",
+    )
+    server = uvicorn.Server(config)
+    server_task = asyncio.create_task(server.serve())
+
     # Run setup before starting the daemon with retries
     # This handles cases where Postgres is starting or in recovery
     max_retries = 5
@@ -85,6 +116,7 @@ async def main():
                 logger.critical(
                     f"Failed to setup Source/Sink after {max_retries} attempts: {e}"
                 )
+                await close_pools()
                 return
             logger.warning(
                 f"Setup attempt {i+1} failed (Postgres might be in recovery). Retrying in 5s... Error: {e}"
@@ -94,6 +126,7 @@ async def main():
     def handle_exit():
         logger.info("Shutdown signal received...")
         task.cancel()
+        server.should_exit = True
 
     task = asyncio.create_task(run_daemon(loop, handle_exit))
 
@@ -106,6 +139,9 @@ async def main():
         logger.info("Daemon task cancelled.")
     finally:
         await drop_subscription_completely(settings)
+        await close_pools()
+        # Wait for server to shutdown
+        await server_task
 
 
 if __name__ == "__main__":

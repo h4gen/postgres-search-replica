@@ -1,13 +1,72 @@
 import logging
 import psycopg
+from psycopg_pool import AsyncConnectionPool
 from pgvector.psycopg import register_vector_async as register_vector  # type: ignore
 from .config import Settings
 
 logger = logging.getLogger(__name__)
 
+# Global pools
+_source_pool: AsyncConnectionPool | None = None
+_sink_pool: AsyncConnectionPool | None = None
+
+
+async def init_pools(settings: Settings):
+    """Initialize connection pools for source and sink."""
+    global _source_pool, _sink_pool
+    if not _source_pool:
+        logger.info("Initializing source connection pool...")
+        _source_pool = AsyncConnectionPool(
+            conninfo=settings.source_url,
+            min_size=1,
+            max_size=5,
+            open=False,  # Don't open yet
+        )
+        await _source_pool.open()
+
+    if not _sink_pool:
+        logger.info("Initializing sink connection pool...")
+        _sink_pool = AsyncConnectionPool(
+            conninfo=settings.resolved_sink_url,
+            min_size=1,
+            max_size=10,
+            open=False,
+        )
+        await _sink_pool.open()
+
+
+async def close_pools():
+    """Close connection pools."""
+    global _source_pool, _sink_pool
+    if _source_pool:
+        logger.info("Closing source connection pool...")
+        await _source_pool.close()
+        _source_pool = None
+    if _sink_pool:
+        logger.info("Closing sink connection pool...")
+        await _sink_pool.close()
+        _sink_pool = None
+
+
+async def get_source_conn():
+    """Get a connection from the source pool."""
+    if not _source_pool:
+        raise RuntimeError("Source pool not initialized")
+    return _source_pool.connection()
+
+
+async def get_sink_conn():
+    """Get a connection from the sink pool."""
+    if not _sink_pool:
+        raise RuntimeError("Sink pool not initialized")
+    return _sink_pool.connection()
+
 
 async def connect_db(url: str, **kwargs):
-    """Connect to database."""
+    """
+    Connect to database (one-off connection).
+    Use pools (get_source_conn/get_sink_conn) for long-running processes.
+    """
     conn = await psycopg.AsyncConnection.connect(url, **kwargs)
     return conn
 
@@ -15,7 +74,8 @@ async def connect_db(url: str, **kwargs):
 async def setup_source(settings: Settings):
     """Remotely initialize the source publication."""
     logger.info("Setting up remote source publication...")
-    async with await connect_db(settings.source_url, autocommit=True) as conn:
+    async with await get_source_conn() as conn:
+        await conn.set_autocommit(True)
         async with conn.cursor() as cur:
             cols = ", ".join(settings.publication_columns)
             where_clause = (
@@ -46,9 +106,8 @@ async def setup_source(settings: Settings):
 async def setup_sink(settings: Settings):
     """Initialize the sink table and subscription."""
     logger.info("Setting up local sink database...")
-    async with await connect_db(
-        settings.resolved_sink_url, autocommit=True
-    ) as conn:
+    async with await get_sink_conn() as conn:
+        await conn.set_autocommit(True)
         async with conn.cursor() as cur:
             # Extensions
             await cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
@@ -184,9 +243,8 @@ async def drop_subscription_completely(settings: Settings):
     """Drop subscription and slot from source on shutdown."""
     logger.info("Dropping subscription and slot from source...")
     try:
-        async with await connect_db(
-            settings.resolved_sink_url, autocommit=True
-        ) as conn:
+        async with await get_sink_conn() as conn:
+            await conn.set_autocommit(True)
             await conn.execute(
                 f"DROP SUBSCRIPTION IF EXISTS {settings.subscription_name}"
             )
@@ -194,13 +252,14 @@ async def drop_subscription_completely(settings: Settings):
         logger.warning(f"Failed to drop subscription: {e}")
 
 
-async def check_and_protect_source(settings: Settings):
+async def check_and_protect_source(settings: Settings) -> float:
     """
     Monitor replication lag on Source and self-destruct if it exceeds safety limits.
-    Returns True if safe, raises Exception if self-destruct triggered.
+    Returns current lag in MB if safe, raises Exception if self-destruct triggered.
     """
+    lag_mb = 0.0
     try:
-        async with await connect_db(settings.source_url) as conn:
+        async with await get_source_conn() as conn:
             async with conn.cursor() as cur:
                 # Query lag for our specific slot
                 # We use pg_wal_lsn_diff to get bytes between current WAL and slot's restart_lsn
@@ -215,7 +274,7 @@ async def check_and_protect_source(settings: Settings):
                 )
                 res = await cur.fetchone()
                 if res:
-                    lag_mb = res[0]
+                    lag_mb = float(res[0])
                     if lag_mb > settings.max_slot_wal_keep_size_mb:
                         logger.critical(
                             f"REPLICATION LAG ({lag_mb:.1f} MB) EXCEEDED SAFETY LIMIT ({settings.max_slot_wal_keep_size_mb} MB)!"
@@ -231,9 +290,9 @@ async def check_and_protect_source(settings: Settings):
                         logger.warning(
                             f"High replication lag detected: {lag_mb:.1f} MB (Limit: {settings.max_slot_wal_keep_size_mb} MB)"
                         )
-        return True
+        return lag_mb
     except Exception as e:
         if "Self-destructed" in str(e):
             raise
         logger.warning(f"Failed to check replication lag: {e}")
-        return True
+        return lag_mb

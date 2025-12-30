@@ -28,7 +28,7 @@ test-unit:
 	@echo "Unit tests for custom transformers are deprecated after pgai migration."
 
 test-integration:
-	PYTHONPATH=src uv run pytest -v -s --log-cli-level=INFO tests/test_integration.py
+	PYTHONPATH=src uv run pytest -v -s --log-cli-level=INFO tests/
 
 lint:
 	uv run ruff check src tests

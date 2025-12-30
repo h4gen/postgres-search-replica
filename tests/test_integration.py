@@ -301,6 +301,7 @@ async def test_wal_watchdog_self_destruct():
     Test the Source Protection (Watchdog).
     """
     from unittest.mock import patch
+    from pg_replica.database import init_pools, close_pools
 
     with patch.dict(
         "os.environ",
@@ -310,6 +311,7 @@ async def test_wal_watchdog_self_destruct():
             sync=True, max_slot_wal_keep_size_mb=-1
         ) as replica:
             settings = replica.settings
+            # Pools are already initialized by Orchestrator.start() via PGSearchReplica
             # 2. Trigger watchdog
             with pytest.raises(
                 RuntimeError, match="Self-destructed to protect Source DB"
@@ -341,8 +343,17 @@ async def test_wal_watchdog_self_destruct():
 @pytest.mark.asyncio
 async def test_idempotent_cleanup():
     """Verify that drop_subscription_completely is safe to call multiple times."""
-    from pg_replica.database import drop_subscription_completely
+    from pg_replica.database import (
+        drop_subscription_completely,
+        init_pools,
+        close_pools,
+    )
 
-    # Call it twice - should not raise exception even if it's already gone
-    await drop_subscription_completely(global_settings)
-    await drop_subscription_completely(global_settings)
+    # We need pools for drop_subscription_completely as it uses get_sink_conn()
+    await init_pools(global_settings)
+    try:
+        # Call it twice - should not raise exception even if it's already gone
+        await drop_subscription_completely(global_settings)
+        await drop_subscription_completely(global_settings)
+    finally:
+        await close_pools()

@@ -18,6 +18,11 @@ dependencies = [
     "anthropic>=0.25.0",
     "litellm>=1.35.0",
     "langchain-text-splitters>=0.2.0",
+    "psycopg-pool>=3.3.0",
+    "python-json-logger>=4.0.0",
+    "prometheus-client>=0.23.1",
+    "fastapi>=0.128.0",
+    "uvicorn>=0.40.0",
 ]
 
 [project.optional-dependencies]

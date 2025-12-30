@@ -11,6 +11,8 @@ from .database import (
     drop_subscription_completely,
     check_and_protect_source,
     connect_db,
+    init_pools,
+    close_pools,
 )
 from pgai.vectorizer.worker import Worker
 
@@ -141,7 +143,10 @@ class Orchestrator:
                 raise RuntimeError("Failed to start local Postgres")
             logger.info("Local Postgres is ready.")
 
-        # 2. Setup Source/Sink (Idempotent)
+        # 2. Initialize connection pools
+        await init_pools(self.settings)
+
+        # 3. Setup Source/Sink (Idempotent)
         max_retries = 5
         for i in range(max_retries):
             try:
@@ -186,6 +191,9 @@ class Orchestrator:
             await drop_subscription_completely(self.settings)
         except Exception as e:
             logger.debug(f"Failed to drop subscription during stop: {e}")
+
+        # Close pools before stopping Postgres
+        await close_pools()
 
         if self._pg_process:
             logger.info("Stopping local Postgres...")
