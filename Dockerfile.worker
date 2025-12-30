@@ -1,0 +1,17 @@
+FROM python:3.12-slim
+
+# Install uv for fast dependency management
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uv/bin/uv
+
+WORKDIR /app
+
+# Copy dependency files
+COPY pyproject.toml uv.lock ./
+
+# Install the worker extra group and base dependencies
+# We use --system to install into the image's python environment
+RUN /uv/bin/uv pip install --system --no-cache ".[worker]" && /uv/bin/uv cache clean
+
+# The worker doesn't need the sidecar source code to run pgai CLI
+ENTRYPOINT ["/usr/local/bin/pgai"]
+

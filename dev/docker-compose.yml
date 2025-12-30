@@ -30,8 +30,8 @@ services:
   ai-worker:
     build: 
       context: ..
-      dockerfile: Dockerfile
-    command: ["/uv/bin/uv", "run", "pgai", "vectorizer", "worker", "--db-url", "postgresql://postgres:password@sink:5432/search_replica_db", "--poll-interval", "2s"]
+      dockerfile: Dockerfile.worker
+    command: ["vectorizer", "worker", "--db-url", "postgresql://postgres:password@sink:5432/search_replica_db", "--poll-interval", "2s"]
     environment:
       - OLLAMA_HOST=http://ollama:11434
     depends_on:
@@ -43,3 +43,6 @@ services:
     image: ollama/ollama:latest
     ports:
       - "11434:11434"
+    # Pull the required embedding model on startup
+    entrypoint: /bin/sh
+    command: -c "ollama serve & sleep 5 && ollama pull nomic-embed-text && wait"

@@ -18,7 +18,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 
 # Use uv to manage the environment
-RUN /uv/bin/uv sync --frozen
+RUN /uv/bin/uv sync --frozen && /uv/bin/uv cache clean
 
 # Set PYTHONPATH to include the app directory
 ENV PYTHONPATH=/app
