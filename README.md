@@ -1,4 +1,4 @@
-# Search Replica Client & Daemon
+# Postgres Search Replica Client & Daemon
 
 A professional-grade PostgreSQL search replica library with real-time vectorization using `pgai`, source database protection, and `pgvector` support.
 
@@ -107,6 +107,9 @@ async def search_example():
 
 - **Declarative Chunk Decoration**: Automatically combine metadata (e.g., `name`) with chunked text (e.g., `description`) using Python-style templates to preserve context across all vectors.
 - **Source Protection (Watchdog)**: Actively monitors replication lag. If the lag exceeds `MAX_SLOT_WAL_KEEP_SIZE_MB`, it triggers a self-destruct to ensure the Source DB never runs out of disk space.
+- **Connection Pooling**: Uses `psycopg-pool` for robust management of database connections, preventing exhaustion under high load.
+- **Observability Hub**: Built-in FastAPI server providing health checks and real-time Prometheus metrics.
+- **Structured JSON Logging**: Native support for single-line JSON logging, ready for ingestion by Datadog, ELK, or Grafana Loki.
 - **Managed Lifecycle**: Automatically handles replication slot creation/cleanup and `pgai` worker management.
 - **Smart Reconciliation**: Only updates embeddings when source data actually changes, leveraging `pgai` native state tracking.
 - **Zero-Touch Config**: Automatically synchronizes publication columns and filters from Python settings to the database on startup.
@@ -136,9 +139,27 @@ Settings are managed via Pydantic and can be overridden by environment variables
 - `LOCAL_PORT`: Port for the internal managed Postgres (default: `54322`).
 - `PUBLICATION_COLUMNS`: List of columns to replicate (default: `["id", "name", "description"]`).
 - `MAX_SLOT_WAL_KEEP_SIZE_MB`: Safety threshold for the Watchdog (default: `1024`).
+- `OBSERVABILITY_HOST`: Host for the health/metrics server (default: `0.0.0.0`).
+- `OBSERVABILITY_PORT`: Port for the health/metrics server (default: `8000`).
 
 ### Vectorizer Settings
 - `EMBEDDING_MODEL`: The model name (default: `nomic-embed-text`).
 - `EMBEDDING_DIMENSION`: Dimension of the vector (default: `768`).
 
 See `src/pg_replica/config.py` for all available options.
+
+## Observability
+
+The library includes a built-in observability server (FastAPI) that starts automatically with the daemon.
+
+### Endpoints
+- **GET `/health`**: Returns `{"status": "ok"}`. Used for liveness and readiness probes.
+- **GET `/metrics`**: Exports Prometheus-formatted metrics including:
+    - `replication_lag_mb`: Current WAL distance from the source database.
+    - `pgai_pending_items`: Number of items currently queued for vectorization (labeled by table).
+
+### Structured Logging
+All logs are output as single-line JSON objects by default. This ensures seamless integration with modern logging infrastructure (Datadog, Grafana Loki, ELK):
+```json
+{"asctime": "2025-12-30 19:30:17,123", "levelname": "INFO", "name": "pg_replica.main", "message": "Daemon started."}
+```
