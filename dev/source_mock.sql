@@ -1,12 +1,11 @@
-CREATE TABLE users (
+CREATE TABLE products (
     id SERIAL PRIMARY KEY,
     name TEXT NOT NULL,
-    email TEXT NOT NULL,
-    secret_key TEXT
+    description TEXT NOT NULL,
+    price DECIMAL(10, 2)
 );
 
-INSERT INTO users (name, email, secret_key) VALUES
-('Alice', 'alice@example.com', 'sk_live_123'),
-('Bob', 'bob@company.org', 'sk_live_456'),
-('Charlie', 'charlie@gmail.com', 'sk_live_789');
-
+INSERT INTO products (name, description, price) VALUES
+('AI Assistant Bot', 'A state-of-the-art autonomous AI agent for productivity.', 49.99),
+('Smart Fitness Watch', 'Water-resistant fitness tracker with heart rate monitoring.', 129.50),
+('Wireless Noise-Canceling Headphones', 'Premium audio quality with active noise cancellation.', 299.00);

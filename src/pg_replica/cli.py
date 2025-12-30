@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 async def run_service():
     """Run the PGSearchReplica as a long-running service."""
     # Settings are automatically loaded from env vars by Pydantic
-    replica = PGSearchReplica()
+    replica = PGSearchReplica(sync=True)
     
     # Setup signal handlers for graceful shutdown
     loop = asyncio.get_running_loop()

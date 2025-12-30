@@ -1,11 +1,11 @@
 import pytest
 import asyncio
 from pgvector.psycopg import register_vector_async as register_vector  # type: ignore
-from pg_replica import PGSearchReplica, settings
+from pg_replica import PGSearchReplica, settings as global_settings
 from pg_replica.database import connect_db, check_and_protect_source
 
 
-async def wait_for_pgai_sync(sink_url, expected_count=1, timeout=60):
+async def wait_for_pgai_sync(settings, expected_count=1, timeout=60):
     """Wait for pgai vectorizer to finish processing all rows."""
     import time
     import logging
@@ -17,7 +17,7 @@ async def wait_for_pgai_sync(sink_url, expected_count=1, timeout=60):
         f"Waiting for {expected_count} embeddings in {embedding_table}..."
     )
     while time.time() - start_time < timeout:
-        async with await connect_db(sink_url) as conn:
+        async with await connect_db(settings.resolved_sink_url) as conn:
             async with conn.cursor() as cur:
                 # 1. Check for errors first
                 try:
@@ -64,7 +64,7 @@ async def wait_for_pgai_sync(sink_url, expected_count=1, timeout=60):
     return False
 
 
-def get_internal_source_url():
+def get_internal_source_url(settings):
     """Helper to translate localhost URL to internal Docker URL for subscription."""
     return settings.source_url.replace("localhost:5433", "source:5432").replace(
         "127.0.0.1:5433", "source:5432"
@@ -83,9 +83,11 @@ async def test_full_replication_flow():
 
     # We need to provide the internal source URL for the subscription CONNECTION string
     with patch.dict(
-        "os.environ", {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url()}
+        "os.environ",
+        {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(global_settings)},
     ):
-        async with PGSearchReplica() as replica:
+        async with PGSearchReplica(sync=True) as replica:
+            settings = replica.settings
             # Clean up from previous runs
             async with await connect_db(
                 settings.source_url, autocommit=True
@@ -101,12 +103,13 @@ async def test_full_replication_flow():
                 )
 
             # 2. Insert test data into Source
+            # Note: We insert into 'name' and 'description'
             async with await connect_db(
                 settings.source_url, autocommit=True
             ) as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(
-                        f"INSERT INTO {settings.source_table} (name, {settings.content_column}) VALUES ('Test User', 'TEST@INTEGRATION.COM')"
+                        f"INSERT INTO {settings.source_table} (name, description) VALUES ('SuperGadget', 'A really useful tool for testing')"
                     )
 
             # 3. VERIFY NATIVE REPLICATION (Core logic check)
@@ -116,7 +119,7 @@ async def test_full_replication_flow():
                 async with await connect_db(settings.resolved_sink_url) as conn:
                     async with conn.cursor() as cur:
                         await cur.execute(
-                            f"SELECT 1 FROM {settings.sink_raw_table} WHERE {settings.content_column} = 'TEST@INTEGRATION.COM'"
+                            f"SELECT 1 FROM {settings.sink_raw_table} WHERE name = 'SuperGadget'"
                         )
                         if await cur.fetchone():
                             found = True
@@ -128,13 +131,16 @@ async def test_full_replication_flow():
             ), f"Native replication failed to move data to Sink {settings.sink_raw_table} table"
 
             # 4. Wait for pgai transformation
-            sync_complete = await wait_for_pgai_sync(settings.resolved_sink_url)
+            sync_complete = await wait_for_pgai_sync(settings)
             assert sync_complete, "pgai sync timed out"
 
             # 5. Verify search results via the new API
-            results = await replica.search("TEST@INTEGRATION.COM")
+            # Test that we can find it by the concatenated name
+            results = await replica.search("SuperGadget")
             assert len(results) > 0
-            assert results[0]["content"] == "TEST@INTEGRATION.COM"
+            # The target_content_column should now contain the concatenated string
+            assert "SuperGadget" in results[0]["content"]
+            assert "useful tool" in results[0]["content"]
             assert "distance" in results[0]
 
 
@@ -142,82 +148,77 @@ async def test_full_replication_flow():
 async def test_filtered_replication_flow():
     """
     Test PG 15 Row Filtering:
-    1. Set filter to only replicate matching users
+    1. Set filter to only replicate matching products
     2. Verify only matching data reached the RAW table (Core logic)
     3. Verify search works only for matching data
     """
     from unittest.mock import patch
 
-    # Override settings for this test
-    original_filter = settings.publication_where
-    settings.publication_where = f"{settings.content_column} LIKE '%KEEP%'"
+    # We need to provide the internal source URL for the subscription CONNECTION string
+    with patch.dict(
+        "os.environ",
+        {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(global_settings)},
+    ):
+        # Override settings for this test
+        async with PGSearchReplica(
+            sync=True,
+            publication_where="description LIKE '%KEEP%'",
+        ) as replica:
+            settings = replica.settings
+            # Clean up
+            async with await connect_db(
+                settings.source_url, autocommit=True
+            ) as conn:
+                await conn.execute(
+                    f"TRUNCATE TABLE {settings.source_table} CASCADE"
+                )
+            async with await connect_db(
+                settings.resolved_sink_url, autocommit=True
+            ) as conn:
+                await conn.execute(
+                    f"TRUNCATE TABLE {settings.sink_raw_table} CASCADE"
+                )
 
-    try:
-        with patch.dict(
-            "os.environ", {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url()}
-        ):
-            async with PGSearchReplica() as replica:
-                # Clean up
-                async with await connect_db(
-                    settings.source_url, autocommit=True
-                ) as conn:
-                    await conn.execute(
-                        f"TRUNCATE TABLE {settings.source_table} CASCADE"
+            # Insert matching and non-matching data
+            async with await connect_db(
+                settings.source_url, autocommit=True
+            ) as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"INSERT INTO {settings.source_table} (name, description) VALUES ('Keep Me', 'KEEP THIS DESCRIPTION')"
                     )
-                async with await connect_db(
-                    settings.resolved_sink_url, autocommit=True
-                ) as conn:
-                    await conn.execute(
-                        f"TRUNCATE TABLE {settings.sink_raw_table} CASCADE"
+                    await cur.execute(
+                        f"INSERT INTO {settings.source_table} (name, description) VALUES ('Ignore Me', 'IGNORE THIS ONE')"
                     )
 
-                # Insert matching and non-matching data
-                async with await connect_db(
-                    settings.source_url, autocommit=True
-                ) as conn:
-                    async with conn.cursor() as cur:
-                        await cur.execute(
-                            f"INSERT INTO {settings.source_table} (name, {settings.content_column}) VALUES ('Keep Me', 'KEEP@ME.COM')"
-                        )
-                        await cur.execute(
-                            f"INSERT INTO {settings.source_table} (name, {settings.content_column}) VALUES ('Ignore Me', 'IGNORE@ME.COM')"
-                        )
-
-                # Wait for replication to RAW table
-                found_keep = False
-                for _ in range(10):
-                    async with await connect_db(
-                        settings.resolved_sink_url
-                    ) as conn:
-                        async with conn.cursor() as cur:
-                            await cur.execute(
-                                f"SELECT 1 FROM {settings.sink_raw_table} WHERE {settings.content_column} = 'KEEP@ME.COM'"
-                            )
-                            if await cur.fetchone():
-                                found_keep = True
-                                break
-                    await asyncio.sleep(1)
-                assert found_keep, "Matching data was not replicated"
-
-                # Verify non-matching one is NOT there
+            # Wait for replication to RAW table
+            found_keep = False
+            for _ in range(10):
                 async with await connect_db(settings.resolved_sink_url) as conn:
                     async with conn.cursor() as cur:
                         await cur.execute(
-                            f"SELECT 1 FROM {settings.sink_raw_table} WHERE {settings.content_column} = 'IGNORE@ME.COM'"
+                            f"SELECT 1 FROM {settings.sink_raw_table} WHERE description = 'KEEP THIS DESCRIPTION'"
                         )
-                        assert (
-                            await cur.fetchone() is None
-                        ), "Non-matching data was replicated (FILTER FAILED)"
+                        if await cur.fetchone():
+                            found_keep = True
+                            break
+                await asyncio.sleep(1)
+            assert found_keep, "Matching data was not replicated"
 
-                # Wait for sync and verify search
-                await wait_for_pgai_sync(
-                    settings.resolved_sink_url, expected_count=1
-                )
-                results = await replica.search("KEEP@ME.COM")
-                assert any(r["content"] == "KEEP@ME.COM" for r in results)
+            # Verify non-matching one is NOT there
+            async with await connect_db(settings.resolved_sink_url) as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"SELECT 1 FROM {settings.sink_raw_table} WHERE description = 'IGNORE THIS ONE'"
+                    )
+                    assert (
+                        await cur.fetchone() is None
+                    ), "Non-matching data was replicated (FILTER FAILED)"
 
-    finally:
-        settings.publication_where = original_filter
+            # Wait for sync and verify search
+            await wait_for_pgai_sync(settings, expected_count=1)
+            results = await replica.search("KEEP THIS DESCRIPTION")
+            assert any("KEEP THIS DESCRIPTION" in r["content"] for r in results)
 
 
 @pytest.mark.asyncio
@@ -232,9 +233,11 @@ async def test_reconciliation_efficiency():
     from unittest.mock import patch
 
     with patch.dict(
-        "os.environ", {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url()}
+        "os.environ",
+        {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(global_settings)},
     ):
-        async with PGSearchReplica() as replica:
+        async with PGSearchReplica(sync=True) as replica:
+            settings = replica.settings
             # 1. Setup initial state
             async with await connect_db(
                 settings.source_url, autocommit=True
@@ -243,7 +246,7 @@ async def test_reconciliation_efficiency():
                     f"TRUNCATE TABLE {settings.source_table} CASCADE"
                 )
                 await conn.execute(
-                    f"INSERT INTO {settings.source_table} (id, name, {settings.content_column}) VALUES (1, 'Stable', 'stable@test.com')"
+                    f"INSERT INTO {settings.source_table} (id, name, description) VALUES (1, 'Stable', 'stable product description')"
                 )
 
             async with await connect_db(
@@ -253,7 +256,7 @@ async def test_reconciliation_efficiency():
                     f"TRUNCATE TABLE {settings.sink_raw_table} CASCADE"
                 )
 
-            await wait_for_pgai_sync(settings.resolved_sink_url)
+            await wait_for_pgai_sync(settings)
 
             # 2. Record state
             async with await connect_db(settings.resolved_sink_url) as conn:
@@ -272,10 +275,10 @@ async def test_reconciliation_efficiency():
             ) as conn:
                 await conn.execute(f"TRUNCATE TABLE {settings.sink_raw_table}")
                 await conn.execute(
-                    f"INSERT INTO {settings.sink_raw_table} ({settings.id_column}, {settings.content_column}) VALUES (1, 'stable@test.com')"
+                    f"INSERT INTO {settings.sink_raw_table} ({settings.id_column}, name, description) VALUES (1, 'Stable', 'stable product description')"
                 )
 
-            await wait_for_pgai_sync(settings.resolved_sink_url)
+            await wait_for_pgai_sync(settings)
 
             # 4. Verify unchanged
             async with await connect_db(settings.resolved_sink_url) as conn:
@@ -300,18 +303,18 @@ async def test_wal_watchdog_self_destruct():
     from unittest.mock import patch
 
     with patch.dict(
-        "os.environ", {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url()}
+        "os.environ",
+        {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(global_settings)},
     ):
-        async with PGSearchReplica() as replica:
+        async with PGSearchReplica(
+            sync=True, max_slot_wal_keep_size_mb=-1
+        ) as replica:
+            settings = replica.settings
             # 2. Trigger watchdog
-            settings.max_slot_wal_keep_size_mb = (
-                -1
-            )  # Force immediate self-destruct
-
             with pytest.raises(
                 RuntimeError, match="Self-destructed to protect Source DB"
             ):
-                await check_and_protect_source()
+                await check_and_protect_source(settings)
 
             # 3. Verify cleanup via DB queries
             async with await connect_db(settings.source_url) as conn:
@@ -341,5 +344,5 @@ async def test_idempotent_cleanup():
     from pg_replica.database import drop_subscription_completely
 
     # Call it twice - should not raise exception even if it's already gone
-    await drop_subscription_completely()
-    await drop_subscription_completely()
+    await drop_subscription_completely(global_settings)
+    await drop_subscription_completely(global_settings)

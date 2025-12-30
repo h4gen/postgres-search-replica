@@ -2,7 +2,7 @@ import asyncio
 import logging
 from typing import Any, Optional
 
-from .config import settings
+from .config import settings as global_settings
 from .database import connect_db
 from .orchestrator import Orchestrator
 
@@ -15,33 +15,32 @@ class PGSearchReplica:
     Handles both infrastructure (replication, workers) and querying.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, sync: bool = False, **kwargs):
         """
         Initialize with optional configuration overrides.
         Example: PGSearchReplica(sink_url="local", source_url="...")
         """
-        for key, value in kwargs.items():
-            if hasattr(settings, key):
-                setattr(settings, key, value)
-
+        # Isolate settings per instance
+        self.settings = global_settings.model_copy(update=kwargs)
+        self._sync_mode = sync
         self._orchestrator: Optional[Orchestrator] = None
         self._conn = None
 
     async def __aenter__(self):
-        await self.start()
+        await self.start(sync=self._sync_mode)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.stop()
 
-    async def start(self, sync: bool = True):
+    async def start(self, sync: bool = False):
         """
         Start the replica.
         If sync=True, starts the background replication and workers.
         """
         if sync:
             logger.info("Starting PGSearchReplica in Sync Mode...")
-            self._orchestrator = Orchestrator()
+            self._orchestrator = Orchestrator(self.settings)
             await self._orchestrator.start()
         else:
             logger.info(
@@ -60,7 +59,7 @@ class PGSearchReplica:
 
     async def _get_conn(self):
         if not self._conn or self._conn.closed:
-            self._conn = await connect_db(settings.resolved_sink_url)
+            self._conn = await connect_db(self.settings.resolved_sink_url)
             # Register vector types
             from pgvector.psycopg import register_vector_async
 
@@ -78,7 +77,7 @@ class PGSearchReplica:
             limit: Number of results to return.
             table: Optional override for the replica table name.
         """
-        target_table = table or settings.sink_replica_table
+        target_table = table or self.settings.sink_replica_table
 
         # 1. Get embedding in Python (Clean, fast, no Postgres hacks)
         import os
@@ -89,7 +88,7 @@ class PGSearchReplica:
 
         # Use the same model as configured for the vectorizer
         res = await client.embeddings(
-            model=settings.embedding_model, prompt=query
+            model=self.settings.embedding_model, prompt=query
         )
         embedding = res["embedding"]
 
@@ -99,9 +98,9 @@ class PGSearchReplica:
             await cur.execute(
                 f"""
                 SELECT 
-                    {settings.id_column}, 
-                    {settings.target_content_column},
-                    {settings.embedding_column} <=> %s::vector as distance
+                    {self.settings.id_column}, 
+                    {self.settings.target_content_column},
+                    {self.settings.embedding_column} <=> %s::vector as distance
                 FROM {target_table}
                 ORDER BY distance ASC
                 LIMIT %s

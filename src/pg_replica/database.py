@@ -1,7 +1,7 @@
 import logging
 import psycopg
 from pgvector.psycopg import register_vector_async as register_vector  # type: ignore
-from .config import settings
+from .config import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +12,7 @@ async def connect_db(url: str, **kwargs):
     return conn
 
 
-async def setup_source():
+async def setup_source(settings: Settings):
     """Remotely initialize the source publication."""
     logger.info("Setting up remote source publication...")
     async with await connect_db(settings.source_url, autocommit=True) as conn:
@@ -43,7 +43,7 @@ async def setup_source():
                 )
 
 
-async def setup_sink():
+async def setup_sink(settings: Settings):
     """Initialize the sink table and subscription."""
     logger.info("Setting up local sink database...")
     async with await connect_db(
@@ -57,14 +57,17 @@ async def setup_sink():
         await register_vector(conn)
 
         async with conn.cursor() as cur:
-            # Tables
+            # Tables - Dynamically create all columns defined in publication_columns
+            cols_sql = []
+            for col in settings.publication_columns:
+                if col == settings.id_column:
+                    cols_sql.append(f"{col} INT PRIMARY KEY")
+                else:
+                    # Defaulting to TEXT for all non-ID columns for simplicity
+                    cols_sql.append(f"{col} TEXT")
+
             await cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {settings.sink_raw_table} (
-                    {settings.id_column} INT PRIMARY KEY,
-                    {settings.content_column} TEXT
-                )
-            """
+                f"CREATE TABLE IF NOT EXISTS {settings.sink_raw_table} ({', '.join(cols_sql)})"
             )
 
             # Define the vectorizer instead of creating a replica table manually
@@ -107,12 +110,16 @@ async def setup_sink():
 
             # Create the compatibility View
             embedding_table = f"{settings.sink_raw_table}_embedding"
+            # We use the same concatenation logic as pgai's Python template
+            # 'Product: $name Description: $chunk'
+            # Note: $chunk corresponds to the content_column after chunking.
+            view_content_sql = f"'Product: ' || COALESCE(r.name, '') || ' Description: ' || COALESCE(r.{settings.content_column}, '')"
             await cur.execute(
                 f"""
                 CREATE OR REPLACE VIEW {settings.sink_replica_table} AS
                 SELECT 
                     r.{settings.id_column},
-                    r.{settings.content_column} as {settings.target_content_column},
+                    {view_content_sql} as {settings.target_content_column},
                     e.{settings.embedding_column}
                 FROM {settings.sink_raw_table} r
                 LEFT JOIN {embedding_table} e ON r.{settings.id_column} = e.{settings.id_column}
@@ -173,7 +180,7 @@ async def setup_sink():
                 )
 
 
-async def drop_subscription_completely():
+async def drop_subscription_completely(settings: Settings):
     """Drop subscription and slot from source on shutdown."""
     logger.info("Dropping subscription and slot from source...")
     try:
@@ -187,7 +194,7 @@ async def drop_subscription_completely():
         logger.warning(f"Failed to drop subscription: {e}")
 
 
-async def check_and_protect_source():
+async def check_and_protect_source(settings: Settings):
     """
     Monitor replication lag on Source and self-destruct if it exceeds safety limits.
     Returns True if safe, raises Exception if self-destruct triggered.
@@ -216,7 +223,7 @@ async def check_and_protect_source():
                         logger.critical(
                             "Emergency shutdown: Dropping subscription to protect Source DB disk space."
                         )
-                        await drop_subscription_completely()
+                        await drop_subscription_completely(settings)
                         raise RuntimeError(
                             "Self-destructed to protect Source DB."
                         )

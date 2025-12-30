@@ -1,14 +1,10 @@
 import asyncio
 import logging
-import os
-import signal
 import subprocess
-import socket
 from datetime import timedelta
-from pathlib import Path
 from typing import Optional
 
-from .config import settings
+from .config import Settings
 from .database import (
     setup_source,
     setup_sink,
@@ -22,7 +18,8 @@ logger = logging.getLogger(__name__)
 
 
 class Orchestrator:
-    def __init__(self):
+    def __init__(self, settings: Settings):
+        self.settings = settings
         self._pg_process: Optional[subprocess.Popen] = None
         self._tasks: list[asyncio.Task] = []
         self._stop_event = asyncio.Event()
@@ -43,7 +40,7 @@ class Orchestrator:
                 # Extra check to ensure we can actually connect via psycopg
                 try:
                     async with await connect_db(
-                        settings.resolved_sink_url
+                        self.settings.resolved_sink_url
                     ) as conn:
                         return True
                 except Exception:
@@ -53,10 +50,10 @@ class Orchestrator:
 
     def _start_local_postgres(self):
         """Starts a local Postgres process if sink_url is 'local'."""
-        if settings.sink_url != "local":
+        if self.settings.sink_url != "local":
             return
 
-        data_dir = settings.data_dir
+        data_dir = self.settings.data_dir
         if not data_dir.exists():
             logger.info(
                 f"Initializing new Postgres data directory at {data_dir}..."
@@ -69,12 +66,11 @@ class Orchestrator:
             with open(data_dir / "pg_hba.conf", "a") as f:
                 f.write("\nhost all all all trust\n")
 
-        # Port 54322 is used for local mode by default in settings.resolved_sink_url
-        port = 54322
+        port = self.settings.local_port
         logger.info(f"Starting local Postgres on port {port}...")
 
         # We use a custom unix socket directory to avoid collisions
-        run_dir = settings.base_dir / "run"
+        run_dir = self.settings.base_dir / "run"
         run_dir.mkdir(parents=True, exist_ok=True)
 
         self._pg_process = subprocess.Popen(
@@ -99,7 +95,9 @@ class Orchestrator:
     async def _log_pgai_status(self):
         """Poll pgai status and log progress."""
         try:
-            async with await connect_db(settings.resolved_sink_url) as conn:
+            async with await connect_db(
+                self.settings.resolved_sink_url
+            ) as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(
                         "SELECT source_table, pending_items FROM ai.vectorizer_status"
@@ -118,7 +116,7 @@ class Orchestrator:
         while not self._stop_event.is_set():
             try:
                 # Watchdog: Protect source from lag
-                await check_and_protect_source()
+                await check_and_protect_source(self.settings)
                 # Observability: Log pgai status
                 await self._log_pgai_status()
             except RuntimeError as e:
@@ -137,9 +135,9 @@ class Orchestrator:
     async def start(self):
         """Start all managed services."""
         # 1. Local Postgres
-        if settings.sink_url == "local":
+        if self.settings.sink_url == "local":
             self._start_local_postgres()
-            if not await self._wait_for_pg(54322):
+            if not await self._wait_for_pg(self.settings.local_port):
                 raise RuntimeError("Failed to start local Postgres")
             logger.info("Local Postgres is ready.")
 
@@ -147,8 +145,8 @@ class Orchestrator:
         max_retries = 5
         for i in range(max_retries):
             try:
-                await setup_source()
-                await setup_sink()
+                await setup_source(self.settings)
+                await setup_sink(self.settings)
                 break
             except Exception as e:
                 if i == max_retries - 1:
@@ -160,7 +158,7 @@ class Orchestrator:
 
         # 3. Start pgai Worker
         worker = Worker(
-            db_url=settings.resolved_sink_url,
+            db_url=self.settings.resolved_sink_url,
             poll_interval=timedelta(seconds=2.0),
         )
         self._tasks.append(
@@ -185,7 +183,7 @@ class Orchestrator:
             self._tasks = []
 
         try:
-            await drop_subscription_completely()
+            await drop_subscription_completely(self.settings)
         except Exception as e:
             logger.debug(f"Failed to drop subscription during stop: {e}")
 
