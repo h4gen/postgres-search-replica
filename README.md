@@ -1,22 +1,21 @@
 # Search Replica Daemon
 
-A professional-grade PostgreSQL read replica with real-time Polars transformation, decoupled vectorization, and pgvector support.
+A professional-grade PostgreSQL read replica with real-time vectorization using pgai, source database protection, and pgvector support.
 
 ## Architecture
 
 - **Native Bridge**: Uses PostgreSQL Native Logical Replication for data movement.
-- **Async Python**: A robust daemon using `psycopg3` async notifications.
-- **Polars**: High-performance tyoe-safe batch data transformations.
+- **Async Python Control Plane**: A robust daemon that orchestrates the replication lifecycle and monitors system health.
+- **pgai**: Leverages the `pgai` extension for declarative, database-native vectorization and background worker orchestration.
 - **pgvector**: Integrated vector storage for search embeddings.
-- **Decoupled Vectorizers**: Extensible embedding logic (Dummy, OpenAI, etc.).
 - **PG 15 Row Filtering**: Selective replication to minimize network traffic and processing load.
 
 ## Key Features (Enterprise Ready)
 
 - **Source Protection (Watchdog)**: The replicator actively monitors its own replication lag. If the lag exceeds `MAX_SLOT_WAL_KEEP_SIZE_MB`, it triggers a self-destruct by dropping its subscription and slot. This ensures the Source DB never runs out of disk space, even if the replicator falls behind.
 - **Graceful Cleanup**: Automatically drops the replication slot upon normal shutdown (`SIGTERM`/`SIGINT`) to prevent WAL accumulation while offline.
-- **Smart Reconciliation**: Only updates embeddings and timestamps if the source data has actually changed, significantly reducing Sink DB load.
-- **Batch Processing**: Processes data in batches (configurable via `BATCH_SIZE`) for efficient transformation and API-friendly vectorization.
+- **Smart Reconciliation**: Leverages pgai's native state tracking to only update embeddings when source data changes.
+- **pgai Orchestration**: Uses database-native background workers for efficient vectorization.
 - **Zero-Touch & Low Privilege**: No `SUPERUSER` rights or global server configuration changes required on the Source DB. All protection logic is handled by the replicator.
 - **Zero-Touch Config**: Automatically synchronizes publication columns and filters from Python settings to the database on startup.
 - **Fully Configurable Schema**: Table and column names are entirely configurable via environment variables.
@@ -31,8 +30,8 @@ We use a `Makefile` to encapsulate best practices and common tasks.
 
 ### Common Commands
 - `make dev` - Spin up the local development environment (Source + Sink + Daemon).
-- `make test` - Run both unit and integration tests.
-- `make test-unit` - Run fast unit tests for transformation logic.
+- `make test` - Run integration tests.
+- `make test-unit` - Inform that unit tests are deprecated.
 - `make test-integration` - Run full end-to-end replication tests (requires `make dev`).
 - `make lint` - Run `ruff` linter and formatter checks.
 - `make type-check` - Run `ty` type checker for Python type safety.
@@ -61,12 +60,14 @@ Settings are managed via Pydantic and can be overridden by environment variables
 - `PUBLICATION_WHERE`: Optional PG 15 row filter clause (e.g., `id > 100`).
 - `SUBSCRIPTION_NAME`: PostgreSQL subscription name (default: `sub_users`).
 - `SUBSCRIPTION_OPTIONS`: Dict of subscription parameters (e.g., `{"streaming": "'on'"}`).
-- `BATCH_SIZE`: Number of rows to process in one transformation cycle (default: `50`).
 - `MAX_SLOT_WAL_KEEP_SIZE_MB`: Safety threshold for the Watchdog (default: `1024`).
 
-### Vectorizer Settings
-- `VECTORIZER_TYPE`: Choice of vectorization strategy. Currently supported: `dummy`.
-- `NOTIFY_CHANNEL`: PostgreSQL notification channel (default: `new_raw_data`).
+### Vectorizer Settings (pgai)
+- `EMBEDDING_PROVIDER`: The embedding provider to use (default: `ollama`).
+- `EMBEDDING_MODEL`: The model name (default: `nomic-embed-text`).
+- `EMBEDDING_DIMENSION`: Dimension of the vector (default: `768`).
+- `CHUNKING_STRATEGY`: Text splitting strategy (default: `recursive_character_text_splitter`).
+- `FORMATTING_TEMPLATE`: SQL template for the content before embedding (default: `$chunk`).
 
 See `src/config.py` for all available options and defaults.
 

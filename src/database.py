@@ -60,51 +60,76 @@ async def setup_sink():
                 f"""
                 CREATE TABLE IF NOT EXISTS {settings.sink_raw_table} (
                     {settings.id_column} INT PRIMARY KEY,
-                    {settings.content_column} TEXT,
-                    processed BOOLEAN DEFAULT FALSE
+                    {settings.content_column} TEXT
                 )
             """
             )
 
-            await cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {settings.sink_replica_table} (
-                    {settings.id_column} INT PRIMARY KEY,
-                    {settings.target_content_column} TEXT,
-                    {settings.embedding_column} vector({settings.embedding_dimension}),
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            # Define the vectorizer instead of creating a replica table manually
+            # pgai will automatically create the {settings.sink_raw_table}_embedding table
+            try:
+                await cur.execute("CREATE EXTENSION IF NOT EXISTS ai CASCADE")
+            except Exception:
+                logger.info(
+                    "Extension 'ai' not found. Attempting to install via pgai python package..."
                 )
-            """
-            )
+                import pgai
 
-            # Notification Trigger
+                # pgai.install expects a database URL string
+                pgai.install(settings.sink_url)
+                logger.info("Extension 'ai' installed successfully.")
+
+            # Check if vectorizer already exists
             await cur.execute(
-                f"""
-                CREATE OR REPLACE FUNCTION notify_new_raw_data() RETURNS trigger AS $$
+                "SELECT 1 FROM ai.vectorizer WHERE source_table::text = %s",
+                (settings.sink_raw_table,),
+            )
+            if not await cur.fetchone():
+                logger.info(
+                    f"Creating pgai vectorizer for {settings.sink_raw_table}..."
+                )
+                # We need to configure the ollama host for the worker
+                # In pgai, this is often done via environment variables for the worker,
+                # but we can also set it in the session if needed.
+                await cur.execute(f"""
+                    SELECT ai.create_vectorizer(
+                        '{settings.sink_raw_table}'::regclass,
+                        loading => ai.loading_column('{settings.content_column}'),
+                        embedding => ai.embedding_{settings.embedding_provider}('{settings.embedding_model}', {settings.embedding_dimension}),
+                        chunking => ai.chunking_{settings.chunking_strategy}(),
+                        formatting => ai.formatting_python_template('{settings.formatting_template}')
+                    )
+                """)
+
+            # Create the compatibility View
+            embedding_table = f"{settings.sink_raw_table}_embedding"
+            await cur.execute(f"""
+                CREATE OR REPLACE VIEW {settings.sink_replica_table} AS
+                SELECT 
+                    r.{settings.id_column},
+                    r.{settings.content_column} as {settings.target_content_column},
+                    e.{settings.embedding_column}
+                FROM {settings.sink_raw_table} r
+                LEFT JOIN {embedding_table} e ON r.{settings.id_column} = e.{settings.id_column}
+            """)
+
+            # IMPORTANT: Enable pgai triggers for native replication
+            # We find all triggers starting with _vectorizer_ and enable them ALWAYS
+            await cur.execute(f"""
+                DO $$
+                DECLARE
+                    trg_name TEXT;
                 BEGIN
-                    IF (TG_OP = 'UPDATE') THEN
-                        -- Only reset if actual data changed
-                        IF (OLD.{settings.content_column} IS DISTINCT FROM NEW.{settings.content_column}) THEN
-                            NEW.processed := FALSE;
-                        END IF;
-                    END IF;
-                    PERFORM pg_notify('{settings.notify_channel}', '');
-                    RETURN NEW;
-                END;
-                $$ LANGUAGE plpgsql;
-            """
-            )
-            await cur.execute(
-                f"""
-                DROP TRIGGER IF EXISTS trg_new_raw_data ON {settings.sink_raw_table};
-                CREATE TRIGGER trg_new_raw_data 
-                BEFORE INSERT OR UPDATE ON {settings.sink_raw_table} 
-                FOR EACH ROW EXECUTE FUNCTION notify_new_raw_data();
-                
-                -- Ensure trigger fires even for native replication
-                ALTER TABLE {settings.sink_raw_table} ENABLE ALWAYS TRIGGER trg_new_raw_data;
-            """
-            )
+                    FOR trg_name IN 
+                        SELECT trigger_name 
+                        FROM information_schema.triggers 
+                        WHERE event_object_table = '{settings.sink_raw_table}' 
+                        AND trigger_name LIKE '_vectorizer_%'
+                    LOOP
+                        EXECUTE 'ALTER TABLE {settings.sink_raw_table} ENABLE ALWAYS TRIGGER ' || quote_ident(trg_name);
+                    END LOOP;
+                END $$;
+            """)
 
             # Subscription
             await cur.execute(
@@ -112,10 +137,7 @@ async def setup_sink():
             )
             if not await cur.fetchone():
                 options = ", ".join(
-                    [
-                        f"{k} = {v}"
-                        for k, v in settings.subscription_options.items()
-                    ]
+                    [f"{k} = {v}" for k, v in settings.subscription_options.items()]
                 )
                 logger.info(
                     f"Creating subscription {settings.subscription_name} WITH ({options})..."
@@ -129,9 +151,7 @@ async def setup_sink():
                 """
                 )
             else:
-                logger.info(
-                    f"Refreshing subscription {settings.subscription_name}..."
-                )
+                logger.info(f"Refreshing subscription {settings.subscription_name}...")
                 await cur.execute(
                     f"ALTER SUBSCRIPTION {settings.subscription_name} ENABLE"
                 )
@@ -182,9 +202,7 @@ async def check_and_protect_source():
                             "Emergency shutdown: Dropping subscription to protect Source DB disk space."
                         )
                         await drop_subscription_completely()
-                        raise RuntimeError(
-                            "Self-destructed to protect Source DB."
-                        )
+                        raise RuntimeError("Self-destructed to protect Source DB.")
                     elif lag_mb > (settings.max_slot_wal_keep_size_mb * 0.8):
                         logger.warning(
                             f"High replication lag detected: {lag_mb:.1f} MB (Limit: {settings.max_slot_wal_keep_size_mb} MB)"
@@ -195,40 +213,3 @@ async def check_and_protect_source():
             raise
         logger.warning(f"Failed to check replication lag: {e}")
         return True
-
-
-async def get_unprocessed_rows(conn):
-    """Fetch rows from raw sink table that haven't been transformed yet."""
-    cols = ", ".join(settings.publication_columns)
-    async with conn.cursor() as cur:
-        await cur.execute(
-            f"SELECT {cols} FROM {settings.sink_raw_table} WHERE processed = FALSE FOR UPDATE SKIP LOCKED LIMIT %s",
-            (settings.batch_size,),
-        )
-        return await cur.fetchall()
-
-
-async def mark_rows_processed(conn, ids):
-    """Mark a batch of rows as processed in the raw table."""
-    async with conn.cursor() as cur:
-        await cur.execute(
-            f"UPDATE {settings.sink_raw_table} SET processed = TRUE WHERE {settings.id_column} = ANY(%s)",
-            (ids,),
-        )
-
-
-async def upsert_replica_batch(conn, batch):
-    """Perform a bulk upsert into the final replica table."""
-    async with conn.cursor() as cur:
-        await cur.executemany(
-            f"""
-            INSERT INTO {settings.sink_replica_table} ({settings.id_column}, {settings.target_content_column}, {settings.embedding_column}, updated_at)
-            VALUES (%({settings.id_column})s, %({settings.target_content_column})s, %({settings.embedding_column})s, CURRENT_TIMESTAMP)
-            ON CONFLICT ({settings.id_column}) DO UPDATE SET
-                {settings.target_content_column} = EXCLUDED.{settings.target_content_column},
-                {settings.embedding_column} = EXCLUDED.{settings.embedding_column},
-                updated_at = EXCLUDED.updated_at
-            WHERE {settings.sink_replica_table}.{settings.target_content_column} IS DISTINCT FROM EXCLUDED.{settings.target_content_column}
-        """,
-            batch,
-        )

@@ -18,10 +18,22 @@ services:
     environment:
       POSTGRES_PASSWORD: password
       POSTGRES_DB: search_replica_db
+      START_POSTGRES: "true"
+      START_PGAI_WORKER: "true"
       # Using the container names in the same network
       SOURCE_URL: postgresql://postgres:password@source:5432/production_db
       SINK_URL: postgresql://postgres:password@localhost:5432/search_replica_db
+      OLLAMA_HOST: http://ollama:11434
     depends_on:
       - source
+      - ollama
     ports:
       - "5434:5432"
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    # Pull the required embedding model on startup
+    entrypoint: /bin/sh
+    command: -c "ollama serve & sleep 5 && ollama pull nomic-embed-text && wait"

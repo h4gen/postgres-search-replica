@@ -25,10 +25,10 @@ down:
 test: test-unit test-integration
 
 test-unit:
-	PYTHONPATH=. uv run pytest tests/test_transformer.py
+	@echo "Unit tests for custom transformers are deprecated after pgai migration."
 
 test-integration:
-	PYTHONPATH=. uv run pytest tests/test_integration.py
+	PYTHONPATH=. uv run pytest -v -s --log-cli-level=INFO tests/test_integration.py
 
 lint:
 	uv run ruff check .

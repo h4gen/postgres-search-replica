@@ -24,8 +24,14 @@ class Settings(BaseSettings):
     content_column: str = "email"
     target_content_column: str = "transformed_email"
     embedding_column: str = "embedding"
-    embedding_dimension: int = 3
-    vectorizer_type: str = "dummy"
+    embedding_dimension: int = 768
+    vectorizer_type: str = "ollama"
+
+    # pgai Vectorizer Settings
+    embedding_provider: str = "ollama"
+    embedding_model: str = "nomic-embed-text"
+    chunking_strategy: str = "recursive_character_text_splitter"
+    formatting_template: str = "$chunk"
 
     # System settings
     notify_channel: str = "new_raw_data"
