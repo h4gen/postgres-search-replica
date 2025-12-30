@@ -63,7 +63,8 @@ We use a `Makefile` to simplify common tasks. Please use these commands to ensur
 ## Pull Request Process
 
 1.  **Open an Issue**: For significant changes, please open an issue first to discuss your proposal.
-2.  **Create a Branch**: Use descriptive branch names (e.g., `feature/hybrid-recovery-optimization` or `fix/connection-leak`).
+2.  **Contributor License Agreement (CLA)**: All contributors must sign a Contributor License Agreement before their pull request can be merged. This ensures the project can remain open-source while allowing for commercial licensing options.
+3.  **Create a Branch**: Use descriptive branch names (e.g., `feature/hybrid-recovery-optimization` or `fix/connection-leak`).
 3.  **Run Checks**: Ensure `make lint`, `make type-check`, and `make test` pass before submitting.
 4.  **Write Tests**: Any new functionality should be covered by integration tests in the `tests/` directory.
 5.  **License**: By contributing, you agree that your contributions will be licensed under the project's **AGPL v3** license.

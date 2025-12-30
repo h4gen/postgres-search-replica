@@ -182,4 +182,8 @@ All logs are output as single-line JSON objects by default. This ensures seamles
 
 ## License
 
-AGPL v3
+This project is licensed under **AGPL v3**.
+
+## Enterprise & Commercial Licensing
+
+Building a closed-source SaaS or need a commercial license? Please **[Contact Me / Sponsor via GitHub](https://github.com/sponsors/h4gen)** to discuss enterprise support and alternative licensing options.
