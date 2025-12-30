@@ -11,7 +11,8 @@ class Settings(BaseSettings):
     # Storage paths for local mode
     base_dir: Path = Path(
         os.environ.get(
-            "PG_REPLICA_DIR", Path.home() / ".local" / "share" / "pg-replica"
+            "PG_REPLICA_DIR",
+            Path.home() / ".local" / "share" / "pg-search-replica",
         )
     )
 

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Entrypoint for pg-replica monolithic service
+# Entrypoint for pg-search-replica monolithic service
 
 # Ensure we use the right PYTHONPATH for our package
 export PYTHONPATH=$PYTHONPATH:/app/src
