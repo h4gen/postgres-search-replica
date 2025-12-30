@@ -45,8 +45,8 @@ This document outlines the architectural and operational requirements to move th
     - **Implementation**: Perform "Pre-flight checks" on the Source DB to verify that configured columns exist and data types are compatible.
     - **Why**: Prevents the pipeline from starting in a broken state or crashing unexpectedly when the source schema diverges from the replica configuration.
 - **Connection Pooling**:
-    - **Implementation**: Use `psycopg_pool` instead of raw `AsyncConnection`.
-    - **Why**: Prevents connection exhaustion and reduces the overhead of repeatedly opening/closing handshakes with the Sink DB.
+    - **Status**: Completed.
+    - **Why**: Uses `psycopg_pool` for robust management of database connections.
 - **Secrets Management**:
     - **Implementation**: Support fetching `SOURCE_URL` and `SINK_URL` from a secret manager (AWS Secrets Manager, HashiCorp Vault) rather than plain environment variables.
     - **Why**: Compliance and security best practices for handling database credentials in enterprise environments.
@@ -64,5 +64,5 @@ This document outlines the architectural and operational requirements to move th
     - **Implementation**: Differentiate between `SIGTERM` (temporary restart) and a full `DECOMMISSION` flag.
     - **Why**: Currently, the system drops the subscription on every restart. In production, you often want to keep the slot during a quick upgrade to avoid a full data re-sync.
 - **Automated Re-Sync/Recovery**:
-    - **Implementation**: Logic to detect if a subscription is missing and trigger a `COPY` command to rebuild the replica from scratch safely.
-    - **Why**: Essential for disaster recovery or after the Watchdog has performed an emergency self-destruct.
+    - **Status**: Completed (Hybrid Model).
+    - **Why**: Essential for disaster recovery or after the Watchdog has performed an emergency self-destruct. The system now automatically detects missing slots and uses a combination of SQL Catch-up and Anti-Entropy to restore consistency.
