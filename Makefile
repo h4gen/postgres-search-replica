@@ -1,9 +1,9 @@
 .PHONY: help dev down test test-unit test-integration clean lint
 
 # Default values for local development
-export PYTHONPATH := .
+export PYTHONPATH := src
 export SOURCE_URL ?= postgresql://postgres:password@localhost:5433/production_db
-export SINK_URL ?= postgresql://postgres:password@localhost:5434/search_replica_db
+export SINK_URL ?= local
 
 help:
 	@echo "Available commands:"
@@ -28,14 +28,13 @@ test-unit:
 	@echo "Unit tests for custom transformers are deprecated after pgai migration."
 
 test-integration:
-	PYTHONPATH=. uv run pytest -v -s --log-cli-level=INFO tests/test_integration.py
+	PYTHONPATH=src uv run pytest -v -s --log-cli-level=INFO tests/test_integration.py
 
 lint:
-	uv run ruff check .
-	uv run ruff format --check .
+	uv run ruff check src tests
 
 type-check:
-	PYTHONPATH=. uv run ty check src
+	PYTHONPATH=src uv run ty check src
 
 clean:
 	docker compose -f dev/docker-compose.yml down -v

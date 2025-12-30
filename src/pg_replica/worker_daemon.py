@@ -3,7 +3,7 @@ import logging
 import signal
 from datetime import timedelta
 from pgai.vectorizer.worker import Worker
-from src.config import settings
+from .config import settings
 
 # Configure logging to match the main daemon
 logging.basicConfig(
@@ -22,7 +22,7 @@ async def run_worker():
     # Note: We use the URL from our settings.
     # The Worker class handles the polling and API calls to Ollama/etc.
     worker = Worker(
-        db_url=settings.sink_url, poll_interval=timedelta(seconds=2.0)
+        db_url=settings.resolved_sink_url, poll_interval=timedelta(seconds=2.0)
     )
 
     # Handle graceful shutdown

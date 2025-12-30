@@ -2,8 +2,8 @@ import asyncio
 import logging
 import signal
 from typing import Callable
-from src.config import settings
-from src.database import (
+from .config import settings
+from .database import (
     setup_source,
     setup_sink,
     drop_subscription_completely,
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 async def log_pgai_status():
     """Poll pgai status and log progress or errors."""
     try:
-        async with await connect_db(settings.sink_url) as conn:
+        async with await connect_db(settings.resolved_sink_url) as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "SELECT source_table, pending_items FROM ai.vectorizer_status"
@@ -38,8 +38,8 @@ async def run_daemon(
     loop: asyncio.AbstractEventLoop, handle_exit: Callable[[], None]
 ) -> None:
     """Main loop for the replicator daemon."""
-    await setup_source()
-    await setup_sink()
+    await setup_source(settings)
+    await setup_sink(settings)
 
     logger.info("Daemon started. Monitoring source health and pgai status...")
 
@@ -49,7 +49,7 @@ async def run_daemon(
         while not stop_event.is_set():
             try:
                 # Watchdog: Protect source from lag
-                await check_and_protect_source()
+                await check_and_protect_source(settings)
                 # Observability: Log pgai status
                 await log_pgai_status()
             except RuntimeError as e:
@@ -77,8 +77,8 @@ async def main():
     max_retries = 5
     for i in range(max_retries):
         try:
-            await setup_source()
-            await setup_sink()
+            await setup_source(settings)
+            await setup_sink(settings)
             break
         except Exception as e:
             if i == max_retries - 1:
@@ -105,7 +105,7 @@ async def main():
     except asyncio.CancelledError:
         logger.info("Daemon task cancelled.")
     finally:
-        await drop_subscription_completely()
+        await drop_subscription_completely(settings)
 
 
 if __name__ == "__main__":
