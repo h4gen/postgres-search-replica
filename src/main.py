@@ -27,7 +27,9 @@ async def log_pgai_status():
                 )
                 results = await cur.fetchall()
                 for table, pending in results:
-                    logger.info(f"pgai Status for {table}: {pending} items pending")
+                    logger.info(
+                        f"pgai Status for {table}: {pending} items pending"
+                    )
     except Exception as e:
         logger.warning(f"Failed to fetch pgai status: {e}")
 
@@ -70,9 +72,24 @@ async def run_daemon(
 async def main():
     loop = asyncio.get_running_loop()
 
-    # Run setup before starting the daemon
-    await setup_source()
-    await setup_sink()
+    # Run setup before starting the daemon with retries
+    # This handles cases where Postgres is starting or in recovery
+    max_retries = 5
+    for i in range(max_retries):
+        try:
+            await setup_source()
+            await setup_sink()
+            break
+        except Exception as e:
+            if i == max_retries - 1:
+                logger.critical(
+                    f"Failed to setup Source/Sink after {max_retries} attempts: {e}"
+                )
+                return
+            logger.warning(
+                f"Setup attempt {i+1} failed (Postgres might be in recovery). Retrying in 5s... Error: {e}"
+            )
+            await asyncio.sleep(5)
 
     def handle_exit():
         logger.info("Shutdown signal received...")

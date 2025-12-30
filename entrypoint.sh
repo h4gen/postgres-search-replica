@@ -1,12 +1,13 @@
 #!/bin/sh
-set -e
+# We don't use set -e to allow the restart loop to manage the daemon
+# set -e
 
-# Start Postgres only if requested (default for sink)
+# 1. Start Postgres in background if requested
 if [ "$START_POSTGRES" = "true" ]; then
     echo "Starting local Postgres..."
+    # The standard postgres entrypoint handles initialization
     docker-entrypoint.sh postgres &
-
-    # Wait for Postgres to be ready
+    
     echo "Waiting for local Postgres to start..."
     until pg_isready -h localhost -p 5432 -U postgres; do
       sleep 1
@@ -14,12 +15,40 @@ if [ "$START_POSTGRES" = "true" ]; then
     echo "Local Postgres is ready."
 fi
 
-# If arguments are provided, run them
-if [ $# -gt 0 ]; then
-    echo "Running custom command: $@"
-    exec "$@"
+# 2. Start pgai worker in background if requested
+if [ "$START_PGAI_WORKER" = "true" ]; then
+    echo "Starting pgai worker (pointing to localhost)..."
+    # Hardcoded to localhost as it's part of the same unit
+    /uv/bin/uv run pgai vectorizer worker \
+        --db-url "${SINK_URL:-postgresql://postgres:password@localhost:5432/search_replica_db}" \
+        --poll-interval 2s &
+    WORKER_PID=$!
 fi
 
-# Otherwise run the replicator daemon
+# 3. Run the replicator daemon in a restart loop (Failsafe)
 echo "Starting replicator daemon..."
-exec /uv/bin/uv run python -m src.main
+while true; do
+    # Run custom command if provided, otherwise run the replicator daemon
+    if [ $# -gt 0 ]; then
+        echo "Running custom command: $@"
+        "$@"
+    else
+        /uv/bin/uv run python -m src.main
+    fi
+    
+    EXIT_CODE=$?
+    
+    # If exit code is 0, it was likely a clean shutdown (SIGTERM/SIGINT)
+    if [ $EXIT_CODE -eq 0 ]; then
+        echo "Process exited normally."
+        break
+    fi
+    
+    echo "Process crashed (exit code $EXIT_CODE). Restarting in 5 seconds..."
+    sleep 5
+done
+
+# Cleanup: if the daemon loop exits, try to stop background processes
+if [ ! -z "$WORKER_PID" ]; then
+    kill $WORKER_PID 2>/dev/null
+fi
