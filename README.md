@@ -175,3 +175,7 @@ All logs are output as single-line JSON objects by default. This ensures seamles
 ```json
 {"asctime": "2025-12-30 19:30:17,123", "levelname": "INFO", "name": "pg_replica.main", "message": "Daemon started."}
 ```
+
+## License
+
+MIT
