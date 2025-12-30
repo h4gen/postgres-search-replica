@@ -1,5 +1,7 @@
 # Enterprise Readiness Roadmap: Search Replica
 
+> **Note**: This roadmap has been moved to GitHub Issues. See the repository issues for tracking progress.
+
 This document outlines the architectural and operational requirements to move this project from a functional daemon to a production-grade, enterprise-ready service.
 
 ---
