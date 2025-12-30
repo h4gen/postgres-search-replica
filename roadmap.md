@@ -66,3 +66,19 @@ This document outlines the architectural and operational requirements to move th
 - **Automated Re-Sync/Recovery**:
     - **Status**: Completed (Hybrid Model).
     - **Why**: Essential for disaster recovery or after the Watchdog has performed an emergency self-destruct. The system now automatically detects missing slots and uses a combination of SQL Catch-up and Anti-Entropy to restore consistency.
+
+## Chapter 6: Enterprise-Grade Source Integration
+*Bridging the gap between developer automation and DBA security policies.*
+
+- **Pre-provisioned Infrastructure Support**:
+    - **Implementation**: Add a `SOURCE_MANAGED_BY_ADMIN` (boolean) flag.
+    - **Why**: In strict environments, the daemon will not have permission to `CREATE PUBLICATION` or `CREATE SLOT`. This mode skips all DDL/Management calls and assumes the pipeline is already ready on the source.
+- **Read-Only Replica Streaming (PG 16+)**:
+    - **Implementation**: Optimize `setup_source` to detect if the source is a standby and skip write operations while still attempting logical streaming.
+    - **Why**: Allows users to point the daemon at a read replica to completely isolate the primary production DB from replication load and "Watchdog" risk.
+- **Periodic SQL Polling (The "Legacy/Strict" Fallback)**:
+    - **Implementation**: If logical replication is unavailable (PG < 16 on standby) or access is denied, fall back to repeating the `run_sql_catchup` logic on a configurable interval (e.g., every 60s).
+    - **Why**: Provides a "best effort" search replica even when the admin refuses to grant anything beyond a standard Read-Only user.
+- **Least-Privilege DBA Scripts**:
+    - **Implementation**: Provide a `docs/dba_setup.sql` template in the repository.
+    - **Why**: Gives enterprises a clear audit trail of exactly what permissions are needed, making security approval significantly faster.
