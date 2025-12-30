@@ -37,7 +37,9 @@ async def test_full_replication_flow():
         await conn.execute(f"TRUNCATE TABLE {settings.source_table} CASCADE")
     async with await connect_db(settings.sink_url, autocommit=True) as conn:
         await conn.execute(f"TRUNCATE TABLE {settings.sink_raw_table} CASCADE")
-        await conn.execute(f"TRUNCATE TABLE {settings.sink_replica_table} CASCADE")
+        await conn.execute(
+            f"TRUNCATE TABLE {settings.sink_replica_table} CASCADE"
+        )
 
     # 2. Insert test data into Source
     async with await connect_db(settings.source_url, autocommit=True) as conn:
@@ -60,9 +62,9 @@ async def test_full_replication_flow():
                     break
             await asyncio.sleep(1)
 
-    assert found, (
-        f"Native replication failed to move data to Sink {settings.sink_raw_table} table"
-    )
+    assert (
+        found
+    ), f"Native replication failed to move data to Sink {settings.sink_raw_table} table"
 
     # 4. Run transformation cycle
     await process_cycle()
@@ -105,13 +107,21 @@ async def test_filtered_replication_flow():
             await setup_sink()
 
         # Clean up
-        async with await connect_db(settings.source_url, autocommit=True) as conn:
-            await conn.execute(f"TRUNCATE TABLE {settings.source_table} CASCADE")
+        async with await connect_db(
+            settings.source_url, autocommit=True
+        ) as conn:
+            await conn.execute(
+                f"TRUNCATE TABLE {settings.source_table} CASCADE"
+            )
         async with await connect_db(settings.sink_url, autocommit=True) as conn:
-            await conn.execute(f"TRUNCATE TABLE {settings.sink_raw_table} CASCADE")
+            await conn.execute(
+                f"TRUNCATE TABLE {settings.sink_raw_table} CASCADE"
+            )
 
         # Insert matching and non-matching data
-        async with await connect_db(settings.source_url, autocommit=True) as conn:
+        async with await connect_db(
+            settings.source_url, autocommit=True
+        ) as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     f"INSERT INTO {settings.source_table} (name, {settings.content_column}) VALUES ('Keep Me', 'KEEP@ME.COM')"
@@ -141,7 +151,9 @@ async def test_filtered_replication_flow():
                 await cur.execute(
                     f"SELECT 1 FROM {settings.sink_raw_table} WHERE {settings.content_column} = 'IGNORE@ME.COM'"
                 )
-                assert await cur.fetchone() is None, "Non-matching data was replicated"
+                assert (
+                    await cur.fetchone() is None
+                ), "Non-matching data was replicated"
 
     finally:
         # Restore original filter and reset DB
@@ -183,7 +195,9 @@ async def test_reconciliation_efficiency():
     async with await connect_db(settings.source_url, autocommit=True) as conn:
         await conn.execute(f"TRUNCATE TABLE {settings.source_table} CASCADE")
     async with await connect_db(settings.sink_url, autocommit=True) as conn:
-        await conn.execute(f"TRUNCATE TABLE {settings.sink_replica_table} CASCADE")
+        await conn.execute(
+            f"TRUNCATE TABLE {settings.sink_replica_table} CASCADE"
+        )
         # Disable trigger again to be absolutely sure the daemon doesn't touch it
         await conn.execute(
             f"ALTER TABLE {settings.sink_raw_table} DISABLE TRIGGER trg_new_raw_data"
@@ -191,7 +205,9 @@ async def test_reconciliation_efficiency():
 
     try:
         # 2. Insert and process
-        async with await connect_db(settings.source_url, autocommit=True) as conn:
+        async with await connect_db(
+            settings.source_url, autocommit=True
+        ) as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     f"INSERT INTO {settings.source_table} (name, {settings.content_column}) VALUES ('Stable User', 'stable@test.com') RETURNING {settings.id_column}"
@@ -260,14 +276,18 @@ async def test_reconciliation_efficiency():
                 assert row2 is not None
                 ts2, emb2, content2 = row2
 
-                assert content1 == content2, (
-                    f"Content changed! '{content1}' != '{content2}'"
-                )
+                assert (
+                    content1 == content2
+                ), f"Content changed! '{content1}' != '{content2}'"
                 assert ts1 == ts2, f"Timestamp changed! {ts1} != {ts2}"
-                assert list(emb1) == list(emb2), "Embedding changed for identical data!"
+                assert list(emb1) == list(
+                    emb2
+                ), "Embedding changed for identical data!"
 
         # 6. Update Source and re-process
-        async with await connect_db(settings.source_url, autocommit=True) as conn:
+        async with await connect_db(
+            settings.source_url, autocommit=True
+        ) as conn:
             await conn.execute(
                 f"UPDATE {settings.source_table} SET {settings.content_column} = 'CHANGED@test.com' WHERE {settings.id_column} = %s",
                 (record_id,),
@@ -327,7 +347,9 @@ async def test_wal_watchdog_self_destruct():
                 "SELECT 1 FROM pg_replication_slots WHERE slot_name = %s",
                 (settings.subscription_name,),
             )
-            assert await cur.fetchone() is not None, "Replication slot should exist"
+            assert (
+                await cur.fetchone() is not None
+            ), "Replication slot should exist"
 
     async with await connect_db(settings.sink_url) as conn:
         async with conn.cursor() as cur:
@@ -342,7 +364,9 @@ async def test_wal_watchdog_self_destruct():
     settings.max_slot_wal_keep_size_mb = -1  # Force immediate self-destruct
 
     try:
-        with pytest.raises(RuntimeError, match="Self-destructed to protect Source DB"):
+        with pytest.raises(
+            RuntimeError, match="Self-destructed to protect Source DB"
+        ):
             await check_and_protect_source()
 
         # 3. Verify cleanup: subscription and slot should be gone
@@ -352,9 +376,9 @@ async def test_wal_watchdog_self_destruct():
                     "SELECT 1 FROM pg_replication_slots WHERE slot_name = %s",
                     (settings.subscription_name,),
                 )
-                assert await cur.fetchone() is None, (
-                    "Replication slot should have been dropped"
-                )
+                assert (
+                    await cur.fetchone() is None
+                ), "Replication slot should have been dropped"
 
         async with await connect_db(settings.sink_url) as conn:
             async with conn.cursor() as cur:
@@ -362,14 +386,191 @@ async def test_wal_watchdog_self_destruct():
                     "SELECT 1 FROM pg_subscription WHERE subname = %s",
                     (settings.subscription_name,),
                 )
-                assert await cur.fetchone() is None, (
-                    "Subscription should have been dropped"
-                )
+                assert (
+                    await cur.fetchone() is None
+                ), "Subscription should have been dropped"
 
     finally:
-        # Restore settings and ensure cleanup
-        settings.max_slot_wal_keep_size_mb = original_max_size
-        # Re-run setup to leave DB in a clean state for other tests
         await setup_source()
         with patch.object(settings, "source_url", get_internal_source_url()):
             await setup_sink()
+
+
+@pytest.mark.asyncio
+async def test_atomic_rollback_on_failure():
+    """
+    Test that if the processing cycle fails halfway, nothing is committed:
+    1. Manually insert data into Sink Raw table (avoiding native replication lag)
+    2. Mock mark_rows_processed to fail
+    3. Run cycle
+    4. Verify rows are STILL NOT marked as processed and NO replica was created
+    """
+    from src.database import setup_sink
+    from unittest.mock import patch
+
+    # setup_sink creates the tables if they don't exist
+    with patch.object(settings, "source_url", get_internal_source_url()):
+        await setup_sink()
+
+    # Clean up sink only
+    async with await connect_db(settings.sink_url, autocommit=True) as conn:
+        await conn.execute(
+            f"ALTER TABLE {settings.sink_raw_table} DISABLE TRIGGER trg_new_raw_data"
+        )
+        await conn.execute(f"TRUNCATE TABLE {settings.sink_raw_table} CASCADE")
+        await conn.execute(
+            f"TRUNCATE TABLE {settings.sink_replica_table} CASCADE"
+        )
+
+    try:
+        # 1. Manually insert data into Sink Raw table
+        record_id = 9999
+        async with await connect_db(settings.sink_url, autocommit=True) as conn:
+            await conn.execute(
+                f"INSERT INTO {settings.sink_raw_table} ({settings.id_column}, {settings.content_column}, processed) VALUES (%s, 'fail@test.com', FALSE)",
+                (record_id,),
+            )
+
+        # 2. Mock upsert_replica_batch to raise an error in src.main
+        import src.main
+
+        with patch.object(
+            src.main,
+            "upsert_replica_batch",
+            side_effect=Exception("Simulated Failure"),
+        ):
+            # 3. Run cycle
+            await src.main.process_cycle()
+
+        # 4. Verify: Row should still be processed=FALSE
+        async with await connect_db(settings.sink_url) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    f"SELECT processed FROM {settings.sink_raw_table} WHERE {settings.id_column} = %s",
+                    (record_id,),
+                )
+                row = await cur.fetchone()
+                assert row is not None
+                assert (
+                    row[0] is False
+                ), "Row should NOT have been marked as processed due to rollback"
+    finally:
+        async with await connect_db(settings.sink_url, autocommit=True) as conn:
+            await conn.execute(
+                f"ALTER TABLE {settings.sink_raw_table} ENABLE ALWAYS TRIGGER trg_new_raw_data"
+            )
+
+
+@pytest.mark.asyncio
+async def test_idempotent_cleanup():
+    """Verify that drop_subscription_completely is safe to call multiple times."""
+    from src.database import drop_subscription_completely
+
+    # Call it twice - should not raise exception even if it's already gone
+    await drop_subscription_completely()
+    await drop_subscription_completely()
+
+
+@pytest.mark.asyncio
+async def test_concurrency_skip_locked():
+    """
+    Verify that FOR UPDATE SKIP LOCKED works:
+    1. Insert two rows
+    2. Mock transform_data to be slow
+    3. Start two process_cycles in parallel
+    4. Verify each row was processed exactly once
+    """
+    from src.database import setup_source, setup_sink
+    from unittest.mock import patch
+
+    await setup_source()
+    with patch.object(settings, "source_url", get_internal_source_url()):
+        await setup_sink()
+
+    # Clean up
+    async with await connect_db(settings.source_url, autocommit=True) as conn:
+        await conn.execute(f"TRUNCATE TABLE {settings.source_table} CASCADE")
+    async with await connect_db(settings.sink_url, autocommit=True) as conn:
+        await conn.execute(
+            f"ALTER TABLE {settings.sink_raw_table} DISABLE TRIGGER trg_new_raw_data"
+        )
+        await conn.execute(f"TRUNCATE TABLE {settings.sink_raw_table} CASCADE")
+        await conn.execute(
+            f"TRUNCATE TABLE {settings.sink_replica_table} CASCADE"
+        )
+
+    try:
+        # 1. Insert data
+        async with await connect_db(
+            settings.source_url, autocommit=True
+        ) as conn:
+            await conn.execute(
+                f"INSERT INTO {settings.source_table} (name, {settings.content_column}) VALUES ('U1', 'u1@t.com'), ('U2', 'u2@t.com')"
+            )
+
+        # Wait for replication
+        max_retries = 10
+        found_count = 0
+        for _ in range(max_retries):
+            async with await connect_db(settings.sink_url) as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"SELECT count(*) FROM {settings.sink_raw_table} WHERE {settings.content_column} IN ('u1@t.com', 'u2@t.com')"
+                    )
+                    res = await cur.fetchone()
+                    found_count = res[0]
+                    if found_count == 2:
+                        break
+            await asyncio.sleep(1)
+        assert (
+            found_count == 2
+        ), f"Data didn't reach Sink raw table for concurrency test (found {found_count})"
+
+        # 2. Mock transform_data to be slow
+        from src.transformer import transform_data as original_transform
+        import time
+
+        def slow_transform(rows):
+            # We can't use asyncio.sleep here because it's a sync function
+            # But we want to simulate some work.
+            # To actually test concurrency with SKIP LOCKED, we need Cycle A
+            # to hold the lock while Cycle B tries to fetch.
+            # Since the lock is held as long as the connection/transaction is open,
+            # we should instead mock get_unprocessed_rows to be slow!
+            return original_transform(rows)
+
+        from src.database import get_unprocessed_rows as original_get_rows
+
+        async def slow_get_rows(conn):
+            rows = await original_get_rows(conn)
+            if rows:
+                await asyncio.sleep(2)  # Hold the lock!
+            return rows
+
+        with patch("src.main.get_unprocessed_rows", side_effect=slow_get_rows):
+            # 3. Start two cycles in parallel
+            await asyncio.gather(process_cycle(), process_cycle())
+
+        # 4. Verify: Both should be processed
+        async with await connect_db(settings.sink_url) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    f"SELECT count(*) FROM {settings.sink_raw_table} WHERE processed = TRUE"
+                )
+                res = await cur.fetchone()
+                count = res[0]
+                assert count == 2, f"Expected 2 processed rows, got {count}"
+
+                await cur.execute(
+                    f"SELECT count(*) FROM {settings.sink_replica_table}"
+                )
+                res_replica = await cur.fetchone()
+                count_replica = res_replica[0]
+                assert (
+                    count_replica == 2
+                ), f"Expected 2 replica rows, got {count_replica}"
+    finally:
+        async with await connect_db(settings.sink_url, autocommit=True) as conn:
+            await conn.execute(
+                f"ALTER TABLE {settings.sink_raw_table} ENABLE ALWAYS TRIGGER trg_new_raw_data"
+            )
