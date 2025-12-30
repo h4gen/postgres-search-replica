@@ -1,14 +1,24 @@
 import asyncio
 import logging
 import signal
+import sys
 from datetime import timedelta
 from pgai.vectorizer.worker import Worker
+from pythonjsonlogger.json import JsonFormatter
 from .config import settings
 
-# Configure logging to match the main daemon
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+# Configure structured JSON logging
+logHandler = logging.StreamHandler(sys.stdout)
+formatter = JsonFormatter(
+    "%(asctime)s %(levelname)s %(name)s %(message)s"
 )
+logHandler.setFormatter(formatter)
+
+# Clear existing handlers and set up our JSON handler
+root_logger = logging.getLogger()
+root_logger.handlers = [logHandler]
+root_logger.setLevel(logging.INFO)
+
 logger = logging.getLogger(__name__)
 
 

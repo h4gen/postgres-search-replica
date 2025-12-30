@@ -74,6 +74,10 @@ class Settings(BaseSettings):
     # System settings
     notify_channel: str = "new_raw_data"
 
+    # Observability
+    observability_host: str = "0.0.0.0"
+    observability_port: int = 8000
+
     model_config = SettingsConfigDict(
         env_file=(".env", ".env.development"),
         env_file_encoding="utf-8",
