@@ -25,7 +25,7 @@ down:
 test: test-unit test-integration
 
 test-unit:
-	@echo "No unit tests found yet."
+	@echo "Unit tests for custom transformers are deprecated after pgai migration."
 
 test-integration:
 	PYTHONPATH=. uv run pytest -v -s --log-cli-level=INFO tests/test_integration.py

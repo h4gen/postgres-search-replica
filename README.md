@@ -14,8 +14,8 @@ A professional-grade PostgreSQL read replica with real-time vectorization using 
 
 - **Source Protection (Watchdog)**: The replicator actively monitors its own replication lag. If the lag exceeds `MAX_SLOT_WAL_KEEP_SIZE_MB`, it triggers a self-destruct by dropping its subscription and slot. This ensures the Source DB never runs out of disk space, even if the replicator falls behind.
 - **Graceful Cleanup**: Automatically drops the replication slot upon normal shutdown (`SIGTERM`/`SIGINT`) to prevent WAL accumulation while offline.
-- **Smart Reconciliation**: Only updates embeddings and timestamps if the source data has actually changed, significantly reducing Sink DB load.
-- **Batch Processing**: Processes data in batches (configurable via `BATCH_SIZE`) for efficient transformation and API-friendly vectorization.
+- **Smart Reconciliation**: Leverages pgai's native state tracking to only update embeddings when source data changes.
+- **pgai Orchestration**: Uses database-native background workers for efficient vectorization.
 - **Zero-Touch & Low Privilege**: No `SUPERUSER` rights or global server configuration changes required on the Source DB. All protection logic is handled by the replicator.
 - **Zero-Touch Config**: Automatically synchronizes publication columns and filters from Python settings to the database on startup.
 - **Fully Configurable Schema**: Table and column names are entirely configurable via environment variables.
@@ -30,8 +30,8 @@ We use a `Makefile` to encapsulate best practices and common tasks.
 
 ### Common Commands
 - `make dev` - Spin up the local development environment (Source + Sink + Daemon).
-- `make test` - Run both unit and integration tests.
-- `make test-unit` - Run fast unit tests for transformation logic.
+- `make test` - Run integration tests.
+- `make test-unit` - Inform that unit tests are deprecated.
 - `make test-integration` - Run full end-to-end replication tests (requires `make dev`).
 - `make lint` - Run `ruff` linter and formatter checks.
 - `make type-check` - Run `ty` type checker for Python type safety.
@@ -60,7 +60,6 @@ Settings are managed via Pydantic and can be overridden by environment variables
 - `PUBLICATION_WHERE`: Optional PG 15 row filter clause (e.g., `id > 100`).
 - `SUBSCRIPTION_NAME`: PostgreSQL subscription name (default: `sub_users`).
 - `SUBSCRIPTION_OPTIONS`: Dict of subscription parameters (e.g., `{"streaming": "'on'"}`).
-- `BATCH_SIZE`: Number of rows to process in one transformation cycle (default: `50`).
 - `MAX_SLOT_WAL_KEEP_SIZE_MB`: Safety threshold for the Watchdog (default: `1024`).
 
 ### Vectorizer Settings (pgai)

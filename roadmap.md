@@ -10,7 +10,7 @@ This document outlines the architectural and operational requirements to move th
 *Ensuring the system can survive external failures without manual intervention.*
 
 - **pgai Orchestration**:
-    - **Status**: Migrated.
+    - **Status**: Completed.
     - **Why**: Replaced custom Python loops with `pgai` background workers. This provides database-native retries, dead-letter queues, and atomic state tracking for embeddings.
 - **Robust Retry Mechanism**:
     - **Implementation**: `pgai` handles vectorizer retries internally. The sidecar only needs to handle its own connection retries.
