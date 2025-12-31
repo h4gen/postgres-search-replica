@@ -132,6 +132,14 @@ async def search_example():
 - **Smart Reconciliation**: Only updates embeddings when source data actually changes, leveraging `pgai` native state tracking.
 - **Zero-Touch Config**: Automatically synchronizes publication columns and filters from Python settings to the database on startup.
 
+## Roadmap
+
+See our [Enterprise Readiness Roadmap](roadmap.md) for planned features, including:
+- **Fault Tolerance**: Poison Pill handling and Circuit Breakers.
+- **Observability**: Prometheus metrics and Structured JSON Logging.
+- **Enterprise Source Integration**: Pre-provisioned infra and Multi-Engine Polling (Oracle, MySQL, etc.).
+- **Search UX**: Hybrid Search with RRF (Reciprocal Rank Fusion).
+
 ## Development
 
 We use a `Makefile` to encapsulate best practices and common tasks.

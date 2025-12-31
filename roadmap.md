@@ -79,9 +79,12 @@ This document outlines the architectural and operational requirements to move th
 - **Read-Only Replica Streaming (PG 16+)**:
     - **Implementation**: Optimize `setup_source` to detect if the source is a standby and skip write operations while still attempting logical streaming.
     - **Why**: Allows users to point the daemon at a read replica to completely isolate the primary production DB from replication load and Watchdog risk.
-- **Periodic SQL Polling ( Legacy/Strict Fallback)**:
+- **Periodic SQL Polling (Legacy/Strict Fallback)**:
     - **Implementation**: If logical replication is unavailable (PG < 16 on standby) or access is denied, fall back to repeating the `run_sql_catchup` logic on a configurable interval (e.g., every 60s).
     - **Why**: Provides a best effort search replica even when the admin refuses to grant anything beyond a standard Read-Only user.
+- **Multi-Engine Polling (Oracle, MySQL, SQL Server)**:
+    - **Implementation**: Abstract the `Source` connection using a generic engine (e.g., SQLAlchemy/pyodbc). Implement engine-specific adapters for schema discovery and keyset pagination.
+    - **Why**: Allows creating a unified Postgres-based search index for legacy or non-Postgres systems without requiring CDC plugins or expensive middleware.
 - **Least-Privilege DBA Scripts**:
     - **Implementation**: Provide a `docs/dba_setup.sql` template in the repository.
     - **Why**: Gives enterprises a clear audit trail of exactly what permissions are needed, making security approval significantly faster.
