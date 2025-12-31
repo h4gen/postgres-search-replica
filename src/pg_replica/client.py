@@ -94,8 +94,7 @@ class PGSearchReplica:
         # 2. Simple vector search query
         conn = await self._get_conn()
         async with conn.cursor() as cur:
-            await cur.execute(
-                f"""
+            sql = f"""
                 SELECT 
                     {self.settings.id_column}, 
                     {self.settings.target_content_column},
@@ -103,11 +102,12 @@ class PGSearchReplica:
                 FROM {target_table}
                 ORDER BY distance ASC
                 LIMIT %s
-            """,
-                (embedding, limit),
-            )
+            """
+            logger.debug(f"Executing search on {target_table} with limit {limit}")
+            await cur.execute(sql, (embedding, limit))
 
             rows = await cur.fetchall()
+            logger.debug(f"Found {len(rows)} results in {target_table}")
             results = []
             for row in rows:
                 results.append(

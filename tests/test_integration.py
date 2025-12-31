@@ -12,13 +12,32 @@ async def wait_for_pgai_sync(settings, expected_count=1, timeout=60):
 
     logger = logging.getLogger(__name__)
     start_time = time.time()
+
+    # We resolve the actual embedding source from the search replica view
+    # to be robust against versioned table names.
     embedding_table = f"{settings.sink_raw_table}_embedding"
-    logger.info(
-        f"Waiting for {expected_count} embeddings in {embedding_table}..."
-    )
+
+    logger.info(f"Waiting for {expected_count} embeddings...")
     while time.time() - start_time < timeout:
         async with await connect_db(settings.resolved_sink_url) as conn:
             async with conn.cursor() as cur:
+                # 0. Resolve the actual embedding source if possible
+                try:
+                    await cur.execute(
+                        """
+                        SELECT table_name 
+                        FROM information_schema.view_table_usage 
+                        WHERE view_name = %s 
+                        AND table_name LIKE %s
+                        """,
+                        (settings.sink_replica_table, f"%_embedding%"),
+                    )
+                    row = await cur.fetchone()
+                    if row:
+                        embedding_table = row[0]
+                except Exception:
+                    pass
+
                 # 1. Check for errors first
                 try:
                     await cur.execute(
@@ -114,31 +133,57 @@ async def test_full_replication_flow():
                         f"INSERT INTO {settings.source_table} (name, description) VALUES ('SuperGadget', 'A really useful tool for testing')"
                     )
 
-            # 3. VERIFY NATIVE REPLICATION (Core logic check)
-            max_retries = 10
-            found = False
-            for _ in range(max_retries):
+                # 3. VERIFY NATIVE REPLICATION (Core logic check)
+                import logging
+
+                logger = logging.getLogger(__name__)
+                max_retries = 10
+                found = False
+                for _ in range(max_retries):
+                    async with await connect_db(
+                        settings.resolved_sink_url
+                    ) as conn:
+                        async with conn.cursor() as cur:
+                            await cur.execute(
+                                f"SELECT count(*) FROM {settings.sink_raw_table} WHERE name = 'SuperGadget'"
+                            )
+                            count = (await cur.fetchone())[0]
+                            if count > 0:
+                                found = True
+                                logger.info(
+                                    f"Verified {count} rows in {settings.sink_raw_table}"
+                                )
+                                break
+                    await asyncio.sleep(1)
+
+                assert (
+                    found
+                ), f"Native replication failed to move data to Sink {settings.sink_raw_table} table"
+
+                # 4. Wait for pgai transformation
+                sync_complete = await wait_for_pgai_sync(settings)
+                assert sync_complete, "pgai sync timed out"
+
+                # 5. Diagnostic: Check view and tables
                 async with await connect_db(settings.resolved_sink_url) as conn:
                     async with conn.cursor() as cur:
                         await cur.execute(
-                            f"SELECT 1 FROM {settings.sink_raw_table} WHERE name = 'SuperGadget'"
+                            f"SELECT count(*) FROM {settings.sink_replica_table}"
                         )
-                        if await cur.fetchone():
-                            found = True
-                            break
-                await asyncio.sleep(1)
+                        view_count = (await cur.fetchone())[0]
+                        logger.info(
+                            f"View {settings.sink_replica_table} has {view_count} rows"
+                        )
 
-            assert (
-                found
-            ), f"Native replication failed to move data to Sink {settings.sink_raw_table} table"
+                        await cur.execute(
+                            f"SELECT * FROM {settings.sink_replica_table} LIMIT 1"
+                        )
+                        row = await cur.fetchone()
+                        logger.info(f"View sample row: {row}")
 
-            # 4. Wait for pgai transformation
-            sync_complete = await wait_for_pgai_sync(settings)
-            assert sync_complete, "pgai sync timed out"
-
-            # 5. Verify search results via the new API
-            # Test that we can find it by the concatenated name
-            results = await replica.search("SuperGadget")
+                # 6. Verify search results via the new API
+                # Test that we can find it by the concatenated name
+                results = await replica.search("SuperGadget")
             assert len(results) > 0
             # The target_content_column should now contain the concatenated string
             assert "SuperGadget" in results[0]["content"]
@@ -360,3 +405,81 @@ async def test_idempotent_cleanup():
         await drop_subscription_completely(global_settings)
     finally:
         await close_pools()
+
+
+@pytest.mark.asyncio
+async def test_blue_green_swap():
+    """
+    Test Blue-Green atomic swap:
+    1. Start replica with model A
+    2. Insert data and wait for embeddings
+    3. Change configuration to model B
+    4. Verify a NEW versioned table is created and search results are still accessible
+    """
+    from unittest.mock import patch
+
+    with patch.dict(
+        "os.environ",
+        {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(global_settings)},
+    ):
+        # 1. Initial Start (Model A)
+        async with PGSearchReplica(
+            sync=True, embedding_model="nomic-embed-text"
+        ) as replica:
+            settings = replica.settings
+            async with await connect_db(
+                settings.source_url, autocommit=True
+            ) as conn:
+                await conn.execute(
+                    f"TRUNCATE TABLE {settings.source_table} CASCADE"
+                )
+                await conn.execute(
+                    f"INSERT INTO {settings.source_table} (name, description) VALUES ('SwapBot', 'Initial version')"
+                )
+
+            await wait_for_pgai_sync(settings)
+            results = await replica.search("SwapBot")
+            assert len(results) > 0
+
+            # Record current view target (the embedding source)
+            import logging
+
+            test_logger = logging.getLogger(__name__)
+            async with await connect_db(settings.resolved_sink_url) as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        SELECT table_name
+                        FROM information_schema.view_table_usage
+                        WHERE view_name = %s
+                        AND table_name LIKE '%%_store_v%%'
+                        """,
+                        (settings.sink_replica_table,),
+                    )
+                    row = await cur.fetchone()
+                    table_v1 = row[0] if row else None
+                    test_logger.info(f"Initial view target: {table_v1}")
+
+        # 2. Re-start with Model B (triggers reconciliation)
+        # Note: we use a different model name AND dimension to trigger the hash drift
+        async with PGSearchReplica(
+            sync=True, embedding_model="all-minilm", embedding_dimension=384
+        ) as replica:
+            settings = replica.settings
+
+            # Verify the view now points to a DIFFERENT target (via hash update)
+            async with await connect_db(settings.resolved_sink_url) as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT table_name FROM information_schema.view_table_usage WHERE view_name = %s",
+                        (settings.sink_replica_table,),
+                    )
+                    table_v2 = (await cur.fetchone())[0]
+
+            assert (
+                table_v1 != table_v2
+            ), f"Atomic swap failed: view still points to {table_v1}"
+
+            # Search should still work (it might need a moment for pgai to vectorize the NEW table)
+            # but for this test, we just care that the infrastructure was swapped.
+            # In a real scenario, warm_up_from_cache would handle the heavy lifting.

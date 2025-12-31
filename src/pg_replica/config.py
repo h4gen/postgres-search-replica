@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -7,6 +9,9 @@ class Settings(BaseSettings):
     source_url: str
     sink_url: str = "local"  # Default to local if not provided
     local_port: int = 54322  # Default port for local mode
+
+    # Enterprise Source Integration
+    source_managed_by_admin: bool = False
 
     # Storage paths for local mode
     base_dir: Path = Path(
@@ -77,6 +82,27 @@ class Settings(BaseSettings):
     # Observability
     observability_host: str = "0.0.0.0"
     observability_port: int = 8000
+
+    def get_config_hash(self) -> str:
+        """
+        Generates a SHA256 hash of the search-relevant configuration.
+        This hash is used to detect when a re-index or Blue-Green swap is needed.
+        """
+        relevant_config = {
+            "publication_columns": sorted(self.publication_columns),
+            "publication_where": self.publication_where,
+            "embedding_provider": self.embedding_provider,
+            "embedding_model": self.embedding_model,
+            "chunking_strategy": self.chunking_strategy,
+            "formatting_template": self.formatting_template,
+            "embedding_dimension": self.embedding_dimension,
+        }
+        config_json = json.dumps(relevant_config, sort_keys=True)
+        return hashlib.sha256(config_json.encode()).hexdigest()
+
+    def get_version_id(self) -> str:
+        """Returns a short version ID based on the config hash."""
+        return self.get_config_hash()[:8]
 
     model_config = SettingsConfigDict(
         env_file=(".env", ".env.development"),

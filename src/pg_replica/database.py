@@ -150,6 +150,7 @@ async def setup_state_table(settings: Settings):
                     key TEXT PRIMARY KEY,
                     last_id TEXT,
                     last_lsn TEXT,
+                    config_hash TEXT,
                     updated_at TIMESTAMP DEFAULT NOW()
                 )
                 """
@@ -202,6 +203,155 @@ async def update_replica_state(
                 )
 
 
+async def ensure_embedding_cache_table(settings: Settings):
+    """Create the Postgres-native embedding cache table."""
+    logger.info("Ensuring embedding cache table exists...")
+    async with await get_sink_conn() as conn:
+        await conn.set_autocommit(True)
+        async with conn.cursor() as cur:
+            await cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+
+            # Protection: If dimension changed, existing cache is invalid/incompatible
+            # atttypmod stores the dimension (e.g. 768) plus 4 bytes of header
+            # We check if table exists first to avoid regclass error
+            await cur.execute(
+                "SELECT 1 FROM information_schema.tables WHERE table_name = '_embedding_cache'"
+            )
+            if await cur.fetchone():
+                await cur.execute(
+                    """
+                    SELECT atttypmod FROM pg_attribute 
+                    WHERE attrelid = '_embedding_cache'::regclass 
+                    AND attname = 'embedding'
+                    """
+                )
+                row = await cur.fetchone()
+                if row:
+                    current_dim = row[0]
+                    # -1 means unspecified dimension. Otherwise it's dimension
+                    if (
+                        current_dim != settings.embedding_dimension
+                        and current_dim != -1
+                    ):
+                        logger.warning(
+                            f"Cache dimension mismatch ({current_dim} vs {settings.embedding_dimension}). Purging cache."
+                        )
+                        await cur.execute("DROP TABLE _embedding_cache CASCADE")
+
+            await cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS _embedding_cache (
+                    text_hash TEXT PRIMARY KEY,
+                    embedding vector({settings.embedding_dimension}),
+                    model_name TEXT,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+                """
+            )
+
+
+async def atomic_view_swap(
+    settings: Settings,
+    config_hash: str,
+    target_table: str | None = None,
+    vectorizer_target: str | None = None,
+):
+    """
+    Update the search view to point to the latest table version and
+    record the new config hash atomically.
+    """
+    raw_table = target_table or settings.sink_raw_table
+    # Default guess if we don't have a vectorizer target or it's not found
+    embedding_view = f"{raw_table}_embedding"
+
+    async with await get_sink_conn() as conn:
+        # 1. Query pgai for the actual view name to be robust (Dynamic Join)
+        if vectorizer_target:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT config->'destination'->>'view_name' FROM ai.vectorizer WHERE name = %s",
+                    (vectorizer_target,),
+                )
+                row = await cur.fetchone()
+                if row and row[0]:
+                    embedding_view = row[0]
+                    logger.info(
+                        f"Resolved embedding view from pgai: {embedding_view}"
+                    )
+                else:
+                    # Fallback to deterministic naming if not in catalog yet
+                    embedding_view = vectorizer_target.replace(
+                        "_store", "_embedding"
+                    )
+
+        logger.info(
+            f"Performing atomic view swap targeting {raw_table} with embedding source {embedding_view}..."
+        )
+
+        view_content_sql = f"'Product: ' || COALESCE(r.name, '') || ' Description: ' || COALESCE(r.{settings.content_column}, '')"
+
+        await conn.set_autocommit(False)  # Start transaction
+        try:
+            async with conn.cursor() as cur:
+                # 1. Update View
+                await cur.execute(
+                    f"DROP VIEW IF EXISTS {settings.sink_replica_table}"
+                )
+                await cur.execute(
+                    f"""
+                    CREATE VIEW {settings.sink_replica_table} AS
+                    SELECT 
+                        r.{settings.id_column},
+                        {view_content_sql} as {settings.target_content_column},
+                        e.{settings.embedding_column}
+                    FROM {raw_table} r
+                    LEFT JOIN {embedding_view} e ON r.{settings.id_column} = e.{settings.id_column}
+                """
+                )
+
+                # 2. Update State Hash
+                await cur.execute(
+                    "UPDATE _replica_state SET config_hash = %s, updated_at = NOW() WHERE key = %s",
+                    (config_hash, settings.subscription_name),
+                )
+            await conn.commit()
+        except Exception as e:
+            await conn.rollback()
+            raise e
+
+
+async def warm_up_from_cache(
+    settings: Settings, source_table: str, target_store_table: str
+):
+    """Populate a new embedding table from the cache to avoid re-calls."""
+    logger.info(f"Warming up {target_store_table} from cache...")
+
+    async with await get_sink_conn() as conn:
+        await conn.set_autocommit(True)
+        async with conn.cursor() as cur:
+            # Ensure the store table exists before attempting warm-up
+            await cur.execute(
+                "SELECT 1 FROM information_schema.tables WHERE table_name = %s",
+                (target_store_table,),
+            )
+            if not await cur.fetchone():
+                logger.info(
+                    f"Table {target_store_table} not found yet, skipping warm-up."
+                )
+                return
+
+            await cur.execute(
+                f"""
+                INSERT INTO {target_store_table} ({settings.id_column}, {settings.embedding_column})
+                SELECT r.{settings.id_column}, c.embedding
+                FROM {source_table} r
+                JOIN _embedding_cache c ON md5(COALESCE(r.{settings.content_column}, '')::text || %s) = c.text_hash
+                ON CONFLICT DO NOTHING
+                """,
+                (settings.embedding_model,),
+            )
+
+
 async def check_slot_exists(settings: Settings) -> bool:
     """Check if the replication slot exists on the Source DB."""
     async with await get_source_conn() as conn:
@@ -234,8 +384,11 @@ async def create_placeholder_slot(settings: Settings) -> str:
             return lsn
 
 
-async def ensure_sink_raw_table(settings: Settings):
+async def ensure_sink_raw_table(
+    settings: Settings, table_name: str | None = None
+):
     """Ensure the raw table exists in the Sink DB with correct types."""
+    target = table_name or settings.sink_raw_table
     source_types = await get_source_column_types(settings)
     async with await get_sink_conn() as conn:
         await conn.set_autocommit(True)
@@ -249,13 +402,19 @@ async def ensure_sink_raw_table(settings: Settings):
                     cols_sql.append(f"{col} {dtype}")
 
             await cur.execute(
-                f"CREATE TABLE IF NOT EXISTS {settings.sink_raw_table} ({', '.join(cols_sql)})"
+                f"CREATE TABLE IF NOT EXISTS {target} ({', '.join(cols_sql)})"
             )
 
 
-async def setup_sink(settings: Settings):
+async def setup_sink(
+    settings: Settings,
+    target_table: str | None = None,
+    vectorizer_target: str | None = None,
+):
     """Initialize the sink table and subscription."""
     logger.info("Setting up local sink database...")
+
+    target = target_table or settings.sink_raw_table
 
     # 0. Ensure state table exists first
     await setup_state_table(settings)
@@ -283,11 +442,10 @@ async def setup_sink(settings: Settings):
                     cols_sql.append(f"{col} {dtype}")
 
             await cur.execute(
-                f"CREATE TABLE IF NOT EXISTS {settings.sink_raw_table} ({', '.join(cols_sql)})"
+                f"CREATE TABLE IF NOT EXISTS {target} ({', '.join(cols_sql)})"
             )
 
-            # Define the vectorizer instead of creating a replica table manually
-            # pgai will automatically create the {settings.sink_raw_table}_embedding table
+            # Define the vectorizer
             try:
                 await cur.execute("CREATE EXTENSION IF NOT EXISTS ai CASCADE")
             except Exception:
@@ -296,60 +454,49 @@ async def setup_sink(settings: Settings):
                 )
                 import pgai
 
-                # pgai.install expects a database URL string
                 pgai.install(settings.resolved_sink_url)
                 logger.info("Extension 'ai' installed successfully.")
 
             # Check if vectorizer already exists
+            vectorizer_name = vectorizer_target or f"{target}_store"
+
             await cur.execute(
-                "SELECT 1 FROM ai.vectorizer WHERE source_table::text = %s",
-                (settings.sink_raw_table,),
+                "SELECT 1 FROM ai.vectorizer WHERE name = %s",
+                (vectorizer_name,),
             )
+
             if not await cur.fetchone():
                 logger.info(
-                    f"Creating pgai vectorizer for {settings.sink_raw_table}..."
+                    f"Creating pgai vectorizer '{vectorizer_name}' for {target}..."
                 )
-                # We need to configure the ollama host for the worker
-                # In pgai, this is often done via environment variables for the worker,
-                # but we can also set it in the session if needed.
+
+                destination_sql = ""
+                if vectorizer_target:
+                    # Explicitly version both the target table and the view name
+                    # We use target_table and view_name explicitly to avoid pgai's
+                    # automatic '_store' suffixing logic when using the 'destination' arg.
+                    versioned_view = vectorizer_target.replace(
+                        "_store", "_embedding"
+                    )
+                    destination_sql = f", destination => ai.destination_table(target_table => '{vectorizer_target}', view_name => '{versioned_view}')"
+
                 await cur.execute(
                     f"""
                     SELECT ai.create_vectorizer(
-                        '{settings.sink_raw_table}'::regclass,
+                        '{target}'::regclass,
+                        name => %s,
                         loading => ai.loading_column('{settings.content_column}'),
                         embedding => ai.embedding_{settings.embedding_provider}('{settings.embedding_model}', {settings.embedding_dimension}),
                         chunking => ai.chunking_{settings.chunking_strategy}(),
-                        formatting => ai.formatting_python_template('{settings.formatting_template}')
+                        formatting => ai.formatting_python_template('{settings.formatting_template}'),
+                        if_not_exists => true
+                        {destination_sql}
                     )
-                """
+                """,
+                    (vectorizer_name,),
                 )
 
-            # Create the compatibility View
-            embedding_table = f"{settings.sink_raw_table}_embedding"
-            # We use the same concatenation logic as pgai's Python template
-            # 'Product: $name Description: $chunk'
-            # Note: $chunk corresponds to the content_column after chunking.
-            view_content_sql = f"'Product: ' || COALESCE(r.name, '') || ' Description: ' || COALESCE(r.{settings.content_column}, '')"
-
-            # Drop the view first to avoid "cannot change data type" errors in tests/dev
-            await cur.execute(
-                f"DROP VIEW IF EXISTS {settings.sink_replica_table}"
-            )
-
-            await cur.execute(
-                f"""
-                CREATE VIEW {settings.sink_replica_table} AS
-                SELECT 
-                    r.{settings.id_column},
-                    {view_content_sql} as {settings.target_content_column},
-                    e.{settings.embedding_column}
-                FROM {settings.sink_raw_table} r
-                LEFT JOIN {embedding_table} e ON r.{settings.id_column} = e.{settings.id_column}
-            """
-            )
-
-            # IMPORTANT: Enable pgai triggers for native replication
-            # We find all triggers starting with _vectorizer_ and enable them ALWAYS
+            # Enable pgai triggers for native replication
             await cur.execute(
                 f"""
                 DO $$
@@ -359,10 +506,10 @@ async def setup_sink(settings: Settings):
                     FOR trg_name IN 
                         SELECT trigger_name 
                         FROM information_schema.triggers 
-                        WHERE event_object_table = '{settings.sink_raw_table}' 
+                        WHERE event_object_table = '{target}' 
                         AND trigger_name LIKE '_vectorizer_%'
                     LOOP
-                        EXECUTE 'ALTER TABLE {settings.sink_raw_table} ENABLE ALWAYS TRIGGER ' || quote_ident(trg_name);
+                        EXECUTE 'ALTER TABLE {target} ENABLE ALWAYS TRIGGER ' || quote_ident(trg_name);
                     END LOOP;
                 END $$;
             """
@@ -501,10 +648,6 @@ async def find_and_fix_ghost_records(settings: Settings):
             min_id_raw, max_id_raw = res
 
     # Handle different ID types (INT vs UUID)
-    # If it's a UUID, we can't easily use range math, so we'll just pull all IDs
-    # and compare in memory if the table is small, or use a different strategy.
-    # For now, let's assume numeric IDs for the chunking logic, and fallback for UUIDs.
-
     source_types = await get_source_column_types(settings)
     id_type = source_types.get(settings.id_column, "TEXT")
 
@@ -512,8 +655,6 @@ async def find_and_fix_ghost_records(settings: Settings):
         logger.info(
             f"Non-numeric ID type ({id_type}) detected. Using simple ID-list comparison for Anti-Entropy..."
         )
-        # Fallback: Pull all IDs from Source and Sink and find the difference
-        # This is okay for medium-sized tables (up to a few million IDs)
         async with await get_source_conn() as s_conn:
             async with s_conn.cursor() as s_cur:
                 await s_cur.execute(
@@ -550,7 +691,6 @@ async def find_and_fix_ghost_records(settings: Settings):
         # 1. Get checksum from Source
         async with await get_source_conn() as s_conn:
             async with s_conn.cursor() as s_cur:
-                # bit_xor is available in PG 14+
                 await s_cur.execute(
                     f"SELECT count(*), COALESCE(bit_xor({settings.id_column}), 0) FROM {settings.source_table} WHERE {settings.id_column} BETWEEN %s AND %s",
                     (start_id, end_id),
@@ -612,6 +752,16 @@ async def drop_subscription_completely(settings: Settings):
     except Exception as e:
         logger.warning(f"Failed to drop subscription: {e}")
 
+    try:
+        async with await get_source_conn() as conn:
+            await conn.set_autocommit(True)
+            await conn.execute(
+                f"SELECT pg_drop_replication_slot('{settings.subscription_name}') "
+                f"WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{settings.subscription_name}')"
+            )
+    except Exception as e:
+        logger.warning(f"Failed to drop replication slot: {e}")
+
 
 async def check_and_protect_source(settings: Settings) -> float:
     """
@@ -623,7 +773,6 @@ async def check_and_protect_source(settings: Settings) -> float:
         async with await get_source_conn() as conn:
             async with conn.cursor() as cur:
                 # Query lag for our specific slot
-                # We use pg_wal_lsn_diff to get bytes between current WAL and slot's restart_lsn
                 await cur.execute(
                     """
                     SELECT 
