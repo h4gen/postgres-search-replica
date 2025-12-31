@@ -42,7 +42,7 @@ This document outlines the architectural and operational requirements to move th
     - **Implementation**: Instead of static `CREATE TABLE`, implement a reconciliation loop at startup. Compare `PUBLICATION_COLUMNS` from settings with the existing sink table schema.
     - **Why**: Allows users to add columns to the replication list via environment variables without manually running SQL migrations. The daemon auto-applies `ALTER TABLE ... ADD COLUMN`.
 - **Upstream Change Detection**:
-    - **Implementation**: Perform "Pre-flight checks" on the Source DB to verify that configured columns exist and data types are compatible.
+    - **Implementation**: Perform Pre-flight checks on the Source DB to verify that configured columns exist and data types are compatible.
     - **Why**: Prevents the pipeline from starting in a broken state or crashing unexpectedly when the source schema diverges from the replica configuration.
 - **Connection Pooling**:
     - **Status**: Completed.
@@ -78,23 +78,54 @@ This document outlines the architectural and operational requirements to move th
     - **Why**: In strict environments, the daemon will not have permission to `CREATE PUBLICATION` or `CREATE SLOT`. This mode skips all DDL/Management calls and assumes the pipeline is already ready on the source.
 - **Read-Only Replica Streaming (PG 16+)**:
     - **Implementation**: Optimize `setup_source` to detect if the source is a standby and skip write operations while still attempting logical streaming.
-    - **Why**: Allows users to point the daemon at a read replica to completely isolate the primary production DB from replication load and "Watchdog" risk.
-- **Periodic SQL Polling (The "Legacy/Strict" Fallback)**:
+    - **Why**: Allows users to point the daemon at a read replica to completely isolate the primary production DB from replication load and Watchdog risk.
+- **Periodic SQL Polling ( Legacy/Strict Fallback)**:
     - **Implementation**: If logical replication is unavailable (PG < 16 on standby) or access is denied, fall back to repeating the `run_sql_catchup` logic on a configurable interval (e.g., every 60s).
-    - **Why**: Provides a "best effort" search replica even when the admin refuses to grant anything beyond a standard Read-Only user.
+    - **Why**: Provides a best effort search replica even when the admin refuses to grant anything beyond a standard Read-Only user.
 - **Least-Privilege DBA Scripts**:
     - **Implementation**: Provide a `docs/dba_setup.sql` template in the repository.
     - **Why**: Gives enterprises a clear audit trail of exactly what permissions are needed, making security approval significantly faster.
 
 ## Chapter 7: Search-as-Code (Declarative Reconciliation)
-*Moving from imperative setup scripts to a state-enforcement engine.*
+*Moving from imperative setup scripts to a state-enforcement engine that treats the search replica as versioned infrastructure.*
 
+- **Unified Reconciler Engine**:
+    - **Implementation**: Refactor the `Orchestrator` to use a `Reconciler` class that follows a Plan/Apply lifecycle. It calculates the delta between the desired `Settings` and the current database state.
+    - **Why**: Centralizes all infrastructure logic and ensures that the system always moves towards the desired state regardless of the initial database condition.
 - **State Discovery & Diffing**:
-    - **Implementation**: Implement a "Plan" phase at startup. The daemon inspects both Source and Sink (schema, indexes, vectorizers) and compares them against the `Settings`.
-    - **Why**: Provides a "Terraform-like" experience where the user describes the desired search infrastructure, and the daemon calculates the necessary DDL/DML to reach that state.
+    - **Implementation**: Implement a Plan phase at startup. The daemon inspects both Source and Sink (schema, indexes, vectorizers) and compares them against the `Settings`.
+    - **Why**: Provides a Terraform-like experience where the user describes the desired search infrastructure, and the daemon calculates the necessary DDL/DML to reach that state.
 - **Concurrent Index Management**:
     - **Implementation**: Automatically manage GIN (full-text) and HNSW (vector) indexes. Use `CREATE INDEX CONCURRENTLY` to ensure zero-downtime during index upgrades or re-indexing experiments.
     - **Why**: Allows users to experiment with different indexing strategies (e.g., changing HNSW `m` or `ef_construction` values) without locking the search replica.
 - **Experimental Versioning (Shadow Indexing)**:
     - **Implementation**: Support multiple concurrent vectorizers/indexes for the same source table.
-    - **Why**: Enables A/B testing of different embedding models or chunking strategies by populating "Shadow" tables/columns alongside the primary ones before switching the public View.
+    - **Why**: Enables A/B testing of different embedding models or chunking strategies by populating Shadow tables/columns alongside the primary ones before switching the public View.
+- **Blue-Green Data Migration ( Swap Pattern)**:
+    - **Implementation**: Instead of in-place `ALTER TABLE` for complex changes (like model or dimension updates), the daemon implements a Blue-Green deployment for tables. It builds the new version in the background and performs an atomic View swap once `pgai` reports 100% sync.
+    - **Why**: Ensures zero-downtime migrations for un-migratable changes like embedding dimension shifts. Prevents migration nightmares by treating derived data as versioned and disposable.
+- **Self-Describing Manifest (State-as-Code)**:
+    - **Implementation**: Store the full JSON manifest of the desired search configuration (models, templates, columns, filters) and its hash within the `_replica_state` table.
+    - **Why**: Turns the search replica into a self-describing system. Allows any future version of the daemon to instantly understand the on-disk state and reconcile it with the current configuration, similar to a `terraform.tfstate` file.
+- **Cost & Experimentation Telemetry**:
+    - **Implementation**: Log build-time metrics (tokens used, total wall-time, model versions, success rates) into a dedicated `experiment_logs` table during the Shadow Build phase.
+    - **Why**: Provides the data needed to evaluate the ROI of different search strategies and model upgrades before committing to a production swap.
+- **Autonomous Performance Tuning**:
+    - **Implementation**: Bake DBRE intelligence into the Reconciler to automatically set HNSW parameters (`m`, `ef_construction`), manage `pg_prewarm` for index buffer loading after swaps, and trigger `ANALYZE` or `REINDEX` based on data drift thresholds.
+    - **Why**: Ensures peak performance for average users by automating complex database tuning. Guarantees sub-10ms search latency and zero cold-start performance hits after migrations.
+
+## Chapter 8: Search UX (Hybrid & Ranked Retrieval)
+*Providing a high-level, one-query interface for complex search strategies.*
+
+- **Declarative Search Profiles**:
+    - **Implementation**: Allow users to define search strategies (e.g., `default_hybrid`, `vector_heavy`) in the configuration, specifying weights for dense vectors, sparse vectors, and full-text search.
+    - **Why**: Decouples the mathematical complexity of ranking from the application logic. The app just asks for a profile, and the database handles the ranking.
+- **Automated RRF (Reciprocal Rank Fusion)**:
+    - **Implementation**: Automatically generate the SQL math for RRF within the search View or a dedicated PostgreSQL function.
+    - **Why**: RRF is the industry standard for hybrid search but is difficult to write correctly in raw SQL. Automating this ensures optimal retrieval quality with zero developer overhead.
+- **Native Sparse Vector Support (pgvector)**:
+    - **Implementation**: Leverage `pgvector`'s native `sparsevec` type and HNSW indexing for learned sparse representations (e.g., SPLADE) or BM25-style scores.
+    - **Why**: Standardizes on `pgvector` for all vector operations. By supporting learned sparse vectors alongside dense vectors, the system can achieve state-of-the-art retrieval that combines semantic depth with keyword precision.
+- **Parameterized Search Functions**:
+    - **Implementation**: Instead of static views, generate PostgreSQL functions that allow passing weights or search parameters at query time.
+    - **Why**: Gives power users the freedom to tune search relevance dynamically without redeploying the daemon or re-syncing data.

@@ -46,7 +46,9 @@ async def wait_for_pgai_sync(settings, expected_count=1, timeout=60):
 
                 # 3. Check embedding count
                 try:
-                    await cur.execute(f"SELECT count(*) FROM {embedding_table}")
+                    await cur.execute(
+                        f"SELECT count(*) FROM {embedding_table} WHERE {settings.embedding_column} IS NOT NULL"
+                    )
                     res = await cur.fetchone()
                     count = res[0] if res else 0
                     logger.info(
@@ -290,6 +292,8 @@ async def test_reconciliation_efficiency():
                     row2 = await cur.fetchone()
                     assert row2 is not None
                     emb2 = row2[0]
+                    assert emb1 is not None, "Initial embedding is None"
+                    assert emb2 is not None, "Sync'd embedding is None"
                     assert list(emb1) == list(
                         emb2
                     ), "Embedding changed for identical data (CACHE/TRACKING FAILED)!"

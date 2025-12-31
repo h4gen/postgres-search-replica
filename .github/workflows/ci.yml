@@ -40,6 +40,11 @@ jobs:
           echo "Sink DB not ready..."
           sleep 2
         done
+        echo "Waiting for Ollama model to be pulled..."
+        until docker exec dev-ollama-1 ollama list | grep -q "nomic-embed-text"; do
+          echo "Ollama model not ready..."
+          sleep 5
+        done
         echo "Infrastructure is ready!"
 
     - name: Run Tests
