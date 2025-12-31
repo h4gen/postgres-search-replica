@@ -103,7 +103,9 @@ class PGSearchReplica:
                 ORDER BY distance ASC
                 LIMIT %s
             """
-            logger.debug(f"Executing search on {target_table} with limit {limit}")
+            logger.debug(
+                f"Executing search on {target_table} with limit {limit}"
+            )
             await cur.execute(sql, (embedding, limit))
 
             rows = await cur.fetchall()

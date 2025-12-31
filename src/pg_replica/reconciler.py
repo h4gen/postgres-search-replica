@@ -46,7 +46,7 @@ class Inspector:
         self.settings = settings
 
     async def get_sink_state(self) -> Dict[str, Any]:
-        state = {
+        state: Dict[str, Any] = {
             "tables": {},
             "views": set(),
             "view_target": None,
@@ -170,7 +170,7 @@ class Inspector:
         return state
 
     async def get_source_state(self) -> Dict[str, Any]:
-        state = {
+        state: Dict[str, Any] = {
             "publications": {},
             "slots": set(),
         }
