@@ -63,9 +63,9 @@ class Settings(BaseSettings):
     embedding_model: str = "nomic-embed-text"
     chunking_strategy: str = "recursive_character_text_splitter"
 
-    # CHUNK DECORATION PRINCIPLE:
+    # CONTEXT-AWARE EMBEDDING PRINCIPLE:
     # 1. The 'content_column' (description) is the "work column" that gets chunked.
-    # 2. The 'formatting_template' allows you to "decorate" each chunk with metadata.
+    # 2. The 'formatting_template' allows you to enrich each chunk with metadata.
     # 3. '$chunk' is the mandatory placeholder for the piece of text being processed.
     # 4. Other columns (like '$name') provide global context for every chunk,
     #    ensuring the vector stays semantically linked to the product.

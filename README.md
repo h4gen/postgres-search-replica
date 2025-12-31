@@ -11,7 +11,7 @@ The project is built for enterprise-scale data movement, leveraging PostgreSQL's
 - **Postgres-Native Vectorization**: Unlike external sync tools, this uses the `pgai` extension to handle vectorization *inside* the database. This ensures your embeddings are governed by the same ACID guarantees as your data.
 - **Hybrid Recovery Model**: A self-healing state machine that automatically bridges data gaps using SQL keyset pagination before handing off to real-time streaming.
 
-## Declarative "Chunk Decoration" Design
+## Declarative Context-Aware Design
 
 The system follows a **Declarative Design Principle**. Instead of manually managing vectors, you define the desired state, and the library orchestrates the underlying PostgreSQL extensions.
 
@@ -22,12 +22,12 @@ Enterprise-grade data movement requires more than just binary streaming. This li
 3.  **Anti-Entropy (Ghost Cleaner)**: Performs checksum-based verification of ID chunks to find and delete "Ghost Records" (rows deleted on Source while the replica was offline).
 4.  **Zero-Loss Handover**: Seamlessly transitions from SQL catch-up to real-time binary streaming.
 
-### Chunk Decoration
+### Context-Aware Embedding
 Traditional vector search often loses context when long documents are split into smaller chunks. This library uses a declarative template system to ensure every vector remains semantically linked to its source.
 
 1.  **The Work Column (`CONTENT_COLUMN`)**: This is your primary text data (e.g., `description`). It is automatically processed and split into pieces according to your `CHUNKING_STRATEGY`.
-2.  **Decoration Columns**: You can replicate additional metadata columns (e.g., `name`, `category`) that are not chunked themselves.
-3.  **The Template (`FORMATTING_TEMPLATE`)**: These pieces are combined. For every chunk generated from the description, the template "decorates" it with metadata.
+2.  **Metadata Columns**: You can replicate additional metadata columns (e.g., `name`, `category`) that are not chunked themselves.
+3.  **The Template (`FORMATTING_TEMPLATE`)**: These pieces are combined. For every chunk generated from the description, the template enriches it with metadata.
 
 **Example Logic:**
 *   **Row**: `name="Smart Watch"`, `description="A water-resistant... [long text] ...with heart rate monitor."`
@@ -132,7 +132,7 @@ async def search_example():
 - **Source Protection (Watchdog)**: Actively monitors replication lag. If the lag exceeds `MAX_SLOT_WAL_KEEP_SIZE_MB`, it triggers a self-destruct to ensure the Source DB never runs out of disk space.
 - **Zero-Touch & Low Privilege**: No `SUPERUSER` rights required on the source. All protection and reconciliation logic is handled by the replica sidecar.
 - **Dynamic Type Detection**: Automatically detect primary key types (including **UUID**, **BIGINT**, **TEXT**) and schema from the source database at runtime.
-- **Declarative Chunk Decoration**: Automatically combine metadata (e.g., `name`) with chunked text (e.g., `description`) using Python-style templates to preserve context across all vectors.
+- **Context-Aware Embedding**: Automatically combine metadata (e.g., `name`) with chunked text (e.g., `description`) using Python-style templates to preserve context across all vectors.
 - **Connection Pooling**: Uses `psycopg-pool` for robust management of database connections, preventing exhaustion under high load.
 - **Observability Hub**: Built-in FastAPI server providing health checks and real-time Prometheus metrics.
 - **Structured JSON Logging**: Native support for single-line JSON logging, ready for ingestion by Datadog, ELK, or Grafana Loki.
@@ -147,6 +147,73 @@ See our [Enterprise Readiness Roadmap](roadmap.md) for planned features, includi
 - **Observability**: Prometheus metrics and Structured JSON Logging.
 - **Enterprise Source Integration**: Pre-provisioned infra and Multi-Engine Polling (Oracle, MySQL, etc.).
 - **Search UX**: Hybrid Search with RRF (Reciprocal Rank Fusion).
+
+## Configuration & API Reference
+
+All settings can be configured via environment variables (e.g., `SOURCE_URL`) or a `.env` file. The library uses `pydantic-settings` for robust validation.
+
+### 1. Core Infrastructure
+| Environment Variable | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `SOURCE_URL` | `str` | **Required** | Connection string for the source PostgreSQL database. |
+| `SINK_URL` | `str` | `local` | Connection string for the sink (search) database. Set to `local` to use the managed sidecar Postgres. |
+| `LOCAL_PORT` | `int` | `54322` | Port for the managed Postgres instance when `SINK_URL=local`. |
+| `PG_REPLICA_DIR` | `Path` | `~/.local/share/...` | Base directory for storage, WAL data, and logs in local mode. |
+| `SUBSCRIPTION_SOURCE_URL` | `str` | `SOURCE_URL` | The URL used *by the Sink DB* to reach the Source. Useful for Docker networking (e.g. `postgresql://host.docker.internal...`). |
+
+### 2. Schema & Table Mapping
+| Environment Variable | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `SOURCE_TABLE` | `str` | `products` | The table name on the source database to replicate. |
+| `SINK_RAW_TABLE` | `str` | `products` | The name of the raw landing table in the sink database. |
+| `SINK_REPLICA_TABLE` | `str` | `products_replica` | The name of the search-ready View that joins raw data with embeddings. |
+| `ID_COLUMN` | `str` | `id` | The Primary Key column (must be numeric, UUID, or TEXT). |
+| `CONTENT_COLUMN` | `str` | `description` | The source column that will be chunked and vectorized. |
+| `TARGET_CONTENT_COLUMN` | `str` | `transformed_description`| The name of the text column in the final search View. |
+
+### 3. Replication & CDC Settings
+| Environment Variable | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `PUBLICATION_NAME` | `str` | `pub_products` | Name of the PostgreSQL publication on the source. |
+| `PUBLICATION_COLUMNS`| `list` | `["id", "name", "description"]` | Columns to include in the replication stream. |
+| `PUBLICATION_WHERE` | `str` | `None` | Optional SQL filter clause for row-level replication (PG 15+). |
+| `SUBSCRIPTION_NAME` | `str` | `sub_products` | Name of the PostgreSQL subscription on the sink. |
+| `SUBSCRIPTION_OPTIONS`| `dict` | `{"streaming": "'on'"}` | Additional options passed to `CREATE SUBSCRIPTION`. |
+| `MAX_SLOT_WAL_KEEP_SIZE_MB` | `int` | `1024` | Safety limit. If replication lag exceeds this, the sidecar self-destructs to protect source disk. |
+| `BATCH_SIZE` | `int` | `50` | Batch size for initial SQL catch-up and anti-entropy sweeps. |
+
+### 4. Vectorization & Context-Aware Embedding (pgai)
+| Environment Variable | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `EMBEDDING_PROVIDER` | `str` | `ollama` | The `pgai` provider (`ollama`, `openai`, `anthropic`, etc.). |
+| `EMBEDDING_MODEL` | `str` | `nomic-embed-text` | The embedding model name. |
+| `EMBEDDING_DIMENSION`| `int` | `768` | Dimension of the vectors generated by the model. |
+| `EMBEDDING_COLUMN` | `str` | `embedding` | Name of the vector column in the embedding table. |
+| `CHUNKING_STRATEGY` | `str` | `recursive_character_text_splitter` | `pgai` strategy for splitting the `CONTENT_COLUMN`. |
+| `FORMATTING_TEMPLATE`| `str` | *See below* | Python template for metadata enrichment (e.g., `Product: $name Description: $chunk`). |
+
+### 5. Observability & System
+| Environment Variable | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `OBSERVABILITY_HOST` | `str` | `0.0.0.0` | Binding host for the built-in FastAPI metrics/health server. |
+| `OBSERVABILITY_PORT` | `int` | `8000` | Port for the observability server. |
+| `NOTIFY_CHANNEL` | `str` | `new_raw_data` | Internal PG channel for real-time signaling. |
+
+## Observability
+
+The library includes a built-in observability server (FastAPI) that starts automatically with the daemon.
+
+### Endpoints
+- **GET `/health`**: Returns `{"status": "ok"}`. Used for liveness and readiness probes.
+- **GET `/metrics`**: Exports Prometheus-formatted metrics including:
+    - `replication_lag_mb`: Current WAL distance from the source database.
+    - `pgai_pending_items`: Number of items currently queued for vectorization (labeled by table).
+
+### Structured Logging
+All logs are output as single-line JSON objects by default. This ensures seamless integration with modern logging infrastructure (Datadog, Grafana Loki, ELK):
+```json
+{"asctime": "2025-12-30 19:30:17,123", "levelname": "INFO", "name": "pg_replica.main", "message": "Daemon started."}
+```
 
 ## Development
 
@@ -166,41 +233,6 @@ We use a `Makefile` to encapsulate best practices and common tasks.
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for details on our development workflow and how to submit pull requests.
-
-## Configuration
-
-Settings are managed via Pydantic and can be overridden by environment variables or a `.env` file.
-
-### Primary Settings
-- `SOURCE_URL`: URL of the source PostgreSQL database.
-- `SINK_URL`: URL of the sink database (default: `local`).
-- `LOCAL_PORT`: Port for the internal managed Postgres (default: `54322`).
-- `PUBLICATION_COLUMNS`: List of columns to replicate (default: `["id", "name", "description"]`).
-- `MAX_SLOT_WAL_KEEP_SIZE_MB`: Safety threshold for the Watchdog (default: `1024`).
-- `OBSERVABILITY_HOST`: Host for the health/metrics server (default: `0.0.0.0`).
-- `OBSERVABILITY_PORT`: Port for the health/metrics server (default: `8000`).
-
-### Vectorizer Settings
-- `EMBEDDING_MODEL`: The model name (default: `nomic-embed-text`).
-- `EMBEDDING_DIMENSION`: Dimension of the vector (default: `768`).
-
-See `src/pg_replica/config.py` for all available options.
-
-## Observability
-
-The library includes a built-in observability server (FastAPI) that starts automatically with the daemon.
-
-### Endpoints
-- **GET `/health`**: Returns `{"status": "ok"}`. Used for liveness and readiness probes.
-- **GET `/metrics`**: Exports Prometheus-formatted metrics including:
-    - `replication_lag_mb`: Current WAL distance from the source database.
-    - `pgai_pending_items`: Number of items currently queued for vectorization (labeled by table).
-
-### Structured Logging
-All logs are output as single-line JSON objects by default. This ensures seamless integration with modern logging infrastructure (Datadog, Grafana Loki, ELK):
-```json
-{"asctime": "2025-12-30 19:30:17,123", "levelname": "INFO", "name": "pg_replica.main", "message": "Daemon started."}
-```
 
 ## License
 
