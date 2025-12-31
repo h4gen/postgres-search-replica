@@ -83,8 +83,14 @@ services:
       - SINK_URL=local  # Uses internal managed Postgres
       - PUBLICATION_COLUMNS=id,description,name
       - OLLAMA_HOST=http://ollama:11434
+    volumes:
+      # CRITICAL: Persist the managed Postgres data to avoid re-embedding on restart
+      - replica_data:/var/lib/postgresql/.local/share/pg-search-replica
     ports:
       - "54322:54322"  # Exposed for search queries
+
+volumes:
+  replica_data:
 ```
 
 ### Self-Hosted Replica (External Postgres)

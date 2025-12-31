@@ -24,6 +24,8 @@ services:
       SUBSCRIPTION_SOURCE_URL: postgresql://postgres:password@source:5432/production_db
       SOURCE_URL: postgresql://postgres:password@source:5432/production_db
       OLLAMA_HOST: http://ollama:11434
+    volumes:
+      - sink_data:/var/lib/postgresql/.local/share/pg-search-replica
     depends_on:
       - source
       - ollama
@@ -37,3 +39,6 @@ services:
     # Pull the required embedding model on startup
     entrypoint: /bin/sh
     command: -c "ollama serve & sleep 5 && ollama pull nomic-embed-text && wait"
+
+volumes:
+  sink_data:

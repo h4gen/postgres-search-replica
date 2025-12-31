@@ -32,6 +32,11 @@ RUN chmod +x entrypoint.sh
 
 # Ensure the postgres user can access the app and run uv
 RUN chown -R postgres:postgres /app
+
+# Create directory for local data and set permissions
+RUN mkdir -p /var/lib/postgresql/.local/share/pg-search-replica && \
+    chown -R postgres:postgres /var/lib/postgresql/.local
+
 USER postgres
 
 # Set the entrypoint

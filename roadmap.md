@@ -66,6 +66,9 @@ This document outlines the architectural and operational requirements to move th
 - **Automated Re-Sync/Recovery**:
     - **Status**: Completed (Hybrid Model).
     - **Why**: Essential for disaster recovery or after the Watchdog has performed an emergency self-destruct. The system now automatically detects missing slots and uses a combination of SQL Catch-up and Anti-Entropy to restore consistency.
+- **Dynamic Publication & Filter Updates**:
+    - **Implementation**: Detect changes in `PUBLICATION_COLUMNS` or `PUBLICATION_WHERE` via configuration hashing stored in the `_replica_state` table.
+    - **Why**: Allows changing the scope of replication (adding columns or narrowing/widening filters) mid-operation. The system will automatically update the publication, refresh the subscription, and trigger a targeted backfill or anti-entropy sweep to reconcile existing data with the new rules.
 
 ## Chapter 6: Enterprise-Grade Source Integration
 *Bridging the gap between developer automation and DBA security policies.*
@@ -82,3 +85,16 @@ This document outlines the architectural and operational requirements to move th
 - **Least-Privilege DBA Scripts**:
     - **Implementation**: Provide a `docs/dba_setup.sql` template in the repository.
     - **Why**: Gives enterprises a clear audit trail of exactly what permissions are needed, making security approval significantly faster.
+
+## Chapter 7: Search-as-Code (Declarative Reconciliation)
+*Moving from imperative setup scripts to a state-enforcement engine.*
+
+- **State Discovery & Diffing**:
+    - **Implementation**: Implement a "Plan" phase at startup. The daemon inspects both Source and Sink (schema, indexes, vectorizers) and compares them against the `Settings`.
+    - **Why**: Provides a "Terraform-like" experience where the user describes the desired search infrastructure, and the daemon calculates the necessary DDL/DML to reach that state.
+- **Concurrent Index Management**:
+    - **Implementation**: Automatically manage GIN (full-text) and HNSW (vector) indexes. Use `CREATE INDEX CONCURRENTLY` to ensure zero-downtime during index upgrades or re-indexing experiments.
+    - **Why**: Allows users to experiment with different indexing strategies (e.g., changing HNSW `m` or `ef_construction` values) without locking the search replica.
+- **Experimental Versioning (Shadow Indexing)**:
+    - **Implementation**: Support multiple concurrent vectorizers/indexes for the same source table.
+    - **Why**: Enables A/B testing of different embedding models or chunking strategies by populating "Shadow" tables/columns alongside the primary ones before switching the public View.
