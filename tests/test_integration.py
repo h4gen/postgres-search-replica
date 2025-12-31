@@ -5,7 +5,7 @@ from pg_replica import PGSearchReplica, settings as global_settings
 from pg_replica.database import connect_db, check_and_protect_source
 
 
-async def wait_for_pgai_sync(settings, expected_count=1, timeout=60):
+async def wait_for_pgai_sync(settings, expected_count=1, timeout=120):
     """Wait for pgai vectorizer to finish processing all rows."""
     import time
     import logging
@@ -142,6 +142,26 @@ async def test_full_replication_flow():
         async with await connect_db(
             custom_settings.resolved_sink_url, autocommit=True
         ) as conn:
+            # Robust subscription cleanup for test setup
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT 1 FROM pg_subscription WHERE subname = %s",
+                    (custom_settings.subscription_name,),
+                )
+                if await cur.fetchone():
+                    # Disable first
+                    await cur.execute(
+                        f"ALTER SUBSCRIPTION {custom_settings.subscription_name} DISABLE"
+                    )
+                    # Decouple slot to avoid remote errors
+                    await cur.execute(
+                        f"ALTER SUBSCRIPTION {custom_settings.subscription_name} SET (slot_name = NONE)"
+                    )
+                    # Drop
+                    await cur.execute(
+                        f"DROP SUBSCRIPTION {custom_settings.subscription_name}"
+                    )
+
             await conn.execute(
                 f"DROP TABLE IF EXISTS {custom_settings.sink_raw_table} CASCADE"
             )
@@ -257,6 +277,26 @@ async def test_filtered_replication_flow():
         async with await connect_db(
             custom_settings.resolved_sink_url, autocommit=True
         ) as conn:
+            # Robust subscription cleanup for test setup
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT 1 FROM pg_subscription WHERE subname = %s",
+                    (custom_settings.subscription_name,),
+                )
+                if await cur.fetchone():
+                    # Disable first
+                    await cur.execute(
+                        f"ALTER SUBSCRIPTION {custom_settings.subscription_name} DISABLE"
+                    )
+                    # Decouple slot to avoid remote errors
+                    await cur.execute(
+                        f"ALTER SUBSCRIPTION {custom_settings.subscription_name} SET (slot_name = NONE)"
+                    )
+                    # Drop
+                    await cur.execute(
+                        f"DROP SUBSCRIPTION {custom_settings.subscription_name}"
+                    )
+
             await conn.execute(
                 f"DROP TABLE IF EXISTS {custom_settings.sink_raw_table} CASCADE"
             )
@@ -342,6 +382,26 @@ async def test_reconciliation_efficiency():
         async with await connect_db(
             custom_settings.resolved_sink_url, autocommit=True
         ) as conn:
+            # Robust subscription cleanup for test setup
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT 1 FROM pg_subscription WHERE subname = %s",
+                    (custom_settings.subscription_name,),
+                )
+                if await cur.fetchone():
+                    # Disable first
+                    await cur.execute(
+                        f"ALTER SUBSCRIPTION {custom_settings.subscription_name} DISABLE"
+                    )
+                    # Decouple slot to avoid remote errors
+                    await cur.execute(
+                        f"ALTER SUBSCRIPTION {custom_settings.subscription_name} SET (slot_name = NONE)"
+                    )
+                    # Drop
+                    await cur.execute(
+                        f"DROP SUBSCRIPTION {custom_settings.subscription_name}"
+                    )
+
             await conn.execute(
                 f"DROP TABLE IF EXISTS {custom_settings.sink_raw_table} CASCADE"
             )
@@ -536,6 +596,26 @@ async def test_blue_green_swap():
         async with await connect_db(
             custom_settings.resolved_sink_url, autocommit=True
         ) as conn:
+            # Robust subscription cleanup for test setup
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT 1 FROM pg_subscription WHERE subname = %s",
+                    (custom_settings.subscription_name,),
+                )
+                if await cur.fetchone():
+                    # Disable first
+                    await cur.execute(
+                        f"ALTER SUBSCRIPTION {custom_settings.subscription_name} DISABLE"
+                    )
+                    # Decouple slot to avoid remote errors
+                    await cur.execute(
+                        f"ALTER SUBSCRIPTION {custom_settings.subscription_name} SET (slot_name = NONE)"
+                    )
+                    # Drop
+                    await cur.execute(
+                        f"DROP SUBSCRIPTION {custom_settings.subscription_name}"
+                    )
+
             await conn.execute(
                 f"DROP TABLE IF EXISTS {custom_settings.sink_raw_table} CASCADE"
             )

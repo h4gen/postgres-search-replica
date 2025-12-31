@@ -804,19 +804,42 @@ async def drop_subscription_completely(settings: Settings):
                     )
                     # 1c. Decouple slot from subscription to prevent DROP SUBSCRIPTION from
                     # trying to drop the slot itself, which can hang if the worker hasn't exited yet.
-                    await cur.execute(
-                        f"ALTER SUBSCRIPTION {settings.subscription_name} SET (slot_name = NONE)"
-                    )
+                    # We use a try block here because some PG versions might error if workers are still shutting down.
+                    try:
+                        await cur.execute(
+                            f"ALTER SUBSCRIPTION {settings.subscription_name} SET (slot_name = NONE)"
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            f"Non-critical: Could not decouple slot from subscription: {e}"
+                        )
             except Exception as e:
-                logger.debug(f"Could not disable or decouple subscription: {e}")
+                logger.debug(f"Could not disable subscription: {e}")
 
             logger.info(
                 f"Dropping subscription {settings.subscription_name}..."
             )
             try:
-                await conn.execute(
-                    f"DROP SUBSCRIPTION IF EXISTS {settings.subscription_name}"
-                )
+                # In PG 15+, dropping a subscription that is disabled and has no slot should be instant.
+                # If it still fails with "could not drop relation mapping", it's a stale state issue
+                # that often resolves on retry or if we wait a second.
+                for i in range(3):
+                    try:
+                        await conn.execute(
+                            f"DROP SUBSCRIPTION IF EXISTS {settings.subscription_name}"
+                        )
+                        break
+                    except Exception as e:
+                        if (
+                            "could not drop relation mapping" in str(e)
+                            and i < 2
+                        ):
+                            logger.warning(
+                                f"Retry {i+1}: Failed to drop subscription due to relation mapping. Waiting..."
+                            )
+                            await asyncio.sleep(1)
+                            continue
+                        raise
             except Exception as e:
                 logger.warning(f"Failed to drop subscription: {e}")
 
