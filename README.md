@@ -1,14 +1,20 @@
 # Postgres Search Replica Client & Daemon
 
-A professional-grade PostgreSQL search replica library with real-time vectorization using `pgai`, source database protection, and `pgvector` support.
+A professional-grade PostgreSQL search replica library with **real-time CDC vectorization** using native WAL streaming, `pgai`, and `pgvector`.
 
-## Architecture & Declarative Design
+## High-Performance Architecture
 
-The project is built with a strong separation of concerns and follows a **Declarative "Chunk Decoration" Principle**. Instead of manually managing vectors, you define the desired state, and the library orchestrates the underlying PostgreSQL `pgai` and `pgvector` extensions.
+The project is built for enterprise-scale data movement, leveraging PostgreSQL's native Change Data Capture (CDC) capabilities to ensure sub-second search synchronization with zero impact on the source database.
 
-It uses a **Hybrid Recovery Model** to ensure data consistency even after critical replication failures (e.g., when a replication slot is dropped to protect the source).
+- **Native WAL Streaming (CDC)**: Uses PostgreSQL Logical Replication to stream changes directly from the write-ahead log. No polling, no triggers on the source, and minimal overhead.
+- **PG 15 Row & Column Filtering**: Minimizes network traffic and sink load by replicating only the specific rows and columns you need for search.
+- **Postgres-Native Vectorization**: Unlike external sync tools, this uses the `pgai` extension to handle vectorization *inside* the database. This ensures your embeddings are governed by the same ACID guarantees as your data.
+- **Hybrid Recovery Model**: A self-healing state machine that automatically bridges data gaps using SQL keyset pagination before handing off to real-time streaming.
 
-...
+## Declarative "Chunk Decoration" Design
+
+The system follows a **Declarative Design Principle**. Instead of manually managing vectors, you define the desired state, and the library orchestrates the underlying PostgreSQL extensions.
+
 ### Hybrid Recovery Model
 Enterprise-grade data movement requires more than just binary streaming. This library implements a state-machine for self-healing:
 1.  **LSN Anchoring**: Automatically creates replication slots on the source to bookmark the exact binary position.
@@ -120,11 +126,13 @@ async def search_example():
 
 ## Key Features
 
+- **Native CDC Streaming**: High-performance binary replication from Source WAL to Sink, ensuring sub-second latency for search results.
 - **Hybrid Recovery & Self-Healing**: Automatically detect missing replication slots and bridge the gap using SQL catch-up followed by an LSN-anchored handover to native replication.
 - **Anti-Entropy (Ghost Cleaner)**: Checksum-based sweep to identify and prune records that were hard-deleted from the source while the daemon was offline.
+- **Source Protection (Watchdog)**: Actively monitors replication lag. If the lag exceeds `MAX_SLOT_WAL_KEEP_SIZE_MB`, it triggers a self-destruct to ensure the Source DB never runs out of disk space.
+- **Zero-Touch & Low Privilege**: No `SUPERUSER` rights required on the source. All protection and reconciliation logic is handled by the replica sidecar.
 - **Dynamic Type Detection**: Automatically detect primary key types (including **UUID**, **BIGINT**, **TEXT**) and schema from the source database at runtime.
 - **Declarative Chunk Decoration**: Automatically combine metadata (e.g., `name`) with chunked text (e.g., `description`) using Python-style templates to preserve context across all vectors.
-- **Source Protection (Watchdog)**: Actively monitors replication lag. If the lag exceeds `MAX_SLOT_WAL_KEEP_SIZE_MB`, it triggers a self-destruct to ensure the Source DB never runs out of disk space.
 - **Connection Pooling**: Uses `psycopg-pool` for robust management of database connections, preventing exhaustion under high load.
 - **Observability Hub**: Built-in FastAPI server providing health checks and real-time Prometheus metrics.
 - **Structured JSON Logging**: Native support for single-line JSON logging, ready for ingestion by Datadog, ELK, or Grafana Loki.
