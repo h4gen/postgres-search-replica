@@ -93,8 +93,29 @@ class Inspector:
                     """,
                     (self.settings.sink_replica_table,),
                 )
-                row = await cur.fetchone()
-                state["view_target"] = row[0] if row else None
+                rows = await cur.fetchall()
+
+                # Robustly find the target versioned table
+                state["view_target"] = None
+                for (t,) in rows:
+                    # Priority 1: versioned store table
+                    if (
+                        t.endswith(f"_v{self.settings.get_version_id()}")
+                        and "_store_" in t
+                    ):
+                        state["view_target"] = t
+                        break
+
+                if not state["view_target"]:
+                    for (t,) in rows:
+                        # Priority 2: any versioned store table
+                        if "_store_v" in t:
+                            state["view_target"] = t
+                            break
+
+                if not state["view_target"] and rows:
+                    # Fallback: first table used by the view
+                    state["view_target"] = rows[0][0]
 
                 # 4. Replica State (including our new config_hash)
                 if "_replica_state" in state["tables"]:
@@ -281,7 +302,19 @@ class Planner:
                     )
                 )
 
-        # 5. Vectorizer Setup
+        # 5. Recovery (Slot check)
+        # We check for recovery early, because if we need to perform hybrid recovery,
+        # we want to create the placeholder slot BEFORE the subscription is created.
+        if self.settings.subscription_name not in source_state["slots"]:
+            actions.append(
+                Action(
+                    type=ActionType.SINK_RECOVERY,
+                    description="Perform hybrid recovery (missing slot)",
+                    params={},
+                )
+            )
+
+        # 6. Vectorizer Setup
         version_id = self.settings.get_version_id()
         needs_new_vectorizer = current_hash != desired_hash
         vectorizers = sink_state.get("vectorizers", {}).get(target_table, [])
@@ -290,7 +323,7 @@ class Planner:
         current_vectorizer_target = f"{target_table}_store_v{version_id}"
         current_vectorizer_name = current_vectorizer_target
         vectorizer_exists = any(
-            v["name"] == current_vectorizer_name for v in vectorizers
+            v.get("name") == current_vectorizer_name for v in vectorizers
         )
 
         if not vectorizer_exists or needs_new_vectorizer:
@@ -302,7 +335,7 @@ class Planner:
                 )
             )
 
-        # 6. View Setup
+        # 7. View Setup
         if (
             self.settings.sink_replica_table not in sink_state["views"]
             or current_hash != desired_hash
@@ -320,35 +353,25 @@ class Planner:
                 )
             )
 
-        # 7. Cleanup old vectorizers
+        # 8. Cleanup old vectorizers
         # We only cleanup versions that are NEITHER the desired version NOR the one
         # currently being used by the search view. This ensures zero-downtime.
         current_live_view_target = sink_state.get("view_target")
         for v in vectorizers:
             if (
-                v["target_table"] != current_vectorizer_target
-                and v["target_table"] != current_live_view_target
+                v.get("target_table") != current_vectorizer_target
+                and v.get("target_table") != current_live_view_target
             ):
                 actions.append(
                     Action(
                         type=ActionType.SINK_TABLE_CLEANUP,
-                        description=f"Cleanup orphaned vectorizer {v['id']} ({v['target_table']})",
+                        description=f"Cleanup orphaned vectorizer {v.get('id')} ({v.get('target_table')})",
                         params={
-                            "id": v["id"],
-                            "target_table": v["target_table"],
+                            "id": v.get("id"),
+                            "target_table": v.get("target_table"),
                         },
                     )
                 )
-
-        # 8. Recovery (Slot check)
-        if self.settings.subscription_name not in source_state["slots"]:
-            actions.append(
-                Action(
-                    type=ActionType.SINK_RECOVERY,
-                    description="Perform hybrid recovery (missing slot)",
-                    params={},
-                )
-            )
 
         return actions
 
@@ -480,10 +503,9 @@ class Applier:
                 )
 
             elif action.type == ActionType.SINK_RECOVERY:
-                source_state = await Inspector(self.settings).get_source_state()
-                if self.settings.subscription_name in source_state["slots"]:
-                    logger.info("Slot actually exists, skipping recovery.")
-                    continue
+                # We trust the Planner's decision to perform recovery.
+                # No need to re-check the slot here, which might have been
+                # created by a concurrent process or setup_sink in a previous step.
 
                 lsn = await create_placeholder_slot(self.settings)
                 await update_replica_state(self.settings, lsn=lsn)

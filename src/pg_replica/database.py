@@ -185,6 +185,8 @@ async def update_replica_state(
 ):
     """Update high-water mark or LSN in the state table."""
     async with await get_sink_conn() as conn:
+        # We ensure autocommit for state updates
+        await conn.set_autocommit(True)
         async with conn.cursor() as cur:
             if last_id is not None and lsn is not None:
                 await cur.execute(
@@ -370,6 +372,17 @@ async def create_placeholder_slot(settings: Settings) -> str:
     )
     async with await get_source_conn() as conn:
         async with conn.cursor() as cur:
+            # Check if exists first
+            await cur.execute(
+                "SELECT restart_lsn FROM pg_replication_slots WHERE slot_name = %s",
+                (settings.subscription_name,),
+            )
+            res = await cur.fetchone()
+            if res:
+                lsn = str(res[0])
+                logger.info(f"Slot already exists at LSN: {lsn}")
+                return lsn
+
             # pg_create_logical_replication_slot(slot_name, plugin, temporary, wait_for_ready)
             # wait_for_ready=True ensures it returns a consistent LSN
             await cur.execute(
@@ -526,8 +539,16 @@ async def setup_sink(
                 # If we pre-created the slot, we must set create_slot = false
                 slot_exists_on_source = await check_slot_exists(settings)
 
+                # CRITICAL: We set copy_data = false if we are performing a hybrid recovery
+                # (slot already exists because we just created it) or if we have existing state.
                 copy_data = (
-                    "true" if (last_id == "0" and last_lsn is None) else "false"
+                    "false"
+                    if (
+                        slot_exists_on_source
+                        or last_id != "0"
+                        or last_lsn is not None
+                    )
+                    else "true"
                 )
 
                 options_dict = settings.subscription_options.copy()
@@ -580,15 +601,24 @@ async def run_sql_catchup(settings: Settings):
         async with await get_source_conn() as source_conn:
             async with source_conn.cursor(row_factory=dict_row) as cur:
                 cols = ", ".join(settings.publication_columns)
+
+                # Hybrid Recovery must honor the publication filter if it exists.
+                # We escape % to %% because psycopg uses % for placeholders.
+                where_clause = (
+                    f"({settings.publication_where.replace('%', '%%')})"
+                    if settings.publication_where
+                    else "TRUE"
+                )
+
                 if last_id is None:
                     # First batch
                     await cur.execute(
-                        f"SELECT {cols} FROM {settings.source_table} ORDER BY {settings.id_column} ASC LIMIT %s",
+                        f"SELECT {cols} FROM {settings.source_table} WHERE {where_clause} ORDER BY {settings.id_column} ASC LIMIT %s",
                         (batch_size,),
                     )
                 else:
                     await cur.execute(
-                        f"SELECT {cols} FROM {settings.source_table} WHERE {settings.id_column} > %s ORDER BY {settings.id_column} ASC LIMIT %s",
+                        f"SELECT {cols} FROM {settings.source_table} WHERE {where_clause} AND {settings.id_column} > %s ORDER BY {settings.id_column} ASC LIMIT %s",
                         (last_id, batch_size),
                     )
                 rows = await cur.fetchall()
@@ -598,6 +628,7 @@ async def run_sql_catchup(settings: Settings):
 
         # 2. Upsert batch into Sink
         async with await get_sink_conn() as sink_conn:
+            await sink_conn.set_autocommit(True)
             async with sink_conn.cursor() as cur:
                 col_names = list(rows[0].keys())
                 placeholders = ", ".join(["%s"] * len(col_names))
@@ -673,6 +704,7 @@ async def find_and_fix_ghost_records(settings: Settings):
         if ghosts:
             logger.warning(f"Found {len(ghosts)} ghost records. Deleting...")
             async with await get_sink_conn() as k_conn:
+                await k_conn.set_autocommit(True)
                 async with k_conn.cursor() as k_cur:
                     await k_cur.execute(
                         f"DELETE FROM {settings.sink_raw_table} WHERE {settings.id_column} = ANY(%s)",
@@ -729,6 +761,7 @@ async def find_and_fix_ghost_records(settings: Settings):
 
                     ghosts = [kid for kid in k_ids if kid not in s_ids]
                     if ghosts:
+                        await k_conn.set_autocommit(True)
                         await k_cur.execute(
                             f"DELETE FROM {settings.sink_raw_table} WHERE {settings.id_column} = ANY(%s)",
                             (ghosts,),
@@ -741,24 +774,97 @@ async def find_and_fix_ghost_records(settings: Settings):
 
 
 async def drop_subscription_completely(settings: Settings):
-    """Drop subscription and slot from source on shutdown."""
+    """Drop subscription, slot, and optionally the pgai vectorizer on shutdown."""
     logger.info("Dropping subscription and slot from source...")
-    try:
-        async with await get_sink_conn() as conn:
-            await conn.set_autocommit(True)
-            await conn.execute(
-                f"DROP SUBSCRIPTION IF EXISTS {settings.subscription_name}"
-            )
-    except Exception as e:
-        logger.warning(f"Failed to drop subscription: {e}")
 
+    # 1. Drop Subscription (Sink)
+    # We use a direct connection here to bypass any pool exhaustion or state issues during teardown.
     try:
-        async with await get_source_conn() as conn:
+        async with await connect_db(settings.resolved_sink_url) as conn:
             await conn.set_autocommit(True)
+
+            # CRITICAL: We must drop the replica view FIRST, because it depends on the vectorizer views.
+            # If we don't, dropping the vectorizer will fail with a dependency error.
             await conn.execute(
-                f"SELECT pg_drop_replication_slot('{settings.subscription_name}') "
-                f"WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{settings.subscription_name}')"
+                f"DROP VIEW IF EXISTS {settings.sink_replica_table} CASCADE"
             )
+
+            # 1b. Disable Subscription before Drop (Prevents Hang)
+            # PostgreSQL's DROP SUBSCRIPTION can block if the apply worker is active.
+            # Forcefully disabling it first helps ensure the worker exits quickly.
+            logger.info(
+                f"Disabling subscription {settings.subscription_name}..."
+            )
+            try:
+                # Use a short timeout for these operations
+                async with conn.cursor() as cur:
+                    await cur.execute("SET statement_timeout = '10s'")
+                    await cur.execute(
+                        f"ALTER SUBSCRIPTION {settings.subscription_name} DISABLE"
+                    )
+                    # 1c. Decouple slot from subscription to prevent DROP SUBSCRIPTION from
+                    # trying to drop the slot itself, which can hang if the worker hasn't exited yet.
+                    await cur.execute(
+                        f"ALTER SUBSCRIPTION {settings.subscription_name} SET (slot_name = NONE)"
+                    )
+            except Exception as e:
+                logger.debug(f"Could not disable or decouple subscription: {e}")
+
+            logger.info(
+                f"Dropping subscription {settings.subscription_name}..."
+            )
+            try:
+                await conn.execute(
+                    f"DROP SUBSCRIPTION IF EXISTS {settings.subscription_name}"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to drop subscription: {e}")
+
+            # Also cleanup vectorizers for this table
+            async with conn.cursor() as cur:
+                await cur.execute("SET statement_timeout = '10s'")
+                await cur.execute(
+                    "SELECT id FROM ai.vectorizer WHERE source_table::text = %s OR source_table::text = %s",
+                    (
+                        settings.sink_raw_table,
+                        f"public.{settings.sink_raw_table}",
+                    ),
+                )
+                v_ids = [r[0] for r in await cur.fetchall()]
+                for vid in v_ids:
+                    logger.info(f"Cleanup: Dropping pgai vectorizer {vid}")
+                    try:
+                        await cur.execute(
+                            f"SELECT ai.drop_vectorizer({vid}, drop_all => true)"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to drop vectorizer {vid}: {e}")
+    except Exception as e:
+        logger.warning(f"Failed to connect to sink or perform cleanup: {e}")
+
+    # 2. Drop Slot (Source)
+    try:
+        async with await connect_db(settings.source_url) as conn:
+            await conn.set_autocommit(True)
+            logger.info(
+                f"Dropping slot {settings.subscription_name} on source..."
+            )
+            async with conn.cursor() as cur:
+                await cur.execute("SET statement_timeout = '10s'")
+                # 2b. Forcefully terminate any backends using this slot to prevent hang
+                await cur.execute(
+                    """
+                    SELECT pg_terminate_backend(active_pid) 
+                    FROM pg_replication_slots 
+                    WHERE slot_name = %s AND active_pid IS NOT NULL
+                    """,
+                    (settings.subscription_name,),
+                )
+
+                await cur.execute(
+                    f"SELECT pg_drop_replication_slot('{settings.subscription_name}') "
+                    f"WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{settings.subscription_name}')"
+                )
     except Exception as e:
         logger.warning(f"Failed to drop replication slot: {e}")
 

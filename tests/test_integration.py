@@ -15,7 +15,8 @@ async def wait_for_pgai_sync(settings, expected_count=1, timeout=60):
 
     # We resolve the actual embedding source from the search replica view
     # to be robust against versioned table names.
-    embedding_table = f"{settings.sink_raw_table}_embedding"
+    # We look for tables used by the search view that look like our store tables.
+    embedding_table = None
 
     logger.info(f"Waiting for {expected_count} embeddings...")
     while time.time() - start_time < timeout:
@@ -28,15 +29,22 @@ async def wait_for_pgai_sync(settings, expected_count=1, timeout=60):
                         SELECT table_name 
                         FROM information_schema.view_table_usage 
                         WHERE view_name = %s 
-                        AND table_name LIKE %s
+                        AND (table_name LIKE '%%_store_v%%' OR table_name LIKE '%%_embedding%%')
+                        LIMIT 1
                         """,
-                        (settings.sink_replica_table, f"%_embedding%"),
+                        (settings.sink_replica_table,),
                     )
                     row = await cur.fetchone()
                     if row:
                         embedding_table = row[0]
                 except Exception:
                     pass
+
+                # If we couldn't resolve it, use a deterministic guess
+                current_table = (
+                    embedding_table
+                    or f"{settings.sink_raw_table}_store_v{settings.get_version_id()}"
+                )
 
                 # 1. Check for errors first
                 try:
@@ -66,19 +74,19 @@ async def wait_for_pgai_sync(settings, expected_count=1, timeout=60):
                 # 3. Check embedding count
                 try:
                     await cur.execute(
-                        f"SELECT count(*) FROM {embedding_table} WHERE {settings.embedding_column} IS NOT NULL"
+                        f"SELECT count(*) FROM {current_table} WHERE {settings.embedding_column} IS NOT NULL"
                     )
                     res = await cur.fetchone()
                     count = res[0] if res else 0
                     logger.info(
-                        f"Current embedding count: {count}/{expected_count}"
+                        f"Current embedding count: {count}/{expected_count} in {current_table}"
                     )
                     if count >= expected_count:
                         logger.info("pgai sync complete.")
                         return True
                 except Exception as e:
                     logger.info(
-                        f"Waiting for embedding table to be created... ({e})"
+                        f"Waiting for embedding table {current_table} to be created... ({e})"
                     )
         await asyncio.sleep(2)
     logger.error("pgai sync timed out.")
@@ -102,88 +110,99 @@ async def test_full_replication_flow():
     """
     from unittest.mock import patch
 
+    custom_settings = global_settings.model_copy(
+        update={
+            "source_table": "full_products",
+            "sink_raw_table": "full_products",
+            "sink_replica_table": "full_products_replica",
+            "publication_name": "pub_full",
+            "subscription_name": "sub_full",
+        }
+    )
+
     # We need to provide the internal source URL for the subscription CONNECTION string
     with patch.dict(
         "os.environ",
-        {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(global_settings)},
+        {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(custom_settings)},
     ):
-        async with PGSearchReplica(sync=True) as replica:
+        # 1. Setup Source & Sink
+        async with await connect_db(
+            custom_settings.source_url, autocommit=True
+        ) as conn:
+            await conn.execute(
+                f"DROP TABLE IF EXISTS {custom_settings.source_table} CASCADE"
+            )
+            await conn.execute(
+                f"CREATE TABLE {custom_settings.source_table} (id SERIAL PRIMARY KEY, name TEXT, description TEXT)"
+            )
+            await conn.execute(
+                f"INSERT INTO {custom_settings.source_table} (name, description) VALUES ('SuperGadget', 'A really useful tool for testing')"
+            )
+
+        async with await connect_db(
+            custom_settings.resolved_sink_url, autocommit=True
+        ) as conn:
+            await conn.execute(
+                f"DROP TABLE IF EXISTS {custom_settings.sink_raw_table} CASCADE"
+            )
+            await conn.execute(
+                f"DELETE FROM _replica_state WHERE key = '{custom_settings.subscription_name}'"
+            )
+
+        async with PGSearchReplica(
+            sync=True, **custom_settings.model_dump()
+        ) as replica:
             settings = replica.settings
-            # Clean up from previous runs
-            async with await connect_db(
-                settings.source_url, autocommit=True
-            ) as conn:
-                await conn.execute(
-                    f"TRUNCATE TABLE {settings.source_table} CASCADE"
-                )
-            async with await connect_db(
-                settings.resolved_sink_url, autocommit=True
-            ) as conn:
-                await conn.execute(
-                    f"TRUNCATE TABLE {settings.sink_raw_table} CASCADE"
-                )
 
-            # 2. Insert test data into Source
-            # Note: We insert into 'name' and 'description'
-            async with await connect_db(
-                settings.source_url, autocommit=True
-            ) as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        f"INSERT INTO {settings.source_table} (name, description) VALUES ('SuperGadget', 'A really useful tool for testing')"
-                    )
+            # 3. VERIFY NATIVE REPLICATION (Core logic check)
+            import logging
 
-                # 3. VERIFY NATIVE REPLICATION (Core logic check)
-                import logging
-
-                logger = logging.getLogger(__name__)
-                max_retries = 10
-                found = False
-                for _ in range(max_retries):
-                    async with await connect_db(
-                        settings.resolved_sink_url
-                    ) as conn:
-                        async with conn.cursor() as cur:
-                            await cur.execute(
-                                f"SELECT count(*) FROM {settings.sink_raw_table} WHERE name = 'SuperGadget'"
-                            )
-                            count = (await cur.fetchone())[0]
-                            if count > 0:
-                                found = True
-                                logger.info(
-                                    f"Verified {count} rows in {settings.sink_raw_table}"
-                                )
-                                break
-                    await asyncio.sleep(1)
-
-                assert (
-                    found
-                ), f"Native replication failed to move data to Sink {settings.sink_raw_table} table"
-
-                # 4. Wait for pgai transformation
-                sync_complete = await wait_for_pgai_sync(settings)
-                assert sync_complete, "pgai sync timed out"
-
-                # 5. Diagnostic: Check view and tables
+            logger = logging.getLogger(__name__)
+            max_retries = 10
+            found = False
+            for _ in range(max_retries):
                 async with await connect_db(settings.resolved_sink_url) as conn:
                     async with conn.cursor() as cur:
                         await cur.execute(
-                            f"SELECT count(*) FROM {settings.sink_replica_table}"
+                            f"SELECT count(*) FROM {settings.sink_raw_table} WHERE name = 'SuperGadget'"
                         )
-                        view_count = (await cur.fetchone())[0]
-                        logger.info(
-                            f"View {settings.sink_replica_table} has {view_count} rows"
-                        )
+                        count = (await cur.fetchone())[0]
+                        if count > 0:
+                            found = True
+                            logger.info(
+                                f"Verified {count} rows in {settings.sink_raw_table}"
+                            )
+                            break
+                await asyncio.sleep(1)
 
-                        await cur.execute(
-                            f"SELECT * FROM {settings.sink_replica_table} LIMIT 1"
-                        )
-                        row = await cur.fetchone()
-                        logger.info(f"View sample row: {row}")
+            assert (
+                found
+            ), f"Native replication failed to move data to Sink {settings.sink_raw_table} table"
 
-                # 6. Verify search results via the new API
-                # Test that we can find it by the concatenated name
-                results = await replica.search("SuperGadget")
+            # 4. Wait for pgai transformation
+            sync_complete = await wait_for_pgai_sync(settings)
+            assert sync_complete, "pgai sync timed out"
+
+            # 5. Diagnostic: Check view and tables
+            async with await connect_db(settings.resolved_sink_url) as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"SELECT count(*) FROM {settings.sink_replica_table}"
+                    )
+                    view_count = (await cur.fetchone())[0]
+                    logger.info(
+                        f"View {settings.sink_replica_table} has {view_count} rows"
+                    )
+
+                    await cur.execute(
+                        f"SELECT * FROM {settings.sink_replica_table} LIMIT 1"
+                    )
+                    row = await cur.fetchone()
+                    logger.info(f"View sample row: {row}")
+
+            # 6. Verify search results via the new API
+            # Test that we can find it by the concatenated name
+            results = await replica.search("SuperGadget")
             assert len(results) > 0
             # The target_content_column should now contain the concatenated string
             assert "SuperGadget" in results[0]["content"]
@@ -201,42 +220,55 @@ async def test_filtered_replication_flow():
     """
     from unittest.mock import patch
 
+    custom_settings = global_settings.model_copy(
+        update={
+            "source_table": "filtered_products",
+            "sink_raw_table": "filtered_products",
+            "sink_replica_table": "filtered_products_replica",
+            "publication_name": "pub_filtered",
+            "subscription_name": "sub_filtered",
+            "publication_where": "description LIKE '%KEEP%'",
+        }
+    )
+
     # We need to provide the internal source URL for the subscription CONNECTION string
     with patch.dict(
         "os.environ",
-        {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(global_settings)},
+        {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(custom_settings)},
     ):
-        # Override settings for this test
-        async with PGSearchReplica(
-            sync=True,
-            publication_where="description LIKE '%KEEP%'",
-        ) as replica:
-            settings = replica.settings
-            # Clean up
-            async with await connect_db(
-                settings.source_url, autocommit=True
-            ) as conn:
-                await conn.execute(
-                    f"TRUNCATE TABLE {settings.source_table} CASCADE"
+        # 1. Setup Source & Sink (Clean start)
+        async with await connect_db(
+            custom_settings.source_url, autocommit=True
+        ) as conn:
+            await conn.execute(
+                f"DROP TABLE IF EXISTS {custom_settings.source_table} CASCADE"
+            )
+            await conn.execute(
+                f"CREATE TABLE {custom_settings.source_table} (id SERIAL PRIMARY KEY, name TEXT, description TEXT)"
+            )
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    f"INSERT INTO {custom_settings.source_table} (name, description) VALUES ('Keep Me', 'KEEP THIS DESCRIPTION')"
                 )
-            async with await connect_db(
-                settings.resolved_sink_url, autocommit=True
-            ) as conn:
-                await conn.execute(
-                    f"TRUNCATE TABLE {settings.sink_raw_table} CASCADE"
+                await cur.execute(
+                    f"INSERT INTO {custom_settings.source_table} (name, description) VALUES ('Ignore Me', 'IGNORE THIS ONE')"
                 )
 
-            # Insert matching and non-matching data
-            async with await connect_db(
-                settings.source_url, autocommit=True
-            ) as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        f"INSERT INTO {settings.source_table} (name, description) VALUES ('Keep Me', 'KEEP THIS DESCRIPTION')"
-                    )
-                    await cur.execute(
-                        f"INSERT INTO {settings.source_table} (name, description) VALUES ('Ignore Me', 'IGNORE THIS ONE')"
-                    )
+        async with await connect_db(
+            custom_settings.resolved_sink_url, autocommit=True
+        ) as conn:
+            await conn.execute(
+                f"DROP TABLE IF EXISTS {custom_settings.sink_raw_table} CASCADE"
+            )
+            await conn.execute(
+                f"DELETE FROM _replica_state WHERE key = '{custom_settings.subscription_name}'"
+            )
+
+        # Override settings for this test
+        async with PGSearchReplica(
+            sync=True, **custom_settings.model_dump()
+        ) as replica:
+            settings = replica.settings
 
             # Wait for replication to RAW table
             found_keep = False
@@ -279,29 +311,48 @@ async def test_reconciliation_efficiency():
     """
     from unittest.mock import patch
 
+    custom_settings = global_settings.model_copy(
+        update={
+            "source_table": "stable_products",
+            "sink_raw_table": "stable_products",
+            "sink_replica_table": "stable_products_replica",
+            "publication_name": "pub_stable",
+            "subscription_name": "sub_stable",
+        }
+    )
+
     with patch.dict(
         "os.environ",
-        {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(global_settings)},
+        {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(custom_settings)},
     ):
-        async with PGSearchReplica(sync=True) as replica:
-            settings = replica.settings
-            # 1. Setup initial state
-            async with await connect_db(
-                settings.source_url, autocommit=True
-            ) as conn:
-                await conn.execute(
-                    f"TRUNCATE TABLE {settings.source_table} CASCADE"
-                )
-                await conn.execute(
-                    f"INSERT INTO {settings.source_table} (id, name, description) VALUES (1, 'Stable', 'stable product description')"
-                )
+        # 1. Setup Source & Sink
+        async with await connect_db(
+            custom_settings.source_url, autocommit=True
+        ) as conn:
+            await conn.execute(
+                f"DROP TABLE IF EXISTS {custom_settings.source_table} CASCADE"
+            )
+            await conn.execute(
+                f"CREATE TABLE {custom_settings.source_table} (id INT PRIMARY KEY, name TEXT, description TEXT)"
+            )
+            await conn.execute(
+                f"INSERT INTO {custom_settings.source_table} (id, name, description) VALUES (1, 'Stable', 'stable product description')"
+            )
 
-            async with await connect_db(
-                settings.resolved_sink_url, autocommit=True
-            ) as conn:
-                await conn.execute(
-                    f"TRUNCATE TABLE {settings.sink_raw_table} CASCADE"
-                )
+        async with await connect_db(
+            custom_settings.resolved_sink_url, autocommit=True
+        ) as conn:
+            await conn.execute(
+                f"DROP TABLE IF EXISTS {custom_settings.sink_raw_table} CASCADE"
+            )
+            await conn.execute(
+                f"DELETE FROM _replica_state WHERE key = '{custom_settings.subscription_name}'"
+            )
+
+        async with PGSearchReplica(
+            sync=True, **custom_settings.model_dump()
+        ) as replica:
+            settings = replica.settings
 
             await wait_for_pgai_sync(settings)
 
@@ -320,7 +371,11 @@ async def test_reconciliation_efficiency():
             async with await connect_db(
                 settings.resolved_sink_url, autocommit=True
             ) as conn:
-                await conn.execute(f"TRUNCATE TABLE {settings.sink_raw_table}")
+                # We also need to clean up the embedding store to force re-processing if needed
+                # though the test checks if it's identical.
+                await conn.execute(
+                    f"TRUNCATE TABLE {settings.sink_raw_table} CASCADE"
+                )
                 await conn.execute(
                     f"INSERT INTO {settings.sink_raw_table} ({settings.id_column}, name, description) VALUES (1, 'Stable', 'stable product description')"
                 )
@@ -331,11 +386,22 @@ async def test_reconciliation_efficiency():
             async with await connect_db(settings.resolved_sink_url) as conn:
                 await register_vector(conn)
                 async with conn.cursor() as cur:
+                    # We use the view to verify access, but it might take a moment for the JOIN to be consistent
+                    # if pgai is doing background work.
                     await cur.execute(
                         f"SELECT {settings.embedding_column} FROM {settings.sink_replica_table} WHERE {settings.id_column} = 1"
                     )
                     row2 = await cur.fetchone()
-                    assert row2 is not None
+                    if row2 is None:
+                        # Fallback to direct table check for diagnostics
+                        await cur.execute(
+                            f"SELECT table_name FROM information_schema.view_table_usage WHERE view_name = '{settings.sink_replica_table}'"
+                        )
+                        targets = await cur.fetchall()
+                        raise AssertionError(
+                            f"Row 1 not found in search view {settings.sink_replica_table}. Targets: {targets}"
+                        )
+
                     emb2 = row2[0]
                     assert emb1 is not None, "Initial embedding is None"
                     assert emb2 is not None, "Sync'd embedding is None"
@@ -351,12 +417,33 @@ async def test_wal_watchdog_self_destruct():
     """
     from unittest.mock import patch
 
+    custom_settings = global_settings.model_copy(
+        update={
+            "source_table": "watchdog_products",
+            "sink_raw_table": "watchdog_products",
+            "publication_name": "pub_watchdog",
+            "subscription_name": "sub_watchdog",
+            "max_slot_wal_keep_size_mb": -1,
+        }
+    )
+
     with patch.dict(
         "os.environ",
-        {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(global_settings)},
+        {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(custom_settings)},
     ):
+        # 1. Setup Source
+        async with await connect_db(
+            custom_settings.source_url, autocommit=True
+        ) as conn:
+            await conn.execute(
+                f"DROP TABLE IF EXISTS {custom_settings.source_table} CASCADE"
+            )
+            await conn.execute(
+                f"CREATE TABLE {custom_settings.source_table} (id SERIAL PRIMARY KEY, name TEXT, description TEXT)"
+            )
+
         async with PGSearchReplica(
-            sync=True, max_slot_wal_keep_size_mb=-1
+            sync=True, **custom_settings.model_dump()
         ) as replica:
             settings = replica.settings
             # Pools are already initialized by Orchestrator.start() via PGSearchReplica
@@ -418,24 +505,49 @@ async def test_blue_green_swap():
     """
     from unittest.mock import patch
 
+    custom_settings = global_settings.model_copy(
+        update={
+            "source_table": "swap_products",
+            "sink_raw_table": "swap_products",
+            "sink_replica_table": "swap_products_replica",
+            "publication_name": "pub_swap",
+            "subscription_name": "sub_swap",
+        }
+    )
+
     with patch.dict(
         "os.environ",
-        {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(global_settings)},
+        {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(custom_settings)},
     ):
+        # 1. Setup Source & Sink
+        async with await connect_db(
+            custom_settings.source_url, autocommit=True
+        ) as conn:
+            await conn.execute(
+                f"DROP TABLE IF EXISTS {custom_settings.source_table} CASCADE"
+            )
+            await conn.execute(
+                f"CREATE TABLE {custom_settings.source_table} (id SERIAL PRIMARY KEY, name TEXT, description TEXT)"
+            )
+            await conn.execute(
+                f"INSERT INTO {custom_settings.source_table} (name, description) VALUES ('SwapBot', 'Initial version')"
+            )
+
+        async with await connect_db(
+            custom_settings.resolved_sink_url, autocommit=True
+        ) as conn:
+            await conn.execute(
+                f"DROP TABLE IF EXISTS {custom_settings.sink_raw_table} CASCADE"
+            )
+            await conn.execute(
+                f"DELETE FROM _replica_state WHERE key = '{custom_settings.subscription_name}'"
+            )
+
         # 1. Initial Start (Model A)
         async with PGSearchReplica(
-            sync=True, embedding_model="nomic-embed-text"
+            sync=True, **custom_settings.model_dump()
         ) as replica:
             settings = replica.settings
-            async with await connect_db(
-                settings.source_url, autocommit=True
-            ) as conn:
-                await conn.execute(
-                    f"TRUNCATE TABLE {settings.source_table} CASCADE"
-                )
-                await conn.execute(
-                    f"INSERT INTO {settings.source_table} (name, description) VALUES ('SwapBot', 'Initial version')"
-                )
 
             await wait_for_pgai_sync(settings)
             results = await replica.search("SwapBot")
@@ -447,23 +559,27 @@ async def test_blue_green_swap():
             test_logger = logging.getLogger(__name__)
             async with await connect_db(settings.resolved_sink_url) as conn:
                 async with conn.cursor() as cur:
+                    # We look for where the view points. It could point to a table or another view.
                     await cur.execute(
                         """
                         SELECT table_name
                         FROM information_schema.view_table_usage
                         WHERE view_name = %s
-                        AND table_name LIKE '%%_store_v%%'
+                        AND (table_name LIKE '%%_store_v%%' OR table_name LIKE '%%_embedding_v%%')
                         """,
                         (settings.sink_replica_table,),
                     )
-                    row = await cur.fetchone()
-                    table_v1 = row[0] if row else None
+                    rows = await cur.fetchall()
+                    table_v1 = rows[0][0] if rows else None
                     test_logger.info(f"Initial view target: {table_v1}")
 
         # 2. Re-start with Model B (triggers reconciliation)
         # Note: we use a different model name AND dimension to trigger the hash drift
+        model_b_settings = custom_settings.model_copy(
+            update={"embedding_model": "all-minilm", "embedding_dimension": 384}
+        )
         async with PGSearchReplica(
-            sync=True, embedding_model="all-minilm", embedding_dimension=384
+            sync=True, **model_b_settings.model_dump()
         ) as replica:
             settings = replica.settings
 
@@ -471,10 +587,19 @@ async def test_blue_green_swap():
             async with await connect_db(settings.resolved_sink_url) as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(
-                        "SELECT table_name FROM information_schema.view_table_usage WHERE view_name = %s",
+                        """
+                        SELECT table_name 
+                        FROM information_schema.view_table_usage 
+                        WHERE view_name = %s 
+                        AND (table_name LIKE '%%_store_v%%' OR table_name LIKE '%%_embedding_v%%')
+                        """,
                         (settings.sink_replica_table,),
                     )
-                    table_v2 = (await cur.fetchone())[0]
+                    row = await cur.fetchone()
+                    assert (
+                        row is not None
+                    ), f"View {settings.sink_replica_table} has no versioned targets in view_table_usage"
+                    table_v2 = row[0]
 
             assert (
                 table_v1 != table_v2

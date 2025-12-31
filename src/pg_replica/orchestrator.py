@@ -181,21 +181,44 @@ class Orchestrator:
         logger.info("Shutting down orchestrator...")
         self._stop_event.set()
 
-        for task in self._tasks:
-            task.cancel()
-
+        # 1. Cancel and wait for background tasks (worker, watchdog)
+        # We give them a strict timeout to avoid blocking teardown.
         if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+            for task in self._tasks:
+                task.cancel()
+
+            try:
+                # Give tasks up to 5 seconds to respond to cancellation and release resources.
+                # This is important for tasks holding DB connections or locks.
+                await asyncio.wait_for(
+                    asyncio.gather(*self._tasks, return_exceptions=True),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Timed out waiting for orchestrator tasks to stop. Some tasks may still be active."
+                )
             self._tasks = []
 
+        # 2. Drop infrastructure (Sink & Source)
+        # This is where the most dangerous hangs occur (DROP SUBSCRIPTION)
         try:
-            await drop_subscription_completely(self.settings)
+            # We wrap this in a timeout as a last resort. 20s is plenty for Postgres teardown.
+            await asyncio.wait_for(
+                drop_subscription_completely(self.settings),
+                timeout=20.0,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Teardown timed out! Some Postgres objects may still exist (slots, subscriptions)."
+            )
         except Exception as e:
-            logger.debug(f"Failed to drop subscription during stop: {e}")
+            logger.debug(f"Failed to drop infrastructure during stop: {e}")
 
-        # Close pools before stopping Postgres
+        # 3. Cleanup connection pools
         await close_pools()
 
+        # 4. Stop Local Postgres
         if self._pg_process:
             logger.info("Stopping local Postgres...")
             self._pg_process.terminate()

@@ -7,21 +7,55 @@ from pg_replica.database import connect_db, check_slot_exists
 async def wait_for_pgai_sync(settings, expected_count=1, timeout=60):
     """Wait for pgai vectorizer to finish processing all rows."""
     import time
+    import logging
 
+    logger = logging.getLogger(__name__)
     start_time = time.time()
+
+    # We resolve the actual embedding source from the search replica view
+    # to be robust against versioned table names.
     embedding_table = f"{settings.sink_raw_table}_embedding"
+
+    logger.info(f"Waiting for {expected_count} embeddings...")
     while time.time() - start_time < timeout:
         async with await connect_db(settings.resolved_sink_url) as conn:
             async with conn.cursor() as cur:
+                # 0. Resolve the actual embedding source if possible
                 try:
-                    await cur.execute(f"SELECT count(*) FROM {embedding_table}")
-                    res = await cur.fetchone()
-                    count = res[0] if res else 0
-                    if count >= expected_count:
-                        return True
+                    await cur.execute(
+                        """
+                        SELECT table_name 
+                        FROM information_schema.view_table_usage 
+                        WHERE view_name = %s 
+                        AND table_name LIKE %s
+                        """,
+                        (settings.sink_replica_table, f"%_embedding%"),
+                    )
+                    row = await cur.fetchone()
+                    if row:
+                        embedding_table = row[0]
                 except Exception:
                     pass
+
+                # 3. Check embedding count
+                try:
+                    await cur.execute(
+                        f"SELECT count(*) FROM {embedding_table} WHERE {settings.embedding_column} IS NOT NULL"
+                    )
+                    res = await cur.fetchone()
+                    count = res[0] if res else 0
+                    logger.info(
+                        f"Current embedding count: {count}/{expected_count}"
+                    )
+                    if count >= expected_count:
+                        logger.info("pgai sync complete.")
+                        return True
+                except Exception as e:
+                    logger.info(
+                        f"Waiting for embedding table to be created... ({e})"
+                    )
         await asyncio.sleep(2)
+    logger.error("pgai sync timed out.")
     return False
 
 
@@ -54,7 +88,7 @@ async def test_uuid_recovery_flow():
         "os.environ",
         {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(custom_settings)},
     ):
-        # Ensure source table exists
+        # 1. Setup Source table with UUIDs
         async with await connect_db(
             custom_settings.source_url, autocommit=True
         ) as conn:
