@@ -290,8 +290,6 @@ async def atomic_view_swap(
             f"Performing atomic view swap targeting {raw_table} with embedding source {embedding_view}..."
         )
 
-        view_content_sql = f"'Product: ' || COALESCE(r.name, '') || ' Description: ' || COALESCE(r.{settings.content_column}, '')"
-
         await conn.set_autocommit(False)  # Start transaction
         try:
             async with conn.cursor() as cur:
@@ -304,7 +302,7 @@ async def atomic_view_swap(
                     CREATE VIEW {settings.sink_replica_table} AS
                     SELECT 
                         r.{settings.id_column},
-                        {view_content_sql} as {settings.target_content_column},
+                        e.chunk as {settings.target_content_column},
                         e.{settings.embedding_column}
                     FROM {raw_table} r
                     LEFT JOIN {embedding_view} e ON r.{settings.id_column} = e.{settings.id_column}
