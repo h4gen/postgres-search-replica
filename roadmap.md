@@ -56,7 +56,7 @@ This document outlines the architectural and operational requirements to move th
     - **Status**: Implemented via `ai-worker`.
     - **Why**: Moving vectorization to dedicated worker containers allows scaling embedding compute independently of the database and sidecar.
 - **Embedding Cache**:
-    - **Implementation**: Optional Redis layer to cache embeddings for identical content strings.
+    - **Implementation**: Optional layer to cache embeddings for identical content strings.
     - **Why**: Significantly reduces cost and latency if the source data contains many repeating text values (e.g., category names or status updates).
 
 ## Chapter 5: Operational Lifecycle
@@ -104,7 +104,7 @@ This document outlines the architectural and operational requirements to move th
 - **Experimental Versioning (Shadow Indexing)**:
     - **Implementation**: Support multiple concurrent vectorizers/indexes for the same source table.
     - **Why**: Enables A/B testing of different embedding models or chunking strategies by populating Shadow tables/columns alongside the primary ones before switching the public View.
-- **Blue-Green Data Migration ( Swap Pattern)**:
+- **Blue-Green Data Migration (Swap Pattern)**:
     - **Implementation**: Instead of in-place `ALTER TABLE` for complex changes (like model or dimension updates), the daemon implements a Blue-Green deployment for tables. It builds the new version in the background and performs an atomic View swap once `pgai` reports 100% sync.
     - **Why**: Ensures zero-downtime migrations for un-migratable changes like embedding dimension shifts. Prevents migration nightmares by treating derived data as versioned and disposable.
 - **Self-Describing Manifest (State-as-Code)**:

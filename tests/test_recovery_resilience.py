@@ -7,21 +7,71 @@ from pg_replica.database import connect_db, check_slot_exists
 async def wait_for_pgai_sync(settings, expected_count=1, timeout=60):
     """Wait for pgai vectorizer to finish processing all rows."""
     import time
+    import logging
 
+    logger = logging.getLogger(__name__)
     start_time = time.time()
-    embedding_table = f"{settings.sink_raw_table}_embedding"
+
+    # We resolve the actual embedding source from the search replica view
+    # to be robust against versioned table names.
+    embedding_table = None
+
+    logger.info(f"Waiting for {expected_count} embeddings...")
     while time.time() - start_time < timeout:
         async with await connect_db(settings.resolved_sink_url) as conn:
             async with conn.cursor() as cur:
+                # 0. Resolve the actual embedding source if possible
                 try:
-                    await cur.execute(f"SELECT count(*) FROM {embedding_table}")
-                    res = await cur.fetchone()
-                    count = res[0] if res else 0
-                    if count >= expected_count:
-                        return True
+                    await cur.execute(
+                        """
+                        SELECT table_name 
+                        FROM information_schema.view_table_usage 
+                        WHERE view_name = %s 
+                        AND (table_name LIKE '%%_store_v%%' OR table_name LIKE '%%_embedding%%')
+                        LIMIT 1
+                        """,
+                        (settings.sink_replica_table,),
+                    )
+                    row = await cur.fetchone()
+                    if row:
+                        embedding_table = row[0]
                 except Exception:
                     pass
+
+                # If we couldn't resolve it, use a deterministic guess
+                current_table = (
+                    embedding_table
+                    or f"{settings.sink_raw_table}_store_v{settings.get_version_id()}"
+                )
+
+                # 2. Check if subscription still exists (Optimization for self-destruct tests)
+                await cur.execute(
+                    "SELECT 1 FROM pg_subscription WHERE subname = %s",
+                    (settings.subscription_name,),
+                )
+                if not await cur.fetchone():
+                    logger.info("Subscription is gone, stopping sync wait.")
+                    return False
+
+                # 3. Check embedding count
+                try:
+                    await cur.execute(
+                        f"SELECT count(*) FROM {current_table} WHERE {settings.embedding_column} IS NOT NULL"
+                    )
+                    res = await cur.fetchone()
+                    count = res[0] if res else 0
+                    logger.info(
+                        f"Current embedding count: {count}/{expected_count} in {current_table}"
+                    )
+                    if count >= expected_count:
+                        logger.info("pgai sync complete.")
+                        return True
+                except Exception as e:
+                    logger.info(
+                        f"Waiting for embedding table {current_table} to be created... ({e})"
+                    )
         await asyncio.sleep(2)
+    logger.error("pgai sync timed out.")
     return False
 
 
@@ -54,7 +104,7 @@ async def test_uuid_recovery_flow():
         "os.environ",
         {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(custom_settings)},
     ):
-        # Ensure source table exists
+        # 1. Setup Source table with UUIDs
         async with await connect_db(
             custom_settings.source_url, autocommit=True
         ) as conn:
@@ -178,6 +228,10 @@ async def test_self_destruct_and_auto_heal():
     from unittest.mock import patch
     from pg_replica.database import check_and_protect_source
 
+    import logging
+
+    logger = logging.getLogger(__name__)
+
     custom_settings = global_settings.model_copy(
         update={
             "source_table": "heal_products",
@@ -204,23 +258,26 @@ async def test_self_destruct_and_auto_heal():
                 "INSERT INTO heal_products (id, name, description) VALUES (1, 'Initial', 'Pre-destruct')"
             )
 
-        # 2. Start and Sync
+        # 2. Start and Sync Initial Data
         async with PGSearchReplica(
             sync=True, **custom_settings.model_dump()
         ) as replica:
             await wait_for_pgai_sync(replica.settings, expected_count=1)
 
-            # 3. Trigger self-destruct
+        # 3. Trigger self-destruct (Using a fresh instance with max_slot_wal_keep_size_mb=-1)
+        # This simulates the daemon being killed by its own watchdog.
+        custom_settings.max_slot_wal_keep_size_mb = -1
+        async with PGSearchReplica(
+            sync=True, **custom_settings.model_dump()
+        ) as replica:
             # We wait for the background monitor to trigger it or call it manually
-            # If the background worker hasn't triggered it yet, we call it here.
             try:
                 await check_and_protect_source(replica.settings)
             except RuntimeError as e:
                 if "Self-destructed" not in str(e):
                     raise
 
-            # Verify slot is gone (either background worker or our call did it)
-            # Give it a few seconds for the background worker to finish if it started first
+            # Verify slot is gone
             slot_still_exists = True
             for _ in range(10):
                 if not await check_slot_exists(replica.settings):
@@ -232,21 +289,41 @@ async def test_self_destruct_and_auto_heal():
                 not slot_still_exists
             ), "Replication slot was not dropped by Watchdog"
 
-            # 4. Insert data while "dead"
+        # 4. Insert data while "dead"
+        async with await connect_db(
+            custom_settings.source_url, autocommit=True
+        ) as conn:
+            await conn.execute(
+                "INSERT INTO heal_products (id, name, description) VALUES (2, 'During Gap', 'Post-destruct')"
+            )
+
+        # 5. Restart with a NEW instance (Daemon should auto-heal)
+        custom_settings.max_slot_wal_keep_size_mb = 1024
+        async with PGSearchReplica(
+            sync=True, **custom_settings.model_dump()
+        ) as replica:
+            # Diagnostic: check sink raw table
             async with await connect_db(
-                custom_settings.source_url, autocommit=True
+                replica.settings.resolved_sink_url
             ) as conn:
-                await conn.execute(
-                    "INSERT INTO heal_products (id, name, description) VALUES (2, 'During Gap', 'Post-destruct')"
-                )
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"SELECT count(*) FROM {replica.settings.sink_raw_table}"
+                    )
+                    cnt = (await cur.fetchone())[0]
+                    logger.info(
+                        f"Diagnostic: Sink raw table {replica.settings.sink_raw_table} has {cnt} rows"
+                    )
 
-            # 5. Restart (Daemon should auto-heal)
-            # We need to reset the safety limit for the restart to succeed
-            replica.settings.max_slot_wal_keep_size_mb = 1024
-            await replica.start(sync=True)
+                    await cur.execute("SELECT * FROM ai.vectorizer_errors")
+                    errs = await cur.fetchall()
+                    if errs:
+                        logger.error(f"Diagnostic: pgai errors: {errs}")
 
-            # Wait for catch-up and vectorization of new record
-            await wait_for_pgai_sync(replica.settings, expected_count=2)
+            # Wait for catch-up and vectorization of both records
+            await wait_for_pgai_sync(
+                replica.settings, expected_count=2, timeout=60
+            )
 
             # Verify both records are there
             results = await replica.search("destruct")

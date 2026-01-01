@@ -6,21 +6,13 @@ import uvicorn
 from typing import Callable
 from pythonjsonlogger.json import JsonFormatter
 from .config import settings
+from .reconciler import Reconciler
 from .database import (
-    setup_source,
-    setup_sink,
     drop_subscription_completely,
     connect_db,
     check_and_protect_source,
     init_pools,
     close_pools,
-    check_slot_exists,
-    create_placeholder_slot,
-    run_sql_catchup,
-    find_and_fix_ghost_records,
-    update_replica_state,
-    setup_state_table,
-    ensure_sink_raw_table,
 )
 from .observability import (
     update_replication_lag,
@@ -111,46 +103,21 @@ async def main():
 
     # Run setup before starting the daemon with retries
     # This handles cases where Postgres is starting or in recovery
+    reconciler = Reconciler(settings)
     max_retries = 5
     for i in range(max_retries):
         try:
-            # 1. Ensure publication exists
-            await setup_source(settings)
-
-            # 2. Ensure state table exists
-            await setup_state_table(settings)
-
-            # 3. Check if we need recovery
-            slot_exists = await check_slot_exists(settings)
-            if not slot_exists:
-                logger.warning(
-                    "Replication slot missing. Entering Hybrid Recovery..."
-                )
-                # Ensure raw table exists before catchup
-                await ensure_sink_raw_table(settings)
-
-                # Create slot to anchor the LSN
-                lsn = await create_placeholder_slot(settings)
-                await update_replica_state(settings, lsn=lsn)
-
-                # SQL Catch-up (Idempotent)
-                await run_sql_catchup(settings)
-
-                # Anti-Entropy (Clean up deleted records while offline)
-                await find_and_fix_ghost_records(settings)
-
-            # 3. Setup sink (subscription) - handles copy_data based on slot status
-            await setup_sink(settings)
+            await reconciler.reconcile()
             break
         except Exception as e:
             if i == max_retries - 1:
                 logger.critical(
-                    f"Failed to setup Source/Sink/Recovery after {max_retries} attempts: {e}"
+                    f"Failed to reconcile infrastructure after {max_retries} attempts: {e}"
                 )
                 await close_pools()
                 return
             logger.warning(
-                f"Setup attempt {i+1} failed (Postgres might be in recovery). Retrying in 5s... Error: {e}"
+                f"Reconciliation attempt {i+1} failed (Postgres might be in recovery). Retrying in 5s... Error: {e}"
             )
             await asyncio.sleep(5)
 
