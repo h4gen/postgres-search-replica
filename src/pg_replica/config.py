@@ -2,8 +2,82 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from typing import Dict, List, Optional
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+
+class TableConfig(BaseModel):
+    """Configuration for a single source-to-sink replication target."""
+    
+    # Source Settings
+    source_table: str
+    publication_columns: List[str] = Field(default_factory=list)
+    publication_where: Optional[str] = None
+    
+    # Sink Settings (Optional, with defaults based on source_table)
+    sink_raw_table: Optional[str] = None
+    sink_replica_table: Optional[str] = None
+ 
+    def model_post_init(self, __context) -> None:
+        if self.sink_raw_table is None:
+            ## NEVER APPEND SOMETHING HERE> NEEDED FOR LOGICAL REPLICATION IN POSTGRES
+            self.sink_raw_table = self.source_table
+        if self.sink_replica_table is None:
+            self.sink_replica_table = f"{self.source_table}_search"
+        
+        # Ensure ID and Content columns are in publication_columns
+        if self.id_column not in self.publication_columns:
+            self.publication_columns.append(self.id_column)
+        if self.content_column not in self.publication_columns:
+            self.publication_columns.append(self.content_column)
+        
+        # Add columns from formatting_template
+        import re
+        template_vars = re.findall(r"\$(\w+)", self.formatting_template)
+        for var in template_vars:
+            if var != "chunk" and var not in self.publication_columns:
+                self.publication_columns.append(var)
+        
+        # FINAL VALIDATION: pgai requires $chunk
+        if "$chunk" not in self.formatting_template:
+            raise ValueError(f"formatting_template for table {self.source_table} must contain '$chunk' placeholder")
+ 
+    # Column Mapping
+    id_column: str = "id"
+    content_column: str = "description"
+    target_content_column: str = "transformed_description"
+    embedding_column: str = "embedding"
+    
+    # Search & Transformation
+    search_profile: str = "vector"  # options: vector, hybrid, sparse
+    embedding_provider: str = "ollama"
+    embedding_model: str = "nomic-embed-text"
+    embedding_dimension: int = 768
+    chunking_strategy: str = "recursive_character_text_splitter"
+    formatting_template: str = "Product: $name Description: $chunk"
+
+    def get_config_hash(self) -> str:
+        """Generates a SHA256 hash of the search-relevant configuration for THIS table."""
+        relevant_config = {
+            "publication_columns": sorted(self.publication_columns),
+            "publication_where": self.publication_where,
+            "embedding_provider": self.embedding_provider,
+            "embedding_model": self.embedding_model,
+            "chunking_strategy": self.chunking_strategy,
+            "formatting_template": self.formatting_template,
+            "embedding_dimension": self.embedding_dimension,
+            "search_profile": self.search_profile,
+        }
+        config_json = json.dumps(relevant_config, sort_keys=True)
+        return hashlib.sha256(config_json.encode()).hexdigest()
+
+    def get_version_id(self) -> str:
+        """Returns a short version ID based on the config hash."""
+        return self.get_config_hash()[:8]
+
+
+from pydantic import model_validator
 
 class Settings(BaseSettings):
     source_url: str
@@ -12,6 +86,21 @@ class Settings(BaseSettings):
 
     # Enterprise Source Integration
     source_managed_by_admin: bool = False
+
+    # Multi-Table Configuration
+    tables: Dict[str, TableConfig] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_tables(self) -> "Settings":
+        # Ensure all tables are TableConfig objects
+        new_tables = {}
+        for k, v in self.tables.items():
+            if isinstance(v, dict):
+                new_tables[k] = TableConfig(**v)
+            else:
+                new_tables[k] = v
+        self.tables = new_tables
+        return self
 
     # Storage paths for local mode
     base_dir: Path = Path(
@@ -27,54 +116,18 @@ class Settings(BaseSettings):
 
     @property
     def resolved_sink_url(self) -> str:
-        """Returns the actual connection string, resolving 'local' if necessary."""
         if self.sink_url == "local":
-            # For local mode, we'll use a high port to avoid conflicts
             return f"postgresql://postgres@localhost:{self.local_port}/postgres"
         return self.sink_url
 
     @property
     def subscription_connection_url(self) -> str:
-        """
-        Returns the connection string used by the Sink DB to reach the Source DB.
-        This can be different from source_url if running in Docker (e.g. 'source' vs 'localhost').
-        """
         return os.environ.get("SUBSCRIPTION_SOURCE_URL", self.source_url)
 
-    # Table names
-    source_table: str = "products"
-    sink_raw_table: str = "products"
-    sink_replica_table: str = "products_replica"
-
-    # Replication settings
-    publication_name: str = "pub_products"
-    publication_columns: list[str] = ["id", "name", "description"]
-    publication_where: str | None = None
+    # Global replication/safety settings
     max_slot_wal_keep_size_mb: int = 1024
-    subscription_name: str = "sub_products"
     subscription_options: dict = {"streaming": "'on'"}
     batch_size: int = 50
-
-    # Column mappings
-    id_column: str = "id"
-    content_column: str = "description"
-    target_content_column: str = "transformed_description"
-    embedding_column: str = "embedding"
-    embedding_dimension: int = 768
-    vectorizer_type: str = "ollama"
-
-    # pgai Vectorizer Settings
-    embedding_provider: str = "ollama"
-    embedding_model: str = "nomic-embed-text"
-    chunking_strategy: str = "recursive_character_text_splitter"
-
-    # CONTEXT-AWARE EMBEDDING PRINCIPLE:
-    # 1. The 'content_column' (description) is the "work column" that gets chunked.
-    # 2. The 'formatting_template' allows you to enrich each chunk with metadata.
-    # 3. '$chunk' is the mandatory placeholder for the piece of text being processed.
-    # 4. Other columns (like '$name') provide global context for every chunk,
-    #    ensuring the vector stays semantically linked to the product.
-    formatting_template: str = "Product: $name Description: $chunk"
 
     # System settings
     notify_channel: str = "new_raw_data"
@@ -82,27 +135,6 @@ class Settings(BaseSettings):
     # Observability
     observability_host: str = "0.0.0.0"
     observability_port: int = 8000
-
-    def get_config_hash(self) -> str:
-        """
-        Generates a SHA256 hash of the search-relevant configuration.
-        This hash is used to detect when a re-index or Blue-Green swap is needed.
-        """
-        relevant_config = {
-            "publication_columns": sorted(self.publication_columns),
-            "publication_where": self.publication_where,
-            "embedding_provider": self.embedding_provider,
-            "embedding_model": self.embedding_model,
-            "chunking_strategy": self.chunking_strategy,
-            "formatting_template": self.formatting_template,
-            "embedding_dimension": self.embedding_dimension,
-        }
-        config_json = json.dumps(relevant_config, sort_keys=True)
-        return hashlib.sha256(config_json.encode()).hexdigest()
-
-    def get_version_id(self) -> str:
-        """Returns a short version ID based on the config hash."""
-        return self.get_config_hash()[:8]
 
     model_config = SettingsConfigDict(
         env_file=(".env", ".env.development"),

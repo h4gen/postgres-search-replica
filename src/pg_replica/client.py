@@ -1,8 +1,10 @@
 import logging
-from typing import Any, Optional
+import os
+from typing import Any, Optional, List, Dict
+from ollama import AsyncClient
 
 from .config import settings as global_settings
-from .database import connect_db
+from .database import connect_db, dict_row
 from .orchestrator import Orchestrator
 
 logger = logging.getLogger(__name__)
@@ -17,10 +19,11 @@ class PGSearchReplica:
     def __init__(self, sync: bool = False, **kwargs):
         """
         Initialize with optional configuration overrides.
-        Example: PGSearchReplica(sink_url="local", source_url="...")
         """
-        # Isolate settings per instance
-        self.settings = global_settings.model_copy(update=kwargs)
+        # Isolate settings per instance and ensure validation runs
+        self.settings = global_settings.__class__.model_validate(
+            {**global_settings.model_dump(), **kwargs}
+        )
         self._sync_mode = sync
         self._orchestrator: Optional[Orchestrator] = None
         self._conn = None
@@ -32,19 +35,18 @@ class PGSearchReplica:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.stop()
 
-    async def start(self, sync: bool = False):
+    async def start(self, sync: Optional[bool] = None):
         """
         Start the replica.
         If sync=True, starts the background replication and workers.
         """
-        if sync:
+        use_sync = sync if sync is not None else self._sync_mode
+        if use_sync:
             logger.info("Starting PGSearchReplica in Sync Mode...")
             self._orchestrator = Orchestrator(self.settings)
             await self._orchestrator.start()
         else:
-            logger.info(
-                "Starting PGSearchReplica in Client Mode (Query only)..."
-            )
+            logger.info("Starting PGSearchReplica in Client Mode (Query only)...")
 
     async def stop(self):
         """Stop the replica and all background services."""
@@ -59,72 +61,95 @@ class PGSearchReplica:
     async def _get_conn(self):
         if not self._conn or self._conn.closed:
             self._conn = await connect_db(self.settings.resolved_sink_url)
-            # Register vector types
             from pgvector.psycopg import register_vector_async
-
             await register_vector_async(self._conn)
         return self._conn
 
     async def search(
         self, query: str, limit: int = 5, table: Optional[str] = None
-    ) -> list[dict[str, Any]]:
+    ) -> List[Dict[str, Any]]:
         """
-        Perform a semantic search.
+        Perform a semantic or hybrid search.
 
         Args:
             query: The text to search for.
             limit: Number of results to return.
-            table: Optional override for the replica table name.
+            table: The name of the table configuration to use.
         """
-        target_table = table or self.settings.sink_replica_table
+        if not self.settings.tables:
+            raise RuntimeError("No tables configured for search.")
 
-        # 1. Get embedding in Python (Clean, fast, no Postgres hacks)
-        import os
-        from ollama import AsyncClient
+        target_name = table or next(iter(self.settings.tables))
+        if target_name not in self.settings.tables:
+            raise ValueError(f"Table configuration '{target_name}' not found.")
+        
+        config = self.settings.tables[target_name]
+        replica_table = config.sink_replica_table
 
+        # 1. Get embedding in Python
         ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
         client = AsyncClient(host=ollama_host)
-
-        # Use the same model as configured for the vectorizer
-        res = await client.embeddings(
-            model=self.settings.embedding_model, prompt=query
-        )
+        res = await client.embeddings(model=config.embedding_model, prompt=query)
         embedding = res["embedding"]
 
-        # 2. Simple vector search query
+        # 2. Search query logic
         conn = await self._get_conn()
-        async with conn.cursor() as cur:
-            sql = f"""
-                SELECT 
-                    {self.settings.id_column}, 
-                    {self.settings.target_content_column},
-                    {self.settings.embedding_column} <=> %s::vector as distance
-                FROM {target_table}
-                ORDER BY distance ASC
-                LIMIT %s
-            """
-            logger.debug(
-                f"Executing search on {target_table} with limit {limit}"
-            )
-            await cur.execute(sql, (embedding, limit))
+        async with conn.cursor(row_factory=dict_row) as cur:
+            if config.search_profile == "hybrid":
+                # HYBRID SEARCH (RRF): Vector + Full-Text
+                sql = f"""
+                    WITH ranked AS (
+                        SELECT 
+                            {config.id_column}, 
+                            {config.target_content_column},
+                            row_number() OVER (ORDER BY {config.embedding_column} <=> %s) as vector_rank,
+                            row_number() OVER (ORDER BY ts_rank(ts_col, websearch_to_tsquery('english', %s)) DESC) as text_rank
+                        FROM {replica_table}
+                    )
+                    SELECT 
+                        {config.id_column}, 
+                        {config.target_content_column},
+                        (1.0 / (60 + vector_rank) + 1.0 / (60 + text_rank)) as score
+                    FROM ranked
+                    ORDER BY score DESC
+                    LIMIT %s
+                """
+                logger.debug(f"Executing Hybrid RRF search on {replica_table}")
+                await cur.execute(sql, (embedding, query, limit))
+            else:
+                # VECTOR SEARCH ONLY
+                sql = f"""
+                    SELECT 
+                        {config.id_column}, 
+                        {config.target_content_column},
+                        {config.embedding_column} <=> %s::vector as distance
+                    FROM {replica_table}
+                    ORDER BY distance ASC
+                    LIMIT %s
+                """
+                logger.debug(f"Executing Vector search on {replica_table}")
+                await cur.execute(sql, (embedding, limit))
 
             rows = await cur.fetchall()
-            logger.debug(f"Found {len(rows)} results in {target_table}")
             results = []
             for row in rows:
-                results.append(
-                    {"id": row[0], "content": row[1], "distance": float(row[2])}
-                )
+                item = {
+                    "id": row[config.id_column],
+                    "content": row[config.target_content_column],
+                }
+                if "score" in row:
+                    item["score"] = float(row["score"])
+                else:
+                    item["distance"] = float(row["distance"])
+                results.append(item)
             return results
 
     async def get_status(self) -> dict[str, Any]:
-        """Get the current replication and embedding status."""
+        """Get current status for all configured tables."""
         conn = await self._get_conn()
-        async with conn.cursor() as cur:
+        async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute("SELECT * FROM ai.vectorizer_status")
-            status_rows = await cur.fetchall()
-
+            status = await cur.fetchall()
             await cur.execute("SELECT * FROM ai.vectorizer_errors")
-            error_rows = await cur.fetchall()
-
-            return {"vectorizers": status_rows, "errors": error_rows}
+            errors = await cur.fetchall()
+            return {"vectorizers": status, "errors": errors}
