@@ -93,6 +93,51 @@ async def wait_for_pgai_sync(settings, expected_count=1, timeout=120):
     return False
 
 
+async def robust_slot_cleanup(conn, subscription_name, logger):
+    """
+    Safely drops a replication slot, terminating any backend holding it.
+    Retries multiple times to handle race conditions with reconnecting clients.
+    """
+    import asyncio
+    max_retries = 5
+    for attempt in range(max_retries):
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT active, active_pid FROM pg_replication_slots WHERE slot_name = %s",
+                (subscription_name,)
+            )
+            slot_info = await cur.fetchone()
+            
+            if not slot_info:
+                logger.debug(f"Slot {subscription_name} not found.")
+                return
+
+            active, pid = slot_info
+            logger.info(f"DEBUG: Found existing slot {subscription_name}. Active={active}, PID={pid} (Attempt {attempt+1}/{max_retries})")
+
+            if active and pid:
+                logger.info(f"DEBUG: Terminating backend {pid}")
+                try:
+                    await cur.execute("SELECT pg_terminate_backend(%s)", (pid,))
+                except Exception as e:
+                    logger.warning(f"DEBUG: Failed to terminate backend {pid}: {e}")
+                
+                await asyncio.sleep(0.5) # Wait for backend to vanish
+
+            try:
+                await cur.execute(
+                    "SELECT pg_drop_replication_slot(%s)",
+                    (subscription_name,),
+                )
+                logger.info(f"DEBUG: Dropped slot {subscription_name}")
+                return
+            except Exception as e:
+                logger.warning(f"DEBUG: Failed to drop slot: {e}")
+                await asyncio.sleep(1) # Wait before retry
+    
+    logger.error(f"DEBUG: Failed to drop slot {subscription_name} after {max_retries} attempts.")
+
+
 def get_internal_source_url(settings):
     """Helper to translate localhost URL to internal Docker URL for subscription."""
     return settings.source_url.replace("localhost:5433", "source:5432").replace(
@@ -125,10 +170,16 @@ async def test_full_replication_flow():
         "os.environ",
         {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(custom_settings)},
     ):
+        import logging
+        test_logger = logging.getLogger(__name__)
+
         # 1. Setup Source & Sink
         async with await connect_db(
             custom_settings.source_url, autocommit=True
         ) as conn:
+            # Robust cleanup: Drop slot if it exists to force fresh recovery
+            await robust_slot_cleanup(conn, custom_settings.subscription_name, test_logger)
+
             await conn.execute(
                 f"DROP TABLE IF EXISTS {custom_settings.source_table} CASCADE"
             )
@@ -256,10 +307,16 @@ async def test_filtered_replication_flow():
         "os.environ",
         {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(custom_settings)},
     ):
+        import logging
+        test_logger = logging.getLogger(__name__)
+
         # 1. Setup Source & Sink (Clean start)
         async with await connect_db(
             custom_settings.source_url, autocommit=True
         ) as conn:
+            # Robust cleanup: Drop slot if it exists to force fresh recovery
+            await robust_slot_cleanup(conn, custom_settings.subscription_name, test_logger)
+
             await conn.execute(
                 f"DROP TABLE IF EXISTS {custom_settings.source_table} CASCADE"
             )
@@ -365,10 +422,16 @@ async def test_reconciliation_efficiency():
         "os.environ",
         {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(custom_settings)},
     ):
+        import logging
+        test_logger = logging.getLogger(__name__)
+
         # 1. Setup Source & Sink
         async with await connect_db(
             custom_settings.source_url, autocommit=True
         ) as conn:
+            # Robust cleanup: Drop slot if it exists to force fresh recovery
+            await robust_slot_cleanup(conn, custom_settings.subscription_name, test_logger)
+
             await conn.execute(
                 f"DROP TABLE IF EXISTS {custom_settings.source_table} CASCADE"
             )
@@ -491,10 +554,16 @@ async def test_wal_watchdog_self_destruct():
         "os.environ",
         {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(custom_settings)},
     ):
+        import logging
+        test_logger = logging.getLogger(__name__)
+
         # 1. Setup Source
         async with await connect_db(
             custom_settings.source_url, autocommit=True
         ) as conn:
+            # Robust cleanup: Drop slot if it exists
+            await robust_slot_cleanup(conn, custom_settings.subscription_name, test_logger)
+
             await conn.execute(
                 f"DROP TABLE IF EXISTS {custom_settings.source_table} CASCADE"
             )
@@ -579,10 +648,16 @@ async def test_blue_green_swap():
         "os.environ",
         {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(custom_settings)},
     ):
+        import logging
+        test_logger = logging.getLogger(__name__)
+
         # 1. Setup Source & Sink
         async with await connect_db(
             custom_settings.source_url, autocommit=True
         ) as conn:
+            # Robust cleanup: Drop slot if it exists to force fresh recovery
+            await robust_slot_cleanup(conn, custom_settings.subscription_name, test_logger)
+
             await conn.execute(
                 f"DROP TABLE IF EXISTS {custom_settings.source_table} CASCADE"
             )
