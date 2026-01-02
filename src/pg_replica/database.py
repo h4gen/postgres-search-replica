@@ -766,6 +766,7 @@ async def find_and_fix_ghost_records(settings: Settings, config: TableConfig, ta
                 await k_cur.execute(f"SELECT {config.id_column} FROM {config.sink_raw_table}")
                 sink_ids = [r[0] for r in await k_cur.fetchall()]
         
+        ghosts = [kid for kid in sink_ids if kid not in source_ids]
         if ghosts:
             logger.info(f"Found {len(ghosts)} ghosts in {target_name} via set comparison")
             async with await get_sink_conn() as k_conn:

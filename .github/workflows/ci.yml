@@ -29,28 +29,9 @@ jobs:
     - name: Start Infrastructure
       run: |
         make dev
-        echo "Waiting for Postgres to be ready..."
-        # Wait for the containers to be healthy using pg_isready
-        until docker exec dev-source-1 pg_isready -U postgres; do
-          echo "Source DB not ready..."
-          sleep 2
-        done
-        # Sink DB runs on port 54322 inside the container in local mode
-        until docker exec dev-sink-1 pg_isready -U postgres -h localhost -p 54322; do
-          echo "Sink DB not ready..."
-          sleep 2
-        done
-        echo "Waiting for Ollama model to be pulled..."
-        until docker exec dev-ollama-1 ollama list | grep -q "nomic-embed-text"; do
-          echo "Ollama model not ready..."
-          sleep 5
-        done
-        echo "Infrastructure is ready!"
+        make wait-for-infra
 
     - name: Run Tests
-      env:
-        SOURCE_URL: postgresql://postgres:password@localhost:5433/production_db
-        SINK_URL: postgresql://postgres@localhost:5434/postgres
       run: make test
 
     - name: Shutdown Infrastructure
