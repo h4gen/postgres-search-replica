@@ -237,17 +237,21 @@ class Planner:
                 )
             )
 
-        if "_embedding_cache" not in sink_state["tables"]:
-            actions.append(
-                Action(
-                    type=ActionType.SINK_CACHE_SETUP,
-                    description="Setup embedding cache table",
-                    params={},
-                )
-            )
 
         # 2. Per-Table Setup
+        cache_setup_added = False
         for name, config in self.settings.tables.items():
+            if "_embedding_cache" not in sink_state["tables"] and not cache_setup_added:
+                actions.append(
+                    Action(
+                        type=ActionType.SINK_CACHE_SETUP,
+                        description="Setup embedding cache table",
+                        params={},
+                        target_name=name,
+                    )
+                )
+                cache_setup_added = True
+
             pub_name = f"pub_{name}"
             sub_name = f"sub_{name}"
             desired_hash = config.get_config_hash()

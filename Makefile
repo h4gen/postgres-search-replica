@@ -18,7 +18,7 @@ help:
 	@echo "  make type-check       - Run ty type checker"
 	@echo "  make clean            - Remove volumes and temporary files"
 
-dev:
+dev: clean
 	docker compose -f dev/docker-compose.yml up --build -d
 
 down:
@@ -51,6 +51,7 @@ test-unit:
 	@echo "Unit tests for custom transformers are deprecated after pgai migration."
 
 test-integration:
+	uv sync --extra test
 	PYTHONPATH=src uv run pytest -v -s --log-cli-level=INFO tests/ $(ARGS)
 
 test-dev: dev wait-for-infra test
