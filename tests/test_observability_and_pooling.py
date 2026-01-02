@@ -32,13 +32,13 @@ def test_observability_health_endpoint():
 def test_observability_metrics_endpoint():
     """Verify the /metrics endpoint returns Prometheus format metrics."""
     # Seed some metrics
-    update_replication_lag(123.45)
+    update_replication_lag("test_table", 123.45)
     update_pgai_pending("test_table", 10)
 
     response = client.get("/metrics")
     assert response.status_code == 200
     content = response.text
-    assert "replication_lag_mb 123.45" in content
+    assert 'replication_lag_mb{table="test_table"} 123.45' in content
     assert 'pgai_pending_items{table="test_table"} 10.0' in content
 
 

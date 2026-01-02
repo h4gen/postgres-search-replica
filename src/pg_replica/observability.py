@@ -6,7 +6,7 @@ logger = logging.getLogger(__name__)
 
 # Prometheus Metrics
 REPLICATION_LAG_MB = Gauge(
-    "replication_lag_mb", "Current replication lag in megabytes"
+    "replication_lag_mb", "Current replication lag in megabytes", ["table"]
 )
 PGAI_PENDING_ITEMS = Gauge(
     "pgai_pending_items", "Number of items pending in pgai vectorizer", ["table"]
@@ -29,9 +29,9 @@ async def metrics():
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-def update_replication_lag(lag_mb: float):
+def update_replication_lag(table_name: str, lag_mb: float):
     """Update the replication lag metric."""
-    REPLICATION_LAG_MB.set(lag_mb)
+    REPLICATION_LAG_MB.labels(table=table_name).set(lag_mb)
 
 
 def update_pgai_pending(table_name: str, pending_count: int):

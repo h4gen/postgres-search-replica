@@ -37,45 +37,33 @@ async def log_pgai_status():
     """Poll pgai status and log progress or errors."""
     try:
         async with await connect_db(settings.resolved_sink_url) as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT source_table, pending_items FROM ai.vectorizer_status"
-                )
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("SELECT name, source_table, pending_items FROM ai.vectorizer_status")
                 results = await cur.fetchall()
-                for table, pending in results:
-                    logger.info(
-                        f"pgai Status for {table}: {pending} items pending"
-                    )
-                    update_pgai_pending(str(table), int(pending))
-    except Exception as e:
-        logger.warning(f"Failed to fetch pgai status: {e}")
+                for row in results:
+                    logger.info(f"pgai Status for {row['name']} ({row['source_table']}): {row['pending_items']} items pending")
+                    update_pgai_pending(row["name"], int(row["pending_items"]))
+    except Exception: pass
 
 
-async def run_daemon(
-    loop: asyncio.AbstractEventLoop, handle_exit: Callable[[], None]
-) -> None:
+async def run_daemon(loop: asyncio.AbstractEventLoop, handle_exit: Callable[[], None]) -> None:
     """Main loop for the replicator daemon."""
-    logger.info("Daemon started. Monitoring source health and pgai status...")
-
+    logger.info("Daemon started. Monitoring multi-table source health...")
     stop_event = asyncio.Event()
 
     async def monitoring_worker():
         while not stop_event.is_set():
-            try:
-                # Watchdog: Protect source from lag
-                lag_mb = await check_and_protect_source(settings)
-                update_replication_lag(lag_mb)
-
-                # Observability: Log pgai status
-                await log_pgai_status()
-            except RuntimeError as e:
-                if "Self-destructed" in str(e):
-                    logger.critical(f"Daemon stopping: {e}")
-                    stop_event.set()
-                    loop.call_soon(handle_exit)
-                    break
-            except Exception as e:
-                logger.error(f"Error in monitoring worker: {e}")
+            for name in list(settings.tables.keys()):
+                try:
+                    lag_mb = await check_and_protect_source(settings, name)
+                    update_replication_lag(name, lag_mb)
+                except RuntimeError as e:
+                    if "Self-destructed" in str(e):
+                        logger.critical(f"Daemon target {name} stopping: {e}")
+                except Exception as e:
+                    logger.error(f"Error in monitoring worker for {name}: {e}")
+            
+            await log_pgai_status()
             await asyncio.sleep(30)
 
     try:
@@ -87,22 +75,12 @@ async def run_daemon(
 
 async def main():
     loop = asyncio.get_running_loop()
-
-    # Initialize connection pools
     await init_pools(settings)
 
-    # Start Health/Metrics server in the background
-    config = uvicorn.Config(
-        observability_app,
-        host=settings.observability_host,
-        port=settings.observability_port,
-        log_level="error",
-    )
+    config = uvicorn.Config(observability_app, host=settings.observability_host, port=settings.observability_port, log_level="error")
     server = uvicorn.Server(config)
     server_task = asyncio.create_task(server.serve())
 
-    # Run setup before starting the daemon with retries
-    # This handles cases where Postgres is starting or in recovery
     reconciler = Reconciler(settings)
     max_retries = 5
     for i in range(max_retries):
@@ -111,14 +89,10 @@ async def main():
             break
         except Exception as e:
             if i == max_retries - 1:
-                logger.critical(
-                    f"Failed to reconcile infrastructure after {max_retries} attempts: {e}"
-                )
+                logger.critical(f"Failed to reconcile after {max_retries} attempts: {e}")
                 await close_pools()
                 return
-            logger.warning(
-                f"Reconciliation attempt {i+1} failed (Postgres might be in recovery). Retrying in 5s... Error: {e}"
-            )
+            logger.warning(f"Reconciliation attempt {i+1} failed: {e}")
             await asyncio.sleep(5)
 
     def handle_exit():
@@ -127,7 +101,6 @@ async def main():
         server.should_exit = True
 
     task = asyncio.create_task(run_daemon(loop, handle_exit))
-
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, handle_exit)
 
@@ -136,9 +109,9 @@ async def main():
     except asyncio.CancelledError:
         logger.info("Daemon task cancelled.")
     finally:
-        await drop_subscription_completely(settings)
+        for name, config_obj in settings.tables.items():
+            await drop_subscription_completely(settings, config_obj, name)
         await close_pools()
-        # Wait for server to shutdown
         await server_task
 
 
