@@ -26,20 +26,20 @@ down:
 
 wait-for-infra:
 	@echo "Waiting for services to start..."
-	@until [ "$$(docker compose -f dev/docker-compose.yml ps -q source)" ]; do sleep 1; done
-	@until [ "$$(docker compose -f dev/docker-compose.yml ps -q sink)" ]; do sleep 1; done
-	@until [ "$$(docker compose -f dev/docker-compose.yml ps -q ollama)" ]; do sleep 1; done
+	@until [ "$$(docker compose -f dev/docker-compose.yml ps -q source | head -n 1)" ]; do sleep 1; done
+	@until [ "$$(docker compose -f dev/docker-compose.yml ps -q sink | head -n 1)" ]; do sleep 1; done
+	@until [ "$$(docker compose -f dev/docker-compose.yml ps -q ollama | head -n 1)" ]; do sleep 1; done
 	@echo "Waiting for Postgres to be ready..."
-	@until docker exec $$(docker compose -f dev/docker-compose.yml ps -q source) pg_isready -U postgres > /dev/null 2>&1; do \
+	@until docker exec $$(docker compose -f dev/docker-compose.yml ps -q source | head -n 1) pg_isready -U postgres > /dev/null 2>&1; do \
 		echo "Source DB not ready..."; \
 		sleep 2; \
 	done
-	@until docker exec $$(docker compose -f dev/docker-compose.yml ps -q sink) pg_isready -U postgres -h localhost -p 54322 > /dev/null 2>&1; do \
+	@until docker exec $$(docker compose -f dev/docker-compose.yml ps -q sink | head -n 1) pg_isready -U postgres -h localhost -p 54322 > /dev/null 2>&1; do \
 		echo "Sink DB not ready..."; \
 		sleep 2; \
 	done
 	@echo "Waiting for Ollama model to be pulled..."
-	@until docker exec $$(docker compose -f dev/docker-compose.yml ps -q ollama) ollama list | grep -q "nomic-embed-text"; do \
+	@until docker exec $$(docker compose -f dev/docker-compose.yml ps -q ollama | head -n 1) ollama list | grep -q "nomic-embed-text"; do \
 		echo "Ollama model not ready..."; \
 		sleep 5; \
 	done
