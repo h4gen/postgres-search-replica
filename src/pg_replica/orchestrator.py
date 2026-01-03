@@ -1,4 +1,4 @@
-import asyncio
+ import asyncio
 import logging
 import subprocess
 from datetime import timedelta
@@ -177,8 +177,6 @@ class Orchestrator:
             except subprocess.TimeoutExpired: self._pg_process.kill()
             self._pg_process = None
 
-        # 3. Cleanup connection pools
-        await close_pools()
 
         # 4. Stop Local Postgres
         if self._pg_process:

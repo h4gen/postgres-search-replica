@@ -104,7 +104,7 @@ async def wait_for_source_table(settings: Settings, config: TableConfig, timeout
                 )
                 if await cur.fetchone():
                     return True
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.1)
     logger.error(f"Timed out waiting for source table {config.source_table}")
     return False
 
