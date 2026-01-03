@@ -51,8 +51,8 @@ async def test_declarative_blue_green_orchestration():
     sink_url = os.getenv("SINK_URL", "postgresql://postgres:password@localhost:5434/search_replica_db")
     
     # This is for the Sink container to connect to the Source container
-    # We MUST set this environment variable because Settings.subscription_connection_url reads from it.
-    os.environ["SUBSCRIPTION_SOURCE_URL"] = "postgresql://postgres:password@source:5432/production_db"
+    from tests.test_integration import get_internal_source_url
+    os.environ["SUBSCRIPTION_SOURCE_URL"] = get_internal_source_url(Settings(source_url=source_url, sink_url=sink_url, tables={}))
 
     settings = Settings(
         source_url=source_url,
@@ -150,7 +150,6 @@ async def test_declarative_blue_green_orchestration():
     # Manually poll database status for v2 target
     async def wait_for_target_sync(target_table_pattern):
         for _ in range(60): # Wait up to 60s
-            statuses = await settings.db_get_vectorizer_statuses() # We don't have this on settings...
             # Use direct DB connection
             async with await get_sink_conn() as conn:
                 async with conn.cursor() as cur:
