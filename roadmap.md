@@ -9,6 +9,16 @@ This document outlines the architectural and operational requirements to move th
 ## Chapter 1: Reliability & Fault Tolerance
 *Ensuring the system can survive external failures without manual intervention.*
 
+- **Readiness Probes (State-based Synchronization)**:
+    - **Status**: High Priority.
+    - **Implementation**: Replace all `asyncio.sleep` calls with active polling loops that verify the database state.
+    - **Key Targets**:
+        - **Publication Visibility**: Verify the Sink can see the Publication on the Source before creating the subscription.
+        - **Slot Activation**: Ensure the replication slot exists and is ready for the subscription worker.
+        - **pgai Registry Sync**: Verify `pgai` has indexed new tables in its internal metadata before attempting vectorizer creation.
+        - **Extension Readiness**: Ensure `ai` and `vector` extensions are fully loaded and their tables (`ai.vectorizer`) are queryable.
+        - **Subscription Health**: Wait for the subscription to move from `initializing` to `streaming` state before reporting a successful sync.
+    - **Why**: Eliminates "flaky" tests and CI failures caused by post-commit lag in Postgres and Docker networking. Moves the system from "timing-based" to "state-based" reliability.
 - **pgai Orchestration**:
     - **Status**: Completed.
     - **Why**: Replaced custom Python loops with `pgai` background workers. This provides database-native retries, dead-letter queues, and atomic state tracking for embeddings.
@@ -80,11 +90,21 @@ This document outlines the architectural and operational requirements to move th
 *Bridging the gap between developer automation and DBA security policies.*
 
 
-- **Downstream Deployment Targets (Edge Replication)**:
-    - **Implementation**: Allow configuring external Vector Databases (Qdrant, Pinecone, Weaviate) as "Downstream Sinks" as deployment target for a specific Table Branch.
-        - **Headless Staging**: Postgres acts as the "Staging Area" and single source of truth for embeddings and metadata.
-        - **Idempotent Sync**: A specialized Worker pipelines the *final, approved* vectors from the Live View to the remote engine using UUID-based upserts.
-    - **Why**: Decouples "Engineering" from "Serving". Engineers can use the Postgres Workbench to build/test complex RAG pipelines, then "Deploy" the finalized index to a high-performance edge cluster (e.g., Qdrant Cloud) for global low-latency serving.
+- **Universal Downstream Sync (Multicast Search Architecture)**:
+    - **Pattern (CQRS)**: Treat the source as the Command store and external sinks (Qdrant, Pinecone, etc.) as specialized Query stores. Postgres acts as the "Reliable Buffer" and state manager.
+    - **Implementation (Outbox Handshake)**: 
+        - **Registry**: Use `_sink_registry` to track downstream mirroring state and version mapping.
+        - **Universal Outbox**: Implement `_downstream_outbox` in the Sink DB to capture all versioned embedding changes.
+        - **Mirror Triggers**: Attach standard triggers to versioned tables to clone changes into the outbox.
+        - **Sink Adapters**: A plugin-based system where external engines (Qdrant, Pinecone) implement a standard `SinkAdapter` interface for batch upserts/deletes.
+    - **Search Lifecycle**:
+        - **Shadow Build**: Synchronize new versions (e.g., `v2`) to isolated downstream collections while `v1` remains live.
+        - **SxS Validation**: Enable side-by-side search benchmarking against shadow collections before promotion.
+        - **Atomic Promotion**: Use downstream-native **Aliases** to flip the "Production" pointer to the new collection once synced.
+    - **Sink-Aware Client**:
+        - **Implementation**: Update `PGSearchReplica.search()` to optionally target a configured downstream sink instead of Postgres SQL.
+        - **Why**: Allows swapping the underlying search infrastructure (e.g., from PG to Qdrant) with zero application code changes.
+    - **Why**: Ensures "at-least-once" delivery of search updates without blocking Postgres transactions. Decouples search infrastructure from database maintenance and enables seamless model/infrastructure migrations.
 - **Pre-provisioned Infrastructure Support**:
     - **Implementation**: Add a `SOURCE_MANAGED_BY_ADMIN` (boolean) flag.
     - **Why**: In strict environments, the daemon will not have permission to `CREATE PUBLICATION` or `CREATE SLOT`. This mode skips all DDL/Management calls and assumes the pipeline is already ready on the source.
@@ -146,6 +166,9 @@ This document outlines the architectural and operational requirements to move th
 - **Side-by-Side (SxS) Diffing**:
     - **Implementation**: A split-screen UI that runs the same query against Main vs. Branch and highlights only the result differences (re-ordering, additions, deletions).
     - **Why**: Facilitates qualitative "vibe checks" for human evaluators to understand the behavioral shift of a new model.
+- **Downstream Atomic Promotion (Aliases)**:
+    - **Implementation**: Extend the Blue-Green swap logic to external sinks. Use target-native "Aliases" (e.g., Qdrant Aliases) to flip the "Live" pointer from `v1_collection` to `v2_collection` downstream once synced.
+    - **Why**: Provides zero-downtime infrastructure swaps for external search engines, mirroring the internal Postgres view-swap behavior.
 
 ### Retrieval Capabilities
 
