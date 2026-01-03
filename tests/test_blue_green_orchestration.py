@@ -68,7 +68,15 @@ async def test_declarative_blue_green_orchestration():
         async with conn.cursor() as cur:
             await cur.execute(f"DROP VIEW IF EXISTS {REPLICA_TABLE}")
             await cur.execute("TRUNCATE TABLE _replica_state CASCADE")
-            await cur.execute("DELETE FROM ai.vectorizer") # Clean up vectorizers
+            # Clean up vectorizers only if the extension table exists
+            await cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_schema = 'ai' AND table_name = 'vectorizer'
+                )
+            """)
+            if (await cur.fetchone())[0]:
+                await cur.execute("DELETE FROM ai.vectorizer")
     
     reconciler = Reconciler(settings)
 

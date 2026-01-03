@@ -1,4 +1,4 @@
- import asyncio
+import asyncio
 import logging
 import subprocess
 from datetime import timedelta
@@ -56,7 +56,7 @@ class Orchestrator:
             return
 
         data_dir = self.settings.data_dir
-        if not data_dir.exists():
+        if not (data_dir / "PG_VERSION").exists():
             logger.info(
                 f"Initializing new Postgres data directory at {data_dir}..."
             )
@@ -91,8 +91,21 @@ class Orchestrator:
                 "shared_preload_libraries=vector",
                 "-c",
                 "listen_addresses=*",
-            ]
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
         )
+        
+        # Start a thread to pipe Postgres logs to our logger
+        def pipe_logs(proc, logger):
+            for line in iter(proc.stdout.readline, ""):
+                if line:
+                    logger.info(f"[Postgres] {line.strip()}")
+        
+        import threading
+        threading.Thread(target=pipe_logs, args=(self._pg_process, logger), daemon=True).start()
 
     async def _log_pgai_status(self):
         """Poll pgai status and log progress."""
@@ -171,14 +184,6 @@ class Orchestrator:
                 logger.debug(f"Failed to drop {name}: {e}")
 
         await close_pools()
-        if self._pg_process:
-            self._pg_process.terminate()
-            try: self._pg_process.wait(timeout=10)
-            except subprocess.TimeoutExpired: self._pg_process.kill()
-            self._pg_process = None
-
-
-        # 4. Stop Local Postgres
         if self._pg_process:
             logger.info("Stopping local Postgres...")
             self._pg_process.terminate()
