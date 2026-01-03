@@ -20,6 +20,7 @@ from .database import (
     drop_subscription_completely,
     cleanup_vectorizer_infrastructure,
     ensure_embedding_cache_table,
+    get_vectorizer_statuses,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,7 @@ class Inspector:
             "extensions": set(),
             "replica_states": {}, # Map: config_name -> replica_state
             "vectorizers": {},
+            "vectorizer_statuses": {},
         }
         async with await get_sink_conn() as conn:
             async with conn.cursor() as cur:
@@ -175,6 +177,9 @@ class Inspector:
                             }
                         )
 
+                # 6. Vectorizer Sync Status
+                state["vectorizer_statuses"] = await get_vectorizer_statuses(self.settings)
+
         return state
 
     async def get_source_state(self) -> Dict[str, Any]:
@@ -238,8 +243,16 @@ class Planner:
             )
 
 
-        # 2. Per-Table Setup
+
+        # 2. Per-Table Setup (declarative pass)
         cache_setup_added = False
+        
+        # Pre-calculate all managed vectorizer targets to prevent accidental cleanup
+        managed_vectorizers = set()
+        for _, cfg in self.settings.tables.items():
+            vid = cfg.get_version_id()
+            managed_vectorizers.add(f"{cfg.sink_raw_table}_store_v{vid}")
+
         for name, config in self.settings.tables.items():
             if "_embedding_cache" not in sink_state["tables"] and not cache_setup_added:
                 actions.append(
@@ -333,18 +346,17 @@ class Planner:
                     )
                 )
 
-            # 2.4 Vectorizer Setup
-            needs_new_vectorizer = current_hash != desired_hash
+            # 2.4 Vectorizer Setup (State-Based)
+            # We ALWAYS ensure the vectorizer for this config exists, even if not active.
             vectorizers = sink_state.get("vectorizers", {}).get(raw_table, [])
-            
-            # Use deterministic target names
             expected_vectorizer_target = f"{raw_table}_store_v{version_id}"
+            
             vectorizer_exists = any(
                 v.get("target_table") == expected_vectorizer_target for v in vectorizers
             )
 
-            if not vectorizer_exists or needs_new_vectorizer:
-                logger.info(f"Planning vectorizer setup for {name}: raw_table={config.sink_raw_table}, source={config.source_table}")
+            if not vectorizer_exists:
+                logger.info(f"Planning vectorizer setup for {name} (Active={config.active})")
                 actions.append(
                     Action(
                         type=ActionType.SINK_VECTORIZER_SETUP,
@@ -354,48 +366,77 @@ class Planner:
                     )
                 )
 
-            # 2.5 View Setup
+            # 2.5 View Setup (Promotion Logic)
+            # Only promote if ACTIVE and SYNCED
             current_view_target = sink_state["view_targets"].get(name)
-            if (
-                config.sink_replica_table not in sink_state["views"]
-                or current_hash != desired_hash
-                or current_view_target != expected_vectorizer_target
-            ):
-                actions.append(
-                    Action(
-                        type=ActionType.SINK_VIEW_SETUP,
-                        description=f"Setup search view {config.sink_replica_table} (Profile: {config.search_profile})",
-                        params={
-                            "config_hash": desired_hash,
-                            "target_table": raw_table,
-                            "version_id": version_id,
-                        },
-                        target_name=name,
+            pending_items = sink_state["vectorizer_statuses"].get(expected_vectorizer_target, 9999)
+            
+            is_synced = pending_items == 0
+            
+            # Logic: If active, and synced, ensure view points to it.
+            # If not synced, we wait (Blue-Green Holding Pattern).
+            if config.active:
+                should_promote = False
+                
+                # Case A: View doesn't exist at all -> Promote immediately (or wait? User prefers wait usually, but initial setup needs access)
+                if config.sink_replica_table not in sink_state["views"]:
+                    should_promote = True
+                
+                # Case B: View exists but points to wrong target (or outdated hash)
+                elif (current_view_target != expected_vectorizer_target) or (replica_state and replica_state["config_hash"] != desired_hash):
+                    # SAFETY: If the view is pointing to NOTHING (bootstrap or broken view), 
+                    # OR if it's the expected target, we promote regardless of sync if missing.
+                    if current_view_target is None:
+                         should_promote = True
+                    elif is_synced:
+                        should_promote = True
+                    else:
+                        logger.info(f"Skipping promotion for {name}: Target {expected_vectorizer_target} has {pending_items} pending items.")
+                
+                if should_promote:
+                    # Idempotency check handled by conditions above
+                     actions.append(
+                        Action(
+                            type=ActionType.SINK_VIEW_SETUP,
+                            description=f"Setup/Swap search view {config.sink_replica_table} -> {expected_vectorizer_target} (active=True, synced=True)",
+                            params={
+                                "config_hash": desired_hash,
+                                "target_table": raw_table,
+                                "version_id": version_id,
+                            },
+                            target_name=name,
+                        )
                     )
-                )
 
-            # 2.6 Cleanup old vectorizers
-            current_live_view_target = sink_state["view_targets"].get(name)
+            # 2.6 Cleanup (Global Safety)
+            # Explicitly protect the LIVE view target, even if it's not "active" in config
+            # (e.g. during a migration where we just flipped active=True to v2, but v2 isn't ready yet, v1 is still live)
+            
+            real_live_target = sink_state["view_targets"].get(name)
+            
             for v in vectorizers:
                 v_target = v.get("target_table")
-                if (
-                    v_target != expected_vectorizer_target
-                    and v_target != current_live_view_target
-                ):
-                    # SAFETY: Only cleanup if it matches our naming pattern for this config
-                    # to avoid deleting vectorizers from other configs sharing the same raw table
-                    if v_target.startswith(f"{raw_table}_store_v"):
-                        actions.append(
-                            Action(
-                                type=ActionType.SINK_TABLE_CLEANUP,
-                                description=f"Cleanup orphaned vectorizer {v.get('id')} ({v_target})",
-                                params={
-                                    "id": v.get("id"),
-                                    "target_table": v_target,
-                                },
-                                target_name=name,
-                            )
+                
+                # Policy: Delete if:
+                # 1. Not the expected target for THIS config iteration (Optimization: handled by managed set)
+                # 2. Not in the "managed_vectorizers" set from ANY config (Global knowledge)
+                # 3. Not the currently LIVE target (Safety guard)
+                
+                is_managed = v_target in managed_vectorizers
+                is_live = v_target == real_live_target
+                
+                if not is_managed and not is_live:
+                    actions.append(
+                        Action(
+                            type=ActionType.SINK_TABLE_CLEANUP,
+                            description=f"Cleanup orphaned vectorizer {v.get('id')} ({v_target})",
+                            params={
+                                "id": v.get("id"),
+                                "target_table": v_target,
+                            },
+                            target_name=name,
                         )
+                    )
 
         return actions
 

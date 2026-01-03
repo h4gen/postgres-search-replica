@@ -9,6 +9,16 @@ This document outlines the architectural and operational requirements to move th
 ## Chapter 1: Reliability & Fault Tolerance
 *Ensuring the system can survive external failures without manual intervention.*
 
+- **Readiness Probes (State-based Synchronization)**:
+    - **Status**: High Priority.
+    - **Implementation**: Replace all `asyncio.sleep` calls with active polling loops that verify the database state.
+    - **Key Targets**:
+        - **Publication Visibility**: Verify the Sink can see the Publication on the Source before creating the subscription.
+        - **Slot Activation**: Ensure the replication slot exists and is ready for the subscription worker.
+        - **pgai Registry Sync**: Verify `pgai` has indexed new tables in its internal metadata before attempting vectorizer creation.
+        - **Extension Readiness**: Ensure `ai` and `vector` extensions are fully loaded and their tables (`ai.vectorizer`) are queryable.
+        - **Subscription Health**: Wait for the subscription to move from `initializing` to `streaming` state before reporting a successful sync.
+    - **Why**: Eliminates "flaky" tests and CI failures caused by post-commit lag in Postgres and Docker networking. Moves the system from "timing-based" to "state-based" reliability.
 - **pgai Orchestration**:
     - **Status**: Completed.
     - **Why**: Replaced custom Python loops with `pgai` background workers. This provides database-native retries, dead-letter queues, and atomic state tracking for embeddings.
@@ -34,6 +44,12 @@ This document outlines the architectural and operational requirements to move th
 - **Health & Readiness Probes**:
     - **Implementation**: Add a lightweight HTTP endpoint (e.g., using `FastAPI` or a background thread).
     - **Why**: Required for Kubernetes/orchestrator liveness checks to automate restarts.
+- **Migration Progress Tracking**:
+    - **Implementation**: Track `total_rows` vs `pending_items` for every active vectorizer job. Calculate and expose `rows_per_second` and `estimated_time_remaining` (ETA).
+    - **Why**: Critical for the Management UI. Users need to know if a "Promote to Live" action is waiting for 5 minutes or 5 hours.
+- **Shadow Index Registry**:
+    - **Implementation**: Expose a dedicated metadata view that lists all active "Branches" (Shadow Tables), their parent configuration, and their sync status.
+    - **Why**: Allows the UI to distinguish between "Live" tables and "Experimental" branches without relying on fragile string parsing of table names.
 
 ## Chapter 3: Declarative Schema & Security
 *Zero-Touch configuration where the code manages the database state.*
@@ -73,6 +89,22 @@ This document outlines the architectural and operational requirements to move th
 ## Chapter 6: Enterprise-Grade Source Integration
 *Bridging the gap between developer automation and DBA security policies.*
 
+
+- **Universal Downstream Sync (Multicast Search Architecture)**:
+    - **Pattern (CQRS)**: Treat the source as the Command store and external sinks (Qdrant, Pinecone, etc.) as specialized Query stores. Postgres acts as the "Reliable Buffer" and state manager.
+    - **Implementation (Outbox Handshake)**: 
+        - **Registry**: Use `_sink_registry` to track downstream mirroring state and version mapping.
+        - **Universal Outbox**: Implement `_downstream_outbox` in the Sink DB to capture all versioned embedding changes.
+        - **Mirror Triggers**: Attach standard triggers to versioned tables to clone changes into the outbox.
+        - **Sink Adapters**: A plugin-based system where external engines (Qdrant, Pinecone) implement a standard `SinkAdapter` interface for batch upserts/deletes.
+    - **Search Lifecycle**:
+        - **Shadow Build**: Synchronize new versions (e.g., `v2`) to isolated downstream collections while `v1` remains live.
+        - **SxS Validation**: Enable side-by-side search benchmarking against shadow collections before promotion.
+        - **Atomic Promotion**: Use downstream-native **Aliases** to flip the "Production" pointer to the new collection once synced.
+    - **Sink-Aware Client**:
+        - **Implementation**: Update `PGSearchReplica.search()` to optionally target a configured downstream sink instead of Postgres SQL.
+        - **Why**: Allows swapping the underlying search infrastructure (e.g., from PG to Qdrant) with zero application code changes.
+    - **Why**: Ensures "at-least-once" delivery of search updates without blocking Postgres transactions. Decouples search infrastructure from database maintenance and enables seamless model/infrastructure migrations.
 - **Pre-provisioned Infrastructure Support**:
     - **Implementation**: Add a `SOURCE_MANAGED_BY_ADMIN` (boolean) flag.
     - **Why**: In strict environments, the daemon will not have permission to `CREATE PUBLICATION` or `CREATE SLOT`. This mode skips all DDL/Management calls and assumes the pipeline is already ready on the source.
@@ -88,15 +120,18 @@ This document outlines the architectural and operational requirements to move th
 - **Least-Privilege DBA Scripts**:
     - **Implementation**: Provide a `docs/dba_setup.sql` template in the repository.
     - **Why**: Gives enterprises a clear audit trail of exactly what permissions are needed, making security approval significantly faster.
+- **Direct Ingest API (Push Connector)**:
+    - **Implementation**: Expose a REST/gRPC endpoint (`POST /v1/ingest`) that writes directly to the internal `_raw` queue capability.
+    - **Why**: Allows users to utilize the full **SearchOps Workbench** (Branching, Diffing, Downstream Sync) for static documents (PDFs, Markdown) or data from sources that cannot support CDC (e.g., CSV uploads), treating them exactly like database rows.
 
 ## Chapter 7: Search-as-Code (Declarative Reconciliation)
 *Moving from imperative setup scripts to a state-enforcement engine that treats the search replica as versioned infrastructure.*
 
 - **Unified Reconciler Engine**:
-    - **Implementation**: Refactor the `Orchestrator` to use a `Reconciler` class that follows a Plan/Apply lifecycle. It calculates the delta between the desired `Settings` and the current database state.
+    - **Status**: Completed.
     - **Why**: Centralizes all infrastructure logic and ensures that the system always moves towards the desired state regardless of the initial database condition.
 - **State Discovery & Diffing**:
-    - **Implementation**: Implement a Plan phase at startup. The daemon inspects both Source and Sink (schema, indexes, vectorizers) and compares them against the `Settings`.
+    - **Status**: Completed.
     - **Why**: Provides a Terraform-like experience where the user describes the desired search infrastructure, and the daemon calculates the necessary DDL/DML to reach that state.
 - **Concurrent Index Management**:
     - **Implementation**: Automatically manage GIN (full-text) and HNSW (vector) indexes. Use `CREATE INDEX CONCURRENTLY` to ensure zero-downtime during index upgrades or re-indexing experiments.
@@ -105,11 +140,11 @@ This document outlines the architectural and operational requirements to move th
     - **Implementation**: Support multiple concurrent vectorizers/indexes for the same source table.
     - **Why**: Enables A/B testing of different embedding models or chunking strategies by populating Shadow tables/columns alongside the primary ones before switching the public View.
 - **Blue-Green Data Migration (Swap Pattern)**:
-    - **Implementation**: Instead of in-place `ALTER TABLE` for complex changes (like model or dimension updates), the daemon implements a Blue-Green deployment for tables. It builds the new version in the background and performs an atomic View swap once `pgai` reports 100% sync.
+    - **Status**: Completed.
     - **Why**: Ensures zero-downtime migrations for un-migratable changes like embedding dimension shifts. Prevents migration nightmares by treating derived data as versioned and disposable.
 - **Self-Describing Manifest (State-as-Code)**:
-    - **Implementation**: Store the full JSON manifest of the desired search configuration (models, templates, columns, filters) and its hash within the `_replica_state` table.
-    - **Why**: Turns the search replica into a self-describing system. Allows any future version of the daemon to instantly understand the on-disk state and reconcile it with the current configuration, similar to a `terraform.tfstate` file.
+    - **Status**: Completed.
+    - **Why**: Turns the search replica into a self-describing system. Allows any future version of the daemon to instantly understand the on-disk state and reconcile it with the configuration.
 - **Cost & Experimentation Telemetry**:
     - **Implementation**: Log build-time metrics (tokens used, total wall-time, model versions, success rates) into a dedicated `experiment_logs` table during the Shadow Build phase.
     - **Why**: Provides the data needed to evaluate the ROI of different search strategies and model upgrades before committing to a production swap.
@@ -117,9 +152,29 @@ This document outlines the architectural and operational requirements to move th
     - **Implementation**: Bake DBRE intelligence into the Reconciler to automatically set HNSW parameters (`m`, `ef_construction`), manage `pg_prewarm` for index buffer loading after swaps, and trigger `ANALYZE` or `REINDEX` based on data drift thresholds.
     - **Why**: Ensures peak performance for average users by automating complex database tuning. Guarantees sub-10ms search latency and zero cold-start performance hits after migrations.
 
-## Chapter 8: Search UX (Hybrid & Ranked Retrieval)
-*Providing a high-level, one-query interface for complex search strategies.*
+## Chapter 8: Search Workbench & UX (SearchOps)
+*Providing a high-level experimentation platform for Search Engineers.*
 
+### Core Workbench Features
+
+- **Git-style Search Versioning (Branching)**:
+    - **Status**: Core Engine Completed.
+    - **Why**: Treats search relevance like code. Allows safe experimentation ("dev branches") by building versioned vectorizers in the background. Swapping is controlled via the `active` flag, fulfilling the "Merge" requirement.
+- **Resource & Cost Profiling**:
+    - **Implementation**: Pre-flight analysis reporting the estimated indexing cost (tokens), RAM usage (HNSW), and query latency for a proposed branch.
+    - **Why**: Empower engineers to make informed trade-offs between relevance quality and operational cost.
+- **Side-by-Side (SxS) Diffing**:
+    - **Implementation**: A split-screen UI that runs the same query against Main vs. Branch and highlights only the result differences (re-ordering, additions, deletions).
+    - **Why**: Facilitates qualitative "vibe checks" for human evaluators to understand the behavioral shift of a new model.
+- **Downstream Atomic Promotion (Aliases)**:
+    - **Implementation**: Extend the Blue-Green swap logic to external sinks. Use target-native "Aliases" (e.g., Qdrant Aliases) to flip the "Live" pointer from `v1_collection` to `v2_collection` downstream once synced.
+    - **Why**: Provides zero-downtime infrastructure swaps for external search engines, mirroring the internal Postgres view-swap behavior.
+
+### Retrieval Capabilities
+
+- **Composable Hybrid Merging**:
+    - **Implementation**: Allow "Merging" multiple branches (e.g., `keyword-branch` + `semantic-branch`) into a single "Release" View using RRF or weighted fusion.
+    - **Why**: Gives users a unified interface to compose complex retrieval strategies from simple, isolated modular components.
 - **Declarative Search Profiles**:
     - **Implementation**: Allow users to define search strategies (e.g., `default_hybrid`, `vector_heavy`) in the configuration, specifying weights for dense vectors, sparse vectors, and full-text search.
     - **Why**: Decouples the mathematical complexity of ranking from the application logic. The app just asks for a profile, and the database handles the ranking.
