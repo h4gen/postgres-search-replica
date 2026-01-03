@@ -56,6 +56,9 @@ class TableConfig(BaseModel):
     embedding_dimension: int = 768
     chunking_strategy: str = "recursive_character_text_splitter"
     formatting_template: str = "Product: $name Description: $chunk"
+    
+    # Deployment State
+    active: bool = True
 
     def get_config_hash(self) -> str:
         """Generates a SHA256 hash of the search-relevant configuration for THIS table."""

@@ -229,6 +229,30 @@ async def get_replica_state(
             return None, None
 
 
+async def get_vectorizer_statuses(settings: Settings) -> dict[str, int]:
+    """
+    Get synchronization status for all vectorizers.
+    Returns: Dict[vectorizer_name, pending_items_count]
+    """
+    statuses = {}
+    async with await get_sink_conn() as conn:
+        async with conn.cursor() as cur:
+            # 1. Try generic ai.vectorizer_status (pgai 0.4.0+)
+            try:
+                await cur.execute(
+                    "SELECT source_table, pending_items FROM ai.vectorizer_status"
+                )
+                rows = await cur.fetchall()
+                for table, pending in rows:
+                    statuses[table] = pending
+            except Exception:
+                # Fallback implementation if specific view unavailable
+                # This could happen on older versions or if permissions deny access
+                logger.warning("Could not query ai.vectorizer_status directly")
+                pass
+    return statuses
+
+
 async def update_replica_state(
     settings: Settings, target_name: str, last_id: str | None = None, lsn: str | None = None
 ):

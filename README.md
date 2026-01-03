@@ -43,6 +43,7 @@ This ensures that even a small chunk from the middle of a description carries th
 - **Orchestrator**: Manages the infrastructure layer, including local PostgreSQL instances (in local mode), `pgai` background workers, and the replication watchdog.
 - **Native Bridge**: Uses PostgreSQL Native Logical Replication for efficient data movement from Source to Sink.
 - **pgai & pgvector**: Database-native vectorization and storage, ensuring embeddings are always in sync with your source data.
+- **Declarative Blue-Green Swaps**: Zero-downtime search index updates. The system automatically builds new vector versions in the background and only swaps the public view once synchronization is complete.
 
 ## Quick Start (Local Mode)
 
@@ -138,7 +139,19 @@ async def search_example():
 - **Structured JSON Logging**: Native support for single-line JSON logging, ready for ingestion by Datadog, ELK, or Grafana Loki.
 - **Managed Lifecycle**: Automatically handles replication slot creation/cleanup and `pgai` worker management.
 - **Smart Reconciliation**: Only updates embeddings when source data actually changes, leveraging `pgai` native state tracking.
+- **Zero-Downtime Blue-Green Swaps**: Orchestrates versioned search indices. It builds new versions (e.g. `v2` with a different model) in the background and only promotes them to the live search view when 100% of rows are vectorized.
 - **Zero-Touch Config**: Automatically synchronizes publication columns and filters from Python settings to the database on startup.
+ 
+## Declarative Blue-Green Swaps
+
+One of the biggest challenges in vector search is upgrading your embedding models or chunking strategies. Normally, this involves downtime or returning incomplete results while the new index builds.
+
+This library solves this using a **Declarative Blue-Green** approach:
+
+1.  **Preparation**: Deploy a new configuration (e.g., higher dimension model) with `ACTIVE=False`. The reconciler will create the new versioned vectorizer and begin building the index in the background.
+2.  **Service Continuity**: The public search View STILL points to your old version (`v1`). Search remains 100% accurate.
+3.  **Promotion**: Once the new vectorizer is synchronized (`pending_items == 0`), simply toggle `ACTIVE=True` for the new version.
+4.  **Atomic Swap**: The reconciler performs an **atomic view swap**. Applications immediately start seeing results from the new model with zero dropped requests.
 
 ## Roadmap
 
@@ -170,6 +183,7 @@ All settings can be configured via environment variables (e.g., `SOURCE_URL`) or
 | `ID_COLUMN` | `str` | `id` | The Primary Key column (must be numeric, UUID, or TEXT). |
 | `CONTENT_COLUMN` | `str` | `description` | The source column that will be chunked and vectorized. |
 | `TARGET_CONTENT_COLUMN` | `str` | `transformed_description`| The name of the text column in the final search View. |
+| `ACTIVE` | `bool` | `True` | Declarative state. If `False`, the version will be built but not promoted to the live View. |
 
 ### 3. Replication & CDC Settings
 | Environment Variable | Type | Default | Description |
