@@ -33,6 +33,7 @@ test = [
     "pytest-docker>=2.0.0",
     "ruff>=0.1.0",
     "ty>=0.0.1",
+    "qdrant-client>=1.7.0",
 ]
 
 [tool.uv]

@@ -43,6 +43,11 @@ wait-for-infra:
 		echo "Ollama model not ready..."; \
 		sleep 5; \
 	done
+	@echo "Waiting for Qdrant to be ready..."
+	@until curl -s http://localhost:6333/healthz > /dev/null; do \
+		echo "Qdrant not ready..."; \
+		sleep 2; \
+	done
 	@echo "Infrastructure is ready!"
 
 test: test-unit test-integration
@@ -52,7 +57,11 @@ test-unit:
 
 test-integration:
 	uv sync --extra test
-	PYTHONPATH=src uv run pytest -v -s --log-cli-level=INFO tests/ $(ARGS)
+	@if [ -z "$(ARGS)" ]; then \
+		PYTHONPATH=src uv run pytest -v -s --log-cli-level=INFO tests/; \
+	else \
+		PYTHONPATH=src uv run pytest -v -s --log-cli-level=INFO $(ARGS); \
+	fi
 
 test-dev: dev wait-for-infra test
 

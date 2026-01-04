@@ -459,6 +459,106 @@ async def atomic_view_swap(
             await conn.rollback()
             raise e
 
+async def ensure_outbox_infrastructure(settings: Settings):
+    """Create the _sink_outbox and _sink_mirror_registry tables."""
+    logger.info("Ensuring Universal Outbox infrastructure exists in Sink...")
+    async with await get_sink_conn() as conn:
+        await conn.set_autocommit(True)
+        async with conn.cursor() as cur:
+            # 1. The Outbox: Transactional log of vectorized changes
+            await cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS _sink_outbox (
+                    id BIGSERIAL PRIMARY KEY,
+                    target_name TEXT NOT NULL,
+                    version_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    action TEXT NOT NULL, -- UPSERT, DELETE
+                    payload JSONB, -- {content: "...", embedding: [...]}
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+                """
+            )
+            # Index for the MirrorWorker to poll efficiently
+            await cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sink_outbox_id ON _sink_outbox(id)"
+            )
+
+            # 2. Mirror Registry: Track progress of external sinks
+            await cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS _sink_mirror_registry (
+                    mirror_id TEXT NOT NULL,
+                    target_name TEXT NOT NULL,
+                    last_processed_id BIGINT DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    PRIMARY KEY (mirror_id, target_name)
+                )
+                """
+            )
+
+
+async def setup_outbox_trigger(
+    settings: Settings, target_name: str, vectorizer_name: str, config: TableConfig
+):
+    """
+    Attach a trigger to the internal pgai store table to capture 
+    all vectorization events into the _sink_outbox.
+    """
+    version_id = config.get_version_id()
+    # The pgai store table is the vectorizer_name itself (v_store_v1)
+    # We want to capture when vectors ARE CREATED.
+    
+    logger.info(f"Setting up outbox trigger for {vectorizer_name}...")
+    
+    trigger_fn_name = f"fn_capture_outbox_{target_name}_{version_id}"
+    trigger_name = f"trg_outbox_{target_name}_{version_id}"
+
+    async with await get_sink_conn() as conn:
+        await conn.set_autocommit(True)
+        async with conn.cursor() as cur:
+            # 1. Create the Trigger Function
+            # Note: pgai keeps source PK in its store table.
+            # We assume config.id_column is present in the pgai store.
+            await cur.execute(
+                f"""
+                CREATE OR REPLACE FUNCTION {trigger_fn_name}() RETURNS TRIGGER AS $$
+                BEGIN
+                    IF (TG_OP = 'DELETE') THEN
+                        INSERT INTO _sink_outbox (target_name, version_id, source_id, action)
+                        VALUES ('{target_name}', '{version_id}', OLD.{config.id_column}::text, 'DELETE');
+                    ELSE
+                        INSERT INTO _sink_outbox (target_name, version_id, source_id, action, payload)
+                        VALUES (
+                            '{target_name}', 
+                            '{version_id}', 
+                            NEW.{config.id_column}::text, 
+                            'UPSERT', 
+                            jsonb_build_object(
+                                'content', NEW.chunk,
+                                'embedding', NEW.embedding::text -- cast to text for JSON
+                            )
+                        );
+                    END IF;
+                    RETURN NULL;
+                END;
+                $$ LANGUAGE plpgsql;
+                """
+            )
+
+            # 2. Attach Trigger to pgai STORE table
+            # We use AFTER INSERT OR UPDATE OR DELETE
+            await cur.execute(
+                f"""
+                DROP TRIGGER IF EXISTS {trigger_name} ON {vectorizer_name};
+                CREATE TRIGGER {trigger_name}
+                AFTER INSERT OR UPDATE OR DELETE ON {vectorizer_name}
+                FOR EACH ROW EXECUTE FUNCTION {trigger_fn_name}();
+                """
+            )
+
+
+
 
 async def warm_up_from_cache(
     settings: Settings, config: TableConfig, source_table: str, target_store_table: str

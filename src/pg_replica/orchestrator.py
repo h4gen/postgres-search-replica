@@ -15,6 +15,7 @@ from .database import (
 )
 from .observability import update_replication_lag
 from pgai.vectorizer.worker import Worker
+from .mirror_worker import MirrorWorker
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,10 @@ class Orchestrator:
 
         worker = Worker(db_url=self.settings.resolved_sink_url, poll_interval=timedelta(seconds=2.0))
         self._tasks.append(asyncio.create_task(worker.run(), name="pgai_worker"))
+        
+        mirror_worker = MirrorWorker(self.settings)
+        self._tasks.append(asyncio.create_task(mirror_worker.run(), name="mirror_worker"))
+        
         self._tasks.append(asyncio.create_task(self._replication_loop(), name="watchdog"))
 
     async def stop(self):

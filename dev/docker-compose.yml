@@ -40,5 +40,14 @@ services:
     entrypoint: /bin/sh
     command: -c "ollama serve & sleep 5 && ollama pull nomic-embed-text && wait"
 
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
 volumes:
   sink_data:
+  qdrant_data:

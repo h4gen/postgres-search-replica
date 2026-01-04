@@ -21,6 +21,8 @@ from .database import (
     cleanup_vectorizer_infrastructure,
     ensure_embedding_cache_table,
     get_vectorizer_statuses,
+    ensure_outbox_infrastructure,
+    setup_outbox_trigger,
 )
 
 logger = logging.getLogger(__name__)
@@ -35,6 +37,7 @@ class ActionType(Enum):
     SINK_RECOVERY = "sink_recovery"
     SINK_CACHE_SETUP = "sink_cache_setup"
     SINK_TABLE_CLEANUP = "sink_table_cleanup"
+    SINK_OUTBOX_SETUP = "sink_outbox_setup"
 
 
 @dataclass
@@ -92,13 +95,12 @@ class Inspector:
                 )
                 state["views"] = {r[0] for r in await cur.fetchall()}
 
-                # Check if tables exist
-                from .database import wait_for_source_table
-                for name, config in self.settings.tables.items():
-                    if await wait_for_source_table(self.settings, config, timeout=5):
-                        state["tables"][name] = True
-                    else:
-                        state["tables"][name] = False
+                # 3.5 Triggers
+                await cur.execute(
+                    "SELECT trigger_name FROM information_schema.triggers"
+                )
+                state["triggers"] = {r[0] for r in await cur.fetchall()}
+
                 # 4. Table-specific view targets and replica states
                 for name, config in self.settings.tables.items():
                     # View Target
@@ -241,6 +243,16 @@ class Planner:
                     },
                 )
             )
+        # 1.5 Global Outbox Setup
+        if "_sink_outbox" not in sink_state["tables"]:
+            actions.append(
+                Action(
+                    type=ActionType.SINK_OUTBOX_SETUP,
+                    description="Initialize Universal Outbox infrastructure",
+                    params={},
+                )
+            )
+
 
 
 
@@ -365,6 +377,22 @@ class Planner:
                         target_name=name,
                     )
                 )
+            # 2.4.5 Outbox Trigger Setup
+            trigger_name = f"trg_outbox_{name}_{version_id}"
+            if vectorizer_exists and trigger_name not in sink_state.get("triggers", set()):
+                actions.append(
+                    Action(
+                        type=ActionType.SINK_OUTBOX_SETUP,
+                        description=f"Setup outbox trigger for {name} version {version_id}",
+                        params={
+                            "vectorizer_name": expected_vectorizer_target,
+                            "trigger_name": trigger_name,
+                            "version_id": version_id
+                        },
+                        target_name=name,
+                    )
+                )
+
 
             # 2.5 View Setup (Promotion Logic)
             # Only promote if ACTIVE and SYNCED
@@ -489,10 +517,22 @@ class Applier:
                 logger.debug(f"Handling SINK_VECTORIZER_SETUP for {target_name}: config.sink_raw_table={raw_table}")
                 version_id = action.params.get("version_id", "latest")
                 vectorizer_target = f"{raw_table}_store_v{version_id}"
-
+                
                 await cleanup_vectorizer_infrastructure(self.settings, config, vectorizer_target)
                 await setup_sink(self.settings, config, target_name, vectorizer_target=vectorizer_target)
                 await warm_up_from_cache(self.settings, config, raw_table, vectorizer_target)
+                await setup_outbox_trigger(self.settings, target_name, vectorizer_target, config)
+
+            elif action.type == ActionType.SINK_OUTBOX_SETUP:
+                if not target_name:
+                    await ensure_outbox_infrastructure(self.settings)
+                else:
+                    await setup_outbox_trigger(
+                        self.settings,
+                        target_name,
+                        action.params["vectorizer_name"],
+                        config,
+                    )
 
             elif action.type == ActionType.SINK_VIEW_SETUP:
                 await atomic_view_swap(
