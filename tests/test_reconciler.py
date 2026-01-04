@@ -25,10 +25,12 @@ def test_planner_no_drift():
             "_replica_state": {"key", "config_hash"},
             "_embedding_cache": {"text_hash"},
             config.sink_raw_table: set(config.publication_columns),
+            "_sink_outbox": set(),
         },
         "views": {config.sink_replica_table},
         "view_targets": {"t1": f"{config.sink_raw_table}_store_v{v_id}"},
         "replica_states": {"t1": {"config_hash": config.get_config_hash()}},
+        "triggers": {f"trg_outbox_t1_{v_id}"},
         "vectorizers": {
             config.sink_raw_table: [
                 {
@@ -70,10 +72,12 @@ def test_planner_missing_column():
             "_replica_state": {"key", "config_hash"},
             "_embedding_cache": {"text_hash"},
             config.sink_raw_table: {"id", "name", "description"},
+            "_sink_outbox": set(),
         },
         "views": {config.sink_replica_table},
         "view_targets": {"t1": f"{config.sink_raw_table}_store_v{v_id}"},
         "replica_states": {"t1": {"config_hash": config.get_config_hash()}},
+        "triggers": {f"trg_outbox_t1_{v_id}"},
         "vectorizers": {config.sink_raw_table: []},
         "vectorizer_statuses": {},
     }

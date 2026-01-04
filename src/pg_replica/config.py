@@ -2,7 +2,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -57,6 +57,9 @@ class TableConfig(BaseModel):
     chunking_strategy: str = "recursive_character_text_splitter"
     formatting_template: str = "Product: $name Description: $chunk"
     
+    # Multicast Mirror Settings
+    mirrors: List[Dict[str, Any]] = Field(default_factory=list)
+
     # Deployment State
     active: bool = True
 

@@ -21,6 +21,8 @@ from .database import (
     cleanup_vectorizer_infrastructure,
     ensure_embedding_cache_table,
     get_vectorizer_statuses,
+    ensure_outbox_infrastructure,
+    setup_outbox_trigger,
 )
 
 logger = logging.getLogger(__name__)
@@ -35,6 +37,7 @@ class ActionType(Enum):
     SINK_RECOVERY = "sink_recovery"
     SINK_CACHE_SETUP = "sink_cache_setup"
     SINK_TABLE_CLEANUP = "sink_table_cleanup"
+    SINK_OUTBOX_SETUP = "sink_outbox_setup"
 
 
 @dataclass
@@ -92,13 +95,12 @@ class Inspector:
                 )
                 state["views"] = {r[0] for r in await cur.fetchall()}
 
-                # Check if tables exist
-                from .database import wait_for_source_table
-                for name, config in self.settings.tables.items():
-                    if await wait_for_source_table(self.settings, config, timeout=5):
-                        state["tables"][name] = True
-                    else:
-                        state["tables"][name] = False
+                # 3.5 Triggers
+                await cur.execute(
+                    "SELECT trigger_name FROM information_schema.triggers"
+                )
+                state["triggers"] = {r[0] for r in await cur.fetchall()}
+
                 # 4. Table-specific view targets and replica states
                 for name, config in self.settings.tables.items():
                     # View Target
@@ -141,15 +143,24 @@ class Inspector:
                             f"SELECT {cols_str} FROM _replica_state WHERE key = %s",
                             (sub_name,),
                         )
-                        row = await cur.fetchone()
-                        if row:
-                            state["replica_states"][name] = {
-                                "last_id": row[0],
-                                "last_lsn": row[1],
-                                "config_hash": (
-                                    row[2] if "config_hash" in query_cols else None
-                                ),
-                            }
+                        r = await cur.fetchone()
+                        if r:
+                            state["replica_states"][name] = dict(zip(query_cols, r))
+
+                # 5. Outbox & Mirror Handshake State
+                state["outbox_watermarks"] = {}
+                if "_sink_outbox" in state["tables"]:
+                    await cur.execute(
+                        "SELECT version_id, MAX(id) FROM _sink_outbox GROUP BY version_id"
+                    )
+                    state["outbox_watermarks"] = {r[0]: r[1] for r in await cur.fetchall()}
+
+                state["mirror_progress"] = {}
+                if "_sink_mirror_registry" in state["tables"]:
+                    await cur.execute(
+                        "SELECT mirror_id, target_name, last_processed_id FROM _sink_mirror_registry"
+                    )
+                    state["mirror_progress"] = {(r[0], r[1]): r[2] for r in await cur.fetchall()}
 
                 # 5. Vectorizers
                 if "ai" in state["extensions"]:
@@ -241,6 +252,16 @@ class Planner:
                     },
                 )
             )
+        # 1.5 Global Outbox Setup
+        if "_sink_outbox" not in sink_state["tables"]:
+            actions.append(
+                Action(
+                    type=ActionType.SINK_OUTBOX_SETUP,
+                    description="Initialize Universal Outbox infrastructure",
+                    params={},
+                )
+            )
+
 
 
 
@@ -365,13 +386,42 @@ class Planner:
                         target_name=name,
                     )
                 )
+            # 2.4.5 Outbox Trigger Setup
+            trigger_name = f"trg_outbox_{name}_{version_id}"
+            if vectorizer_exists and trigger_name not in sink_state.get("triggers", set()):
+                actions.append(
+                    Action(
+                        type=ActionType.SINK_OUTBOX_SETUP,
+                        description=f"Setup outbox trigger for {name} version {version_id}",
+                        params={
+                            "vectorizer_name": expected_vectorizer_target,
+                            "trigger_name": trigger_name,
+                            "version_id": version_id
+                        },
+                        target_name=name,
+                    )
+                )
+
 
             # 2.5 View Setup (Promotion Logic)
             # Only promote if ACTIVE and SYNCED
             current_view_target = sink_state["view_targets"].get(name)
             pending_items = sink_state["vectorizer_statuses"].get(expected_vectorizer_target, 9999)
-            
             is_synced = pending_items == 0
+            
+            # Mirror Handshake: Ensure external mirrors caught up to outbox watermark
+            if is_synced and config.mirrors:
+                outbox_watermark = sink_state.get("outbox_watermarks", {}).get(version_id, 0)
+                for mirror in config.mirrors:
+                    m_id = mirror.get("id")
+                    m_progress = sink_state.get("mirror_progress", {}).get((m_id, name), 0)
+                    if m_progress < outbox_watermark:
+                        logger.info(
+                            f"Delaying promotion for {name}: Mirror {m_id} is at {m_progress}, "
+                            f"waiting for outbox watermark {outbox_watermark}"
+                        )
+                        is_synced = False
+                        break
             
             # Logic: If active, and synced, ensure view points to it.
             # If not synced, we wait (Blue-Green Holding Pattern).
@@ -489,10 +539,22 @@ class Applier:
                 logger.debug(f"Handling SINK_VECTORIZER_SETUP for {target_name}: config.sink_raw_table={raw_table}")
                 version_id = action.params.get("version_id", "latest")
                 vectorizer_target = f"{raw_table}_store_v{version_id}"
-
+                
                 await cleanup_vectorizer_infrastructure(self.settings, config, vectorizer_target)
                 await setup_sink(self.settings, config, target_name, vectorizer_target=vectorizer_target)
                 await warm_up_from_cache(self.settings, config, raw_table, vectorizer_target)
+                await setup_outbox_trigger(self.settings, target_name, vectorizer_target, config)
+
+            elif action.type == ActionType.SINK_OUTBOX_SETUP:
+                if not target_name:
+                    await ensure_outbox_infrastructure(self.settings)
+                else:
+                    await setup_outbox_trigger(
+                        self.settings,
+                        target_name,
+                        action.params["vectorizer_name"],
+                        config,
+                    )
 
             elif action.type == ActionType.SINK_VIEW_SETUP:
                 await atomic_view_swap(
