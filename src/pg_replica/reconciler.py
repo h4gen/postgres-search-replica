@@ -143,15 +143,24 @@ class Inspector:
                             f"SELECT {cols_str} FROM _replica_state WHERE key = %s",
                             (sub_name,),
                         )
-                        row = await cur.fetchone()
-                        if row:
-                            state["replica_states"][name] = {
-                                "last_id": row[0],
-                                "last_lsn": row[1],
-                                "config_hash": (
-                                    row[2] if "config_hash" in query_cols else None
-                                ),
-                            }
+                        r = await cur.fetchone()
+                        if r:
+                            state["replica_states"][name] = dict(zip(query_cols, r))
+
+                # 5. Outbox & Mirror Handshake State
+                state["outbox_watermarks"] = {}
+                if "_sink_outbox" in state["tables"]:
+                    await cur.execute(
+                        "SELECT version_id, MAX(id) FROM _sink_outbox GROUP BY version_id"
+                    )
+                    state["outbox_watermarks"] = {r[0]: r[1] for r in await cur.fetchall()}
+
+                state["mirror_progress"] = {}
+                if "_sink_mirror_registry" in state["tables"]:
+                    await cur.execute(
+                        "SELECT mirror_id, target_name, last_processed_id FROM _sink_mirror_registry"
+                    )
+                    state["mirror_progress"] = {(r[0], r[1]): r[2] for r in await cur.fetchall()}
 
                 # 5. Vectorizers
                 if "ai" in state["extensions"]:
@@ -398,8 +407,21 @@ class Planner:
             # Only promote if ACTIVE and SYNCED
             current_view_target = sink_state["view_targets"].get(name)
             pending_items = sink_state["vectorizer_statuses"].get(expected_vectorizer_target, 9999)
-            
             is_synced = pending_items == 0
+            
+            # Mirror Handshake: Ensure external mirrors caught up to outbox watermark
+            if is_synced and config.mirrors:
+                outbox_watermark = sink_state.get("outbox_watermarks", {}).get(version_id, 0)
+                for mirror in config.mirrors:
+                    m_id = mirror.get("id")
+                    m_progress = sink_state.get("mirror_progress", {}).get((m_id, name), 0)
+                    if m_progress < outbox_watermark:
+                        logger.info(
+                            f"Delaying promotion for {name}: Mirror {m_id} is at {m_progress}, "
+                            f"waiting for outbox watermark {outbox_watermark}"
+                        )
+                        is_synced = False
+                        break
             
             # Logic: If active, and synced, ensure view points to it.
             # If not synced, we wait (Blue-Green Holding Pattern).

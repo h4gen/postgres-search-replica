@@ -93,17 +93,19 @@ This document outlines the architectural and operational requirements to move th
 - **Universal Downstream Sync (Multicast Search Architecture)**:
     - **Pattern (CQRS)**: Treat the source as the Command store and external sinks (Qdrant, Pinecone, etc.) as specialized Query stores. Postgres acts as the "Reliable Buffer" and state manager.
     - **Implementation (Outbox Handshake)**: 
-        - **Registry**: Use `_sink_registry` to track downstream mirroring state and version mapping.
-        - **Universal Outbox**: Implement `_downstream_outbox` in the Sink DB to capture all versioned embedding changes.
-        - **Mirror Triggers**: Attach standard triggers to versioned tables to clone changes into the outbox.
-        - **Sink Adapters**: A plugin-based system where external engines (Qdrant, Pinecone) implement a standard `SinkAdapter` interface for batch upserts/deletes.
+        - **Registry**: Use `_sink_mirror_registry` to track downstream mirroring state and version mapping. (**Status: Core Completed**)
+        - **Universal Outbox**: Implement `_sink_outbox` in the Sink DB to capture all versioned embedding changes. (**Status: Core Completed**)
+        - **Mirror Triggers**: Attach standard triggers to versioned tables to clone changes into the outbox. (**Status: Core Completed**)
+        - **Sink Adapters**: A plugin-based system where external engines (Qdrant, Pinecone) implement a standard `SinkAdapter` interface for batch upserts/deletes. (Qdrant: **Done**, Pinecone: **Todo**)
     - **Search Lifecycle**:
         - **Shadow Build**: Synchronize new versions (e.g., `v2`) to isolated downstream collections while `v1` remains live.
         - **SxS Validation**: Enable side-by-side search benchmarking against shadow collections before promotion.
         - **Atomic Promotion**: Use downstream-native **Aliases** to flip the "Production" pointer to the new collection once synced.
-    - **Sink-Aware Client**:
+    - **Sink-Aware Client (Strategy Pattern)**:
         - **Implementation**: Update `PGSearchReplica.search()` to optionally target a configured downstream sink instead of Postgres SQL.
         - **Why**: Allows swapping the underlying search infrastructure (e.g., from PG to Qdrant) with zero application code changes.
+    - **Mirror Sync Handshake (Blue-Green Consistency)**:
+        - **Implementation**: Ensure mirrors are 100% caught up before the Reconciler promotes a search view in Postgres. (**Status: Completed**)
     - **Why**: Ensures "at-least-once" delivery of search updates without blocking Postgres transactions. Decouples search infrastructure from database maintenance and enables seamless model/infrastructure migrations.
 - **Pre-provisioned Infrastructure Support**:
     - **Implementation**: Add a `SOURCE_MANAGED_BY_ADMIN` (boolean) flag.

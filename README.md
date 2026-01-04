@@ -9,6 +9,7 @@ The project is built for enterprise-scale data movement, leveraging PostgreSQL's
 - **Native WAL Streaming (CDC)**: Uses PostgreSQL Logical Replication to stream changes directly from the write-ahead log. No polling, no triggers on the source, and minimal overhead.
 - **PG 15 Row & Column Filtering**: Minimizes network traffic and sink load by replicating only the specific rows and columns you need for search.
 - **Postgres-Native Vectorization**: Unlike external sync tools, this uses the `pgai` extension to handle vectorization *inside* the database. This ensures your embeddings are governed by the same ACID guarantees as your data.
+- **Universal Outbox (Multicast Sync)**: Acts as a high-reliability bridge to external search engines (Qdrant, Pinecone, etc.). Changes are captured in a transactional outbox and synced downstream with at-least-once delivery guarantees.
 - **Hybrid Recovery Model**: A self-healing state machine that automatically bridges data gaps using SQL keyset pagination before handing off to real-time streaming.
 
 ## Declarative Context-Aware Design
@@ -44,6 +45,7 @@ This ensures that even a small chunk from the middle of a description carries th
 - **Native Bridge**: Uses PostgreSQL Native Logical Replication for efficient data movement from Source to Sink.
 - **pgai & pgvector**: Database-native vectorization and storage, ensuring embeddings are always in sync with your source data.
 - **Declarative Blue-Green Swaps**: Zero-downtime search index updates. The system automatically builds new vector versions in the background and only swaps the public view once synchronization is complete.
+- **Multicast Sync Engine**: A plugin-based system to mirror your vectorized data to external engines like Qdrant or Pinecone.
 
 ## Quick Start (Local Mode)
 
@@ -141,6 +143,8 @@ async def search_example():
 - **Smart Reconciliation**: Only updates embeddings when source data actually changes, leveraging `pgai` native state tracking.
 - **Zero-Downtime Blue-Green Swaps**: Orchestrates versioned search indices. It builds new versions (e.g. `v2` with a different model) in the background and only promotes them to the live search view when 100% of rows are vectorized.
 - **Zero-Touch Config**: Automatically synchronizes publication columns and filters from Python settings to the database on startup.
+- **Multicast CDC Bridge**: Transactionally capture embeddings and sync them to external vector databases with persistent state tracking and retry logic.
+- **Cross-Engine Consistency (Mirror Handshake)**: Guarantees that external search engines are 100% caught up before Postgres version promotion.
  
 ## Declarative Blue-Green Swaps
 
@@ -206,7 +210,25 @@ All settings can be configured via environment variables (e.g., `SOURCE_URL`) or
 | `CHUNKING_STRATEGY` | `str` | `recursive_character_text_splitter` | `pgai` strategy for splitting the `CONTENT_COLUMN`. |
 | `FORMATTING_TEMPLATE`| `str` | *See below* | Python template for metadata enrichment (e.g., `Product: $name Description: $chunk`). |
 
-### 5. Observability & System
+### 5. Multicast Sync (External Mirrors)
+You can configure a list of external mirrors in your `TableConfig`. The library will ensure these stay in sync with your Postgres embeddings.
+
+```python
+tables={
+    "products": {
+        "mirrors": [
+            {
+                "id": "qdrant_prod",
+                "type": "qdrant",
+                "url": "http://qdrant:6333",
+                "prefix": "search_v1_"
+            }
+        ]
+    }
+}
+```
+
+### 6. Observability & System
 | Environment Variable | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `OBSERVABILITY_HOST` | `str` | `0.0.0.0` | Binding host for the built-in FastAPI metrics/health server. |
