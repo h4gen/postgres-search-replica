@@ -245,6 +245,13 @@ async def test_search_alias_promotion():
         assert found.collection_name != v1_collection
         assert "alias_test_products_" in found.collection_name
         
-        # Final check: search via alias
-        res = await replica.search("watch", engine="qdrant")
-        assert len(res) > 0
+        # Final check: search via alias (with retry to handle eventual searchability)
+        logger.info("Verifying search via Qdrant Alias...")
+        for _ in range(10):
+            res = await replica.search("watch", engine="qdrant")
+            if len(res) > 0:
+                logger.info(f"Search success: found {len(res)} results")
+                break
+            await asyncio.sleep(1)
+        else:
+            pytest.fail("Timed out waiting for data to be searchable via Qdrant Alias")

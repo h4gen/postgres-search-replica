@@ -23,7 +23,7 @@ class SinkAdapter(abc.ABC):
         pass
 
     @abc.abstractmethod
-    async def update_alias(self, target_name: str, version_id: str):
+    async def update_alias(self, target_name: str, version_id: str, vector_size: int = 768):
         """Update the 'production' alias to point to the specific versioned index."""
         pass
 
@@ -117,11 +117,14 @@ class QdrantSinkAdapter(SinkAdapter):
 
         logger.info(f"Synced {len(entries)} entries to Qdrant")
 
-    async def update_alias(self, target_name: str, version_id: str):
+    async def update_alias(self, target_name: str, version_id: str, vector_size: int = 768):
         alias_name = f"{self.collection_prefix}{target_name}_production"
         collection_name = self._get_collection_name(target_name, version_id)
         
         logger.info(f"Updating Qdrant alias {alias_name} -> {collection_name}")
+        
+        # Ensure collection exists before creating alias
+        await self._ensure_collection(collection_name, vector_size)
         
         try:
             # Qdrant aliases are updated via operations. 

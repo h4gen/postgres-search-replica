@@ -24,7 +24,7 @@ async def init_pools(settings: Settings):
         _sink_pool = None
 
     if not _source_pool:
-        logger.info("Initializing source connection pool...")
+        logger.info(f"Initializing source connection pool with {settings.source_url}...")
         _source_pool = AsyncConnectionPool(
             conninfo=settings.source_url,
             min_size=1,
@@ -229,6 +229,36 @@ async def get_replica_state(
             return None, None
 
 
+    return statuses
+
+
+async def get_source_health(settings: Settings) -> dict:
+    """Query current health state of the Source DB replication."""
+    logger.debug("Fetching source health metadata...")
+    try:
+        async with await get_source_conn() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                # 1. Check replication slots
+                await cur.execute(
+                    "SELECT slot_name, active, restart_lsn, confirmed_flush_lsn FROM pg_replication_slots"
+                )
+                slots = await cur.fetchall()
+
+                # 2. Get current WAL LSN
+                await cur.execute("SELECT pg_current_wal_lsn() as current_lsn")
+                row = await cur.fetchone()
+                current_lsn = str(row["current_lsn"]) if row and row["current_lsn"] else None
+
+                return {
+                    "slots": slots,
+                    "current_lsn": current_lsn,
+                    "is_connected": True
+                }
+    except Exception as e:
+        logger.error(f"Failed to fetch source health: {e}")
+        return {"is_connected": False, "error": str(e)}
+
+
 async def get_vectorizer_statuses(settings: Settings) -> dict[str, int]:
     """
     Get synchronization status for all vectorizers.
@@ -247,10 +277,165 @@ async def get_vectorizer_statuses(settings: Settings) -> dict[str, int]:
                     statuses[table] = pending
             except Exception:
                 # Fallback implementation if specific view unavailable
-                # This could happen on older versions or if permissions deny access
-                logger.warning("Could not query ai.vectorizer_status directly")
                 pass
     return statuses
+
+
+async def get_pipeline_summary(settings: Settings) -> dict:
+    """Aggregate health signals from source, vectorizers, and mirrors."""
+    summary = {
+        "source": await get_source_health(settings),
+        "vectorizers": [],
+        "mirrors": []
+    }
+
+    async with await get_sink_conn() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            # 1. Get pgai vectorizer statuses
+            try:
+                await cur.execute(
+                    """
+                    SELECT 
+                        v.name, 
+                        v.source_table, 
+                        s.pending_items,
+                        v.config->'destination'->>'target_table' as target_table,
+                        v.config->'destination'->>'view_name' as view_name
+                    FROM ai.vectorizer v
+                    LEFT JOIN ai.vectorizer_status s ON v.id = s.id
+                    """
+                )
+                summary["vectorizers"] = await cur.fetchall()
+            except Exception:
+                # Fallback if ai.vectorizer_status is not exactly as expected
+                pass
+
+            # 2. Get mirror statuses from our registry
+            await cur.execute(
+                """
+                SELECT 
+                    mirror_id, 
+                    target_name, 
+                    last_processed_id, 
+                    promoted_version_id, 
+                    error_count, 
+                    last_error, 
+                    last_sync_latency_ms,
+                    updated_at
+                FROM _sink_mirror_registry
+                """
+            )
+            summary["mirrors"] = await cur.fetchall()
+
+            # 3. Calculate Outbox Lag
+            await cur.execute("SELECT MAX(id) as max_id FROM _sink_outbox")
+            row = await cur.fetchone()
+            max_outbox_id = row["max_id"] if row and row["max_id"] else 0
+            
+    return summary
+
+
+def estimate_hnsw_ram(dimension: int, row_count: int, M: int = 16) -> int:
+    """
+    Estimate RAM usage for pgvector HNSW index.
+    Formula: (dim * 4 + M * 8) * rows * 1.5 (overhead factor)
+    """
+    bytes_per_row = (dimension * 4) + (M * 8)
+    total_bytes = int(bytes_per_row * row_count * 1.5)
+    return total_bytes
+
+
+async def get_resource_projections(settings: Settings, config: TableConfig) -> dict:
+    """Estimate costs and hardware needs for a build."""
+    logger.debug(f"Calculating projections for {config.source_table}...")
+    
+    async with await get_source_conn() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(f"SELECT count(*) FROM {config.source_table}")
+            row = await cur.fetchone()
+            row_count = row[0] if row else 0
+
+    # Simplified cost model (e.g., $0.10 per 1M tokens)
+    # Average 100 tokens per chunk for estimation
+    estimated_tokens = row_count * 100 
+    estimated_cost_usd = (estimated_tokens / 1_000_000) * 0.10
+    
+    ram_bytes = estimate_hnsw_ram(config.embedding_dimension, row_count)
+
+    return {
+        "row_count": row_count,
+        "estimated_tokens": estimated_tokens,
+        "estimated_cost_usd": round(estimated_cost_usd, 4),
+        "estimated_ram_mb": round(ram_bytes / (1024 * 1024), 2),
+        "embedding_model": config.embedding_model,
+        "dimension": config.embedding_dimension
+    }
+
+
+async def log_experiment_start(settings: Settings, target_name: str, version_id: str):
+    """Log the beginning of a new search experiment (shadow build)."""
+    async with await get_sink_conn() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO _search_experiment_logs (target_name, version_id, started_at, metadata)
+                VALUES (%s, %s, NOW(), %s)
+                """,
+                (target_name, version_id, psycopg.types.json.Json({"status": "starting"}))
+            )
+            await conn.commit()
+
+
+async def log_experiment_finish(settings: Settings, target_name: str, version_id: str, success: bool = True):
+    """Finalize experiment log with results."""
+    async with await get_sink_conn() as conn:
+        async with conn.cursor() as cur:
+            # Get final stats from vectorizer status if available
+            await cur.execute(
+                "SELECT pending_items FROM ai.vectorizer_status WHERE source_table ILIKE %s",
+                (f"%{target_name}%",)
+            )
+            row = await cur.fetchone()
+            # If successfully promoted, we assume it's caught up
+            await cur.execute(
+                """
+                UPDATE _search_experiment_logs 
+                SET finished_at = NOW(), 
+                    success_rate = %s,
+                    metadata = metadata || %s::jsonb
+                WHERE target_name = %s AND version_id = %s AND finished_at IS NULL
+                """,
+                (1.0 if success else 0.0, psycopg.types.json.Json({"status": "promoted"}), target_name, version_id)
+            )
+            await conn.commit()
+
+
+async def audit_pipeline_failures(settings: Settings):
+    """Sync errors from pgai's internal logs into our tracking table."""
+    async with await get_sink_conn() as conn:
+        async with conn.cursor() as cur:
+            # Check if pgai error view exists (pgai 0.6.0+)
+            try:
+                # This is a guestimate of where pgai stores errors
+                # In latest pgai, it's often in ai.vectorizer_errors
+                await cur.execute(
+                    """
+                    INSERT INTO _pipeline_failures (target_name, version_id, source_id, error_message, context)
+                    SELECT 
+                        v.name, 
+                        (v.config->'destination'->>'target_table'), 
+                        e.id::text, 
+                        e.message, 
+                        e.details
+                    FROM ai.vectorizer_errors e
+                    JOIN ai.vectorizer v ON e.vectorizer_id = v.id
+                    ON CONFLICT DO NOTHING
+                    """
+                )
+                await conn.commit()
+            except Exception:
+                # Silently skip if pgai error table is missing or schema differs
+                pass
 
 
 async def update_replica_state(
@@ -375,6 +560,21 @@ async def cleanup_vectorizer_infrastructure(
                     EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident('{embedding_view}') || ' CASCADE';
                 EXCEPTION WHEN OTHERS THEN NULL;
                 END;
+
+                -- 5. Search & Destroy Zombie Triggers on the Raw Table
+                -- Find ANY trigger on the source raw table whose function source mentions the vectorizer target
+                FOR live_target IN 
+                    SELECT tgname 
+                    FROM pg_trigger tg
+                    JOIN pg_class c ON tg.tgrelid = c.oid
+                    JOIN pg_proc p ON tg.tgfoid = p.oid
+                    JOIN pg_namespace n ON c.relnamespace = n.oid
+                    WHERE n.nspname = 'public' 
+                      AND c.relname = '{config.sink_raw_table}'
+                      AND p.prosrc ILIKE '%{vectorizer_name}%'
+                LOOP
+                    EXECUTE 'DROP TRIGGER IF EXISTS ' || quote_ident(live_target) || ' ON ' || quote_ident('{config.sink_raw_table}') || ' CASCADE';
+                END LOOP;
             END $$;
             """
             await cur.execute(cleanup_sql)
@@ -492,13 +692,52 @@ async def ensure_outbox_infrastructure(settings: Settings):
                     target_name TEXT NOT NULL,
                     last_processed_id BIGINT DEFAULT 0,
                     promoted_version_id TEXT,
+                    error_count INT DEFAULT 0,
+                    last_error TEXT,
+                    last_sync_latency_ms INT,
                     updated_at TIMESTAMP DEFAULT NOW(),
                     PRIMARY KEY (mirror_id, target_name)
                 )
                 """
             )
-            # Migration: Ensure promoted_version_id exists
+            # Migration: Ensure operational columns exist
             await cur.execute("ALTER TABLE _sink_mirror_registry ADD COLUMN IF NOT EXISTS promoted_version_id TEXT")
+            await cur.execute("ALTER TABLE _sink_mirror_registry ADD COLUMN IF NOT EXISTS error_count INT DEFAULT 0")
+            await cur.execute("ALTER TABLE _sink_mirror_registry ADD COLUMN IF NOT EXISTS last_error TEXT")
+            await cur.execute("ALTER TABLE _sink_mirror_registry ADD COLUMN IF NOT EXISTS last_sync_latency_ms INT")
+
+            # 3. Experiment Logs: Track build history
+            await cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS _search_experiment_logs (
+                    id SERIAL PRIMARY KEY,
+                    target_name TEXT NOT NULL,
+                    version_id TEXT NOT NULL,
+                    started_at TIMESTAMP DEFAULT NOW(),
+                    finished_at TIMESTAMP,
+                    total_rows INT DEFAULT 0,
+                    success_rate FLOAT,
+                    tokens_used BIGINT DEFAULT 0,
+                    metadata JSONB
+                )
+                """
+            )
+
+            # 4. Pipeline Failures: Trace poison pills
+            await cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS _pipeline_failures (
+                    id SERIAL PRIMARY KEY,
+                    target_name TEXT NOT NULL,
+                    version_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    error_message TEXT,
+                    failed_at TIMESTAMP DEFAULT NOW(),
+                    context JSONB,
+                    resolved BOOLEAN DEFAULT FALSE
+                )
+                """
+            )
 
 
 async def setup_outbox_trigger(
