@@ -87,7 +87,7 @@ class QdrantSinkAdapter(SinkAdapter):
                                 id=p_id,
                                 vector=embedding,
                                 payload={
-                                    "content": entry.payload.get("content"),
+                                    "content": entry.payload.get("content") or entry.payload.get("description"),
                                     "target_name": entry.target_name,
                                     "version_id": entry.version_id
                                 }

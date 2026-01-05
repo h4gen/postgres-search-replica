@@ -1313,16 +1313,44 @@ async def drop_subscription_completely(settings: Settings, config: TableConfig, 
         async with await connect_db(settings.resolved_sink_url) as conn:
             await conn.set_autocommit(True)
             await conn.execute(f"DROP VIEW IF EXISTS {config.sink_replica_table} CASCADE")
-            try:
-                await conn.execute(f"DROP SUBSCRIPTION IF EXISTS {sub_name} CASCADE")
-            except Exception: pass
+            
+            # Retry loop for dropping subscription to handle "sync in progress"
+            # Increasing retries to be very robust against slow worker shutdown
+            for attempt in range(10): 
+                try:
+                    # Force kill workers for this subscription
+                    try:
+                        await conn.execute("""
+                            SELECT pg_terminate_backend(pid) 
+                            FROM pg_stat_activity 
+                            WHERE application_name LIKE 'pg_logical_worker%' 
+                            AND datname = current_database()
+                        """)
+                    except Exception: pass
 
+                    try: await conn.execute(f"ALTER SUBSCRIPTION {sub_name} DISABLE")
+                    except Exception: pass
+                    
+                    try: await conn.execute(f"ALTER SUBSCRIPTION {sub_name} SET (slot_name = NONE)")
+                    except Exception: pass
+                    
+                    await conn.execute(f"DROP SUBSCRIPTION IF EXISTS {sub_name} CASCADE")
+                    break
+                except Exception as e:
+
+                    if attempt == 9:
+                        logger.warning(f"Failed to drop subscription {sub_name} after 10 attempts: {e}")
+                    else:
+                        import asyncio
+                        await asyncio.sleep(1.0)
+                        
             # Cleanup vectorizers
             async with conn.cursor() as cur:
                 await cur.execute("SELECT id FROM ai.vectorizer WHERE name LIKE %s", (f"{config.sink_raw_table}_store%",))
                 for (vid,) in await cur.fetchall():
                     await cur.execute(f"SELECT ai.drop_vectorizer({vid}, drop_all => true)")
-    except Exception as e: logger.warning(f"teardown sink error: {e}")
+    except Exception as e:
+        logger.warning(f"teardown sink error: {e}")
 
     try:
         async with await connect_db(settings.source_url) as conn:

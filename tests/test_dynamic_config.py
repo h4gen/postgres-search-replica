@@ -35,6 +35,13 @@ async def robust_cleanup(settings):
                     except Exception: pass
     except Exception: pass
     
+    # 3. Clear Control Plane History (Prevent Zombies)
+    try:
+        async with await connect_db(settings.resolved_sink_url) as conn:
+            await conn.set_autocommit(True)
+            await conn.execute("TRUNCATE _replica_config_history CASCADE")
+    except Exception: pass
+
     # 2. Clear Source slots
     try:
         async with await connect_db(settings.source_url) as conn:
