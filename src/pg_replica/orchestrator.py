@@ -148,6 +148,10 @@ class Orchestrator:
             logger.info("Local Postgres is ready.")
 
         await init_pools(self.settings)
+        
+        # 1. Ensure outbox infrastructure exists globally before starting workers
+        from .database import ensure_outbox_infrastructure
+        await ensure_outbox_infrastructure(self.settings)
 
         reconciler = Reconciler(self.settings)
         max_retries = 5

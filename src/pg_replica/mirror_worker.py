@@ -69,39 +69,85 @@ class MirrorWorker:
                     (target_name, last_id, 100) # Batch size
                 )
                 rows = await cur.fetchall()
-                if not rows:
-                    return
+                if rows:
+                    entries = [
+                        OutboxEntry(
+                            id=r[0],
+                            target_name=r[1],
+                            version_id=r[2],
+                            source_id=r[3],
+                            action=r[4],
+                            payload=r[5]
+                        ) for r in rows
+                    ]
 
-                entries = [
-                    OutboxEntry(
-                        id=r[0],
-                        target_name=r[1],
-                        version_id=r[2],
-                        source_id=r[3],
-                        action=r[4],
-                        payload=r[5]
-                    ) for r in rows
-                ]
+                    # 3. Dispatch to adapter
+                    logger.info(f"MirrorWorker for {mirror_id}/{target_name} found {len(rows)} entries (last_id={last_id})")
+                    try:
+                        await adapter.sync_batch(entries)
+                        
+                        # Update registry for sync progress
+                        new_last_id = entries[-1].id
+                        await cur.execute(
+                            """
+                            INSERT INTO _sink_mirror_registry (mirror_id, target_name, last_processed_id, updated_at)
+                            VALUES (%s, %s, %s, NOW())
+                            ON CONFLICT (mirror_id, target_name) 
+                            DO UPDATE SET last_processed_id = EXCLUDED.last_processed_id, updated_at = NOW()
+                            """,
+                            (mirror_id, target_name, new_last_id)
+                        )
+                        await conn.commit()
+                    except Exception as e:
+                        await conn.rollback()
+                        logger.error(f"Failed to sync batch to mirror {mirror_id}: {e}")
+                        return # Stop processing this mirror if sync fails
 
-                # 3. Dispatch to adapter
+                # 4. Check for Version Promotion in Postgres (even if no new rows)
                 try:
-                    await adapter.sync_batch(entries)
-                    
-                    # 4. Update registry
-                    new_last_id = entries[-1].id
+                    sub_name = f"sub_{target_name}"
+                    logger.debug(f"MirrorWorker checking promotion for {sub_name}...")
                     await cur.execute(
-                        """
-                        INSERT INTO _sink_mirror_registry (mirror_id, target_name, last_processed_id, updated_at)
-                        VALUES (%s, %s, %s, NOW())
-                        ON CONFLICT (mirror_id, target_name) 
-                        DO UPDATE SET last_processed_id = EXCLUDED.last_processed_id, updated_at = NOW()
-                        """,
-                        (mirror_id, target_name, new_last_id)
+                        "SELECT config_hash FROM _replica_state WHERE key = %s",
+                        (sub_name,)
                     )
-                    await conn.commit()
+                    state_row = await cur.fetchone()
+                    if state_row:
+                        current_hash = state_row[0]
+                        promoted_version = current_hash[:8]
+                        logger.debug(f"Found promoted hash {current_hash} (version {promoted_version}) for {sub_name}")
+                        
+                        await cur.execute(
+                            "SELECT promoted_version_id FROM _sink_mirror_registry WHERE mirror_id = %s AND target_name = %s",
+                            (mirror_id, target_name)
+                        )
+                        reg_row = await cur.fetchone()
+                        last_mirrored_version = reg_row[0] if reg_row else None
+                        
+                        logger.debug(f"Mirror {mirror_id} last promoted version: {last_mirrored_version}")
+
+                        if promoted_version != last_mirrored_version:
+                            logger.info(f"Promoting mirror {mirror_id} for {target_name} to version {promoted_version}...")
+                            await adapter.update_alias(target_name, promoted_version)
+                            await cur.execute(
+                                """
+                                INSERT INTO _sink_mirror_registry (mirror_id, target_name, promoted_version_id, updated_at)
+                                VALUES (%s, %s, %s, NOW())
+                                ON CONFLICT (mirror_id, target_name) 
+                                DO UPDATE SET promoted_version_id = EXCLUDED.promoted_version_id, updated_at = NOW()
+                                """,
+                                (mirror_id, target_name, promoted_version)
+                            )
+                            await conn.commit()
+                    else:
+                        logger.debug(f"No replica state found for key {sub_name}")
                 except Exception as e:
                     await conn.rollback()
-                    logger.error(f"Failed to sync batch to mirror {mirror_id}: {e}")
+                    # Catch 'column does not exist' gracefully during initial startup migration
+                    if "promoted_version_id" in str(e):
+                        logger.debug("Mirror registry migration still pending...")
+                    else:
+                        logger.error(f"Failed to update alias for mirror {mirror_id}: {e}")
 
     def stop(self):
         self._shutdown = True

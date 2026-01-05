@@ -51,6 +51,7 @@ class TableConfig(BaseModel):
     
     # Search & Transformation
     search_profile: str = "vector"  # options: vector, hybrid, sparse
+    search_engine: str = "postgres"  # options: postgres, qdrant, pinecone
     embedding_provider: str = "ollama"
     embedding_model: str = "nomic-embed-text"
     embedding_dimension: int = 768
