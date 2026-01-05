@@ -19,6 +19,7 @@ from .observability import (
     update_pgai_pending,
     app as observability_app,
 )
+from .utils import wait_until
 
 # Configure structured JSON logging
 logHandler = logging.StreamHandler(sys.stdout)
@@ -82,18 +83,21 @@ async def main():
     server_task = asyncio.create_task(server.serve())
 
     reconciler = Reconciler(settings)
-    max_retries = 5
-    for i in range(max_retries):
+    
+    async def try_reconcile():
         try:
             await reconciler.reconcile()
-            break
+            return True
         except Exception as e:
-            if i == max_retries - 1:
-                logger.critical(f"Failed to reconcile after {max_retries} attempts: {e}")
-                await close_pools()
-                return
-            logger.warning(f"Reconciliation attempt {i+1} failed: {e}")
-            await asyncio.sleep(5)
+            logger.warning(f"Reconciliation attempt failed: {e}")
+            return False
+
+    try:
+        await wait_until(try_reconcile, timeout=60.0, interval=5.0, message="Failed to reconcile search infrastructure")
+    except asyncio.TimeoutError as e:
+        logger.critical(str(e))
+        await close_pools()
+        return
 
     def handle_exit():
         logger.info("Shutdown signal received...")

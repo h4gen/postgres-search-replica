@@ -16,6 +16,7 @@ from .database import (
 from .observability import update_replication_lag
 from pgai.vectorizer.worker import Worker
 from .mirror_worker import MirrorWorker
+from .utils import wait_until
 
 logger = logging.getLogger(__name__)
 
@@ -37,19 +38,21 @@ class Orchestrator:
             return False
 
     async def _wait_for_pg(self, port: int, timeout: int = 30):
-        start_time = asyncio.get_event_loop().time()
-        while asyncio.get_event_loop().time() - start_time < timeout:
+        async def pg_ready():
             if await self._is_port_open(port):
-                # Extra check to ensure we can actually connect via psycopg
                 try:
-                    async with await connect_db(
-                        self.settings.resolved_sink_url
-                    ):
+                    async with await connect_db(self.settings.resolved_sink_url):
                         return True
                 except Exception:
                     pass
-            await asyncio.sleep(1)
-        return False
+            return False
+
+        logger.info(f"Waiting for Postgres on port {port}...")
+        try:
+            await wait_until(pg_ready, timeout=timeout, interval=1.0)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     def _start_local_postgres(self):
         """Starts a local Postgres process if sink_url is 'local'."""
@@ -154,16 +157,19 @@ class Orchestrator:
         await ensure_outbox_infrastructure(self.settings)
 
         reconciler = Reconciler(self.settings)
-        max_retries = 5
-        for i in range(max_retries):
+        
+        async def try_reconcile():
             try:
                 await reconciler.reconcile()
-                break
+                return True
             except Exception as e:
-                if i == max_retries - 1:
-                    raise RuntimeError(f"Failed to reconcile after {max_retries} attempts: {e}")
-                logger.warning(f"Reconciliation attempt {i+1} failed: {e}")
-                await asyncio.sleep(5)
+                logger.warning(f"Reconciliation attempt failed: {e}")
+                return False
+
+        try:
+            await wait_until(try_reconcile, timeout=60.0, interval=5.0, message="Failed to reconcile search infrastructure")
+        except asyncio.TimeoutError as e:
+            raise RuntimeError(str(e))
 
         worker = Worker(db_url=self.settings.resolved_sink_url, poll_interval=timedelta(seconds=2.0))
         self._tasks.append(asyncio.create_task(worker.run(), name="pgai_worker"))

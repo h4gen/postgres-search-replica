@@ -7,6 +7,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from pgvector.psycopg import register_vector_async as register_vector  # type: ignore
 from .config import Settings, TableConfig
+from .utils import wait_until
 
 logger = logging.getLogger(__name__)
 
@@ -87,15 +88,9 @@ async def connect_db(url: str, **kwargs):
 
 async def wait_for_source_table(settings: Settings, config: TableConfig, timeout: int = 30):
     """Wait for a table to exist on the Source DB."""
-    import asyncio
-    start_time = asyncio.get_event_loop().time()
-    logger.info(f"Waiting for source table {config.source_table} to be visible...")
-    while asyncio.get_event_loop().time() - start_time < timeout:
+    async def table_exists():
         async with await get_source_conn() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SHOW search_path")
-                spath = await cur.fetchone()
-                
                 await cur.execute(
                     "SELECT 1 FROM information_schema.tables WHERE table_name = %s",
                     (config.source_table,),
@@ -107,11 +102,41 @@ async def wait_for_source_table(settings: Settings, config: TableConfig, timeout
                     "SELECT 1 FROM pg_class WHERE relname = %s",
                     (config.source_table,),
                 )
-                if await cur.fetchone():
-                    return True
-        await asyncio.sleep(0.1)
-    logger.error(f"Timed out waiting for source table {config.source_table}")
-    return False
+                return await cur.fetchone() is not None
+
+    logger.info(f"Waiting for source table {config.source_table} to be visible...")
+    try:
+        await wait_until(table_exists, timeout=timeout, interval=0.1)
+        return True
+    except asyncio.TimeoutError:
+        logger.error(f"Timed out waiting for source table {config.source_table}")
+        return False
+
+
+async def is_extension_loaded(ext_name: str) -> bool:
+    """Check if a Postgres extension is loaded on the Sink DB."""
+    async with await get_sink_conn() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT 1 FROM pg_extension WHERE extname = %s", (ext_name,))
+            return await cur.fetchone() is not None
+
+
+async def is_replication_slot_active(slot_name: str, on_source: bool = True) -> bool:
+    """Check if a replication slot is active."""
+    get_conn = get_source_conn if on_source else get_sink_conn
+    async with await get_conn() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT active FROM pg_replication_slots WHERE slot_name = %s", (slot_name,))
+            row = await cur.fetchone()
+            return row[0] if row else False
+
+
+async def is_publication_valid(pub_name: str) -> bool:
+    """Check if a publication exists on the Source DB."""
+    async with await get_source_conn() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT 1 FROM pg_publication WHERE pubname = %s", (pub_name,))
+            return await cur.fetchone() is not None
 
 
 async def get_source_column_types(
@@ -1073,8 +1098,7 @@ async def setup_sink(
                 destination_sql = f", destination => ai.destination_table(target_table => '{vectorizer_name}', view_name => '{versioned_view}')"
 
             # Retry loop for pgai creation to handle intermittent registration lag
-            max_retries = 3
-            for attempt in range(max_retries):
+            async def try_create_vectorizer():
                 try:
                     await cur.execute(
                         f"""
@@ -1091,13 +1115,14 @@ async def setup_sink(
                     """,
                         (vectorizer_name,),
                     )
-                    break
+                    return True
                 except Exception as e:
-                    if "does not exist" in str(e) and attempt < max_retries -1:
-                        logger.warning(f"Attempt {attempt+1} failed with relation error, retrying in 2s: {e}")
-                        await asyncio.sleep(2)
-                        continue
+                    if "does not exist" in str(e):
+                        logger.warning(f"Relation not yet visible to pgai, retrying: {e}")
+                        return False
                     raise e
+
+            await wait_until(try_create_vectorizer, timeout=20.0, interval=2.0)
 
             # Enable triggers
             await cur.execute(
@@ -1130,7 +1155,7 @@ async def setup_sink(
 
                 options = ", ".join([f"{k} = {v}" for k, v in options_dict.items()])
                 # Retry loop for subscription to handle source-side visibility lag
-                for attempt in range(max_retries):
+                async def try_create_subscription():
                     try:
                         await cur.execute(
                             f"""
@@ -1140,13 +1165,14 @@ async def setup_sink(
                             WITH ({options})
                             """
                         )
-                        break
+                        return True
                     except Exception as e:
-                        if "does not exist" in str(e) and attempt < max_retries - 1:
-                            logger.warning(f"Attempt {attempt+1} failed to create subscription, retrying: {e}")
-                            await asyncio.sleep(2)
-                            continue
+                        if "does not exist" in str(e):
+                            logger.warning(f"Subscription publication {pub_name} not yet visible, retrying: {e}")
+                            return False
                         raise e
+
+                await wait_until(try_create_subscription, timeout=20.0, interval=2.0)
             else:
                 await cur.execute(f"ALTER SUBSCRIPTION {sub_name} ENABLE")
                 await cur.execute(f"ALTER SUBSCRIPTION {sub_name} REFRESH PUBLICATION")
@@ -1315,8 +1341,7 @@ async def drop_subscription_completely(settings: Settings, config: TableConfig, 
             await conn.execute(f"DROP VIEW IF EXISTS {config.sink_replica_table} CASCADE")
             
             # Retry loop for dropping subscription to handle "sync in progress"
-            # Increasing retries to be very robust against slow worker shutdown
-            for attempt in range(10): 
+            async def try_drop_subscription():
                 try:
                     # Force kill workers for this subscription
                     try:
@@ -1335,14 +1360,15 @@ async def drop_subscription_completely(settings: Settings, config: TableConfig, 
                     except Exception: pass
                     
                     await conn.execute(f"DROP SUBSCRIPTION IF EXISTS {sub_name} CASCADE")
-                    break
+                    return True
                 except Exception as e:
+                    logger.warning(f"Failed to drop subscription {sub_name}, retrying: {e}")
+                    return False
 
-                    if attempt == 9:
-                        logger.warning(f"Failed to drop subscription {sub_name} after 10 attempts: {e}")
-                    else:
-                        import asyncio
-                        await asyncio.sleep(1.0)
+            try:
+                await wait_until(try_drop_subscription, timeout=15.0, interval=1.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"Timed out waiting to drop subscription {sub_name}")
                         
             # Cleanup vectorizers
             async with conn.cursor() as cur:
