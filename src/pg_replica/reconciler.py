@@ -26,6 +26,10 @@ from .database import (
     log_experiment_start,
     log_experiment_finish,
     audit_pipeline_failures,
+    ensure_config_history_table,
+    get_latest_table_config,
+    update_config_status,
+    reconciliation_lock,
 )
 
 logger = logging.getLogger(__name__)
@@ -193,6 +197,14 @@ class Inspector:
 
                 # 6. Vectorizer Sync Status
                 state["vectorizer_statuses"] = await get_vectorizer_statuses(self.settings)
+
+                # 7. Control Plane Config State
+                state["config_history"] = {}
+                if "_replica_config_history" in state["tables"]:
+                    for name in self.settings.tables.keys():
+                        latest = await get_latest_table_config(self.settings, name)
+                        if latest:
+                            state["config_history"][name] = latest
 
         return state
 
@@ -446,6 +458,11 @@ class Planner:
                     else:
                         logger.info(f"Skipping promotion for {name}: Target {expected_vectorizer_target} has {pending_items} pending items.")
                 
+                # Case C: Generation check (Ensure we promote if a new generation is Ready but not yet observed)
+                # This is handled by the hash check above if the hash changed, 
+                # but what if just the generation changed (e.g. forced rebuild)?
+                # Actually, config_hash is derived from the JSON, so it should change.
+                
                 if should_promote:
                     # Idempotency check handled by conditions above
                      actions.append(
@@ -596,26 +613,87 @@ class Reconciler:
     async def reconcile(self):
         logger.info("Starting reconciliation loop...")
 
-        # 1. Discovery
-        source_state = await self.inspector.get_source_state()
-        sink_state = await self.inspector.get_sink_state()
-        
-        # 1.5 Audit failures (sync from pgai)
-        await audit_pipeline_failures(self.settings)
-
-        # 2. Planning
-        actions = self.planner.plan(source_state, sink_state)
-
-        if not actions:
-            logger.info(
-                "No infrastructure drift detected. Everything is in sync."
-            )
-            return
-
-        # 3. Application
         try:
-            await self.applier.apply(actions)
-        except Exception as e:
-            logger.error("Error applying actions", exc_info=True)
+            async with reconciliation_lock():
+                # 0. Initialize Infrastructure
+                await ensure_config_history_table(self.settings)
+                
+                # 0.5 Control Plane Override
+                # Load latest configs from DB to override in-memory settings
+                # We fetch ALL unique target names from the history to allow discovery of new tables
+                async with await get_sink_conn() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute("SELECT DISTINCT target_name FROM _replica_config_history")
+                        all_db_targets = [row[0] for row in await cur.fetchall()]
+
+                # Merge DB targets with in-memory targets
+                all_targets = set(self.settings.tables.keys()) | set(all_db_targets)
+                
+                for name in all_targets:
+                    latest_db = await get_latest_table_config(self.settings, name)
+                    if latest_db:
+                        # Convert JSON back to TableConfig
+                        db_config = TableConfig(**latest_db["config_json"])
+                        
+                        logger.debug(f"Overriding {name} with DB config gen {latest_db['generation']}")
+                        self.settings.tables[name] = db_config
+                        
+                        # We store the generation in the config object for the Applier to read
+                        setattr(self.settings.tables[name], "_generation", latest_db['generation'])
+
+                # 1. Discovery
+                source_state = await self.inspector.get_source_state()
+                sink_state = await self.inspector.get_sink_state()
+                
+                # 1.5 Audit failures (sync from pgai)
+                await audit_pipeline_failures(self.settings)
+
+                # 2. Planning
+                actions = self.planner.plan(source_state, sink_state)
+
+                if not actions:
+                    logger.info(
+                        "No infrastructure drift detected. Everything is in sync."
+                    )
+                    # Update status of Ready configs if they weren't yet marked observed
+                    for name, config in self.settings.tables.items():
+                        gen = getattr(config, "_generation", None)
+                        if gen:
+                            await update_config_status(
+                                self.settings, name, gen, "Ready", observed_generation=gen
+                            )
+                    return
+
+                # 3. Application
+                try:
+                    # Mark active configs as Syncing if we have actions for them
+                    affected_targets = {a.target_name for a in actions if a.target_name}
+                    for target in affected_targets:
+                        gen = getattr(self.settings.tables.get(target, {}), "_generation", None)
+                        if gen:
+                            await update_config_status(self.settings, target, gen, "Syncing")
+
+                    await self.applier.apply(actions)
+                    
+                    # Mark as Ready if successful
+                    for target in affected_targets:
+                        gen = getattr(self.settings.tables.get(target, {}), "_generation", None)
+                        if gen:
+                            await update_config_status(self.settings, target, gen, "Ready", observed_generation=gen)
+
+                except Exception as e:
+                    logger.error("Error applying actions", exc_info=True)
+                    # Mark as Failed
+                    for target in affected_targets:
+                        gen = getattr(self.settings.tables.get(target, {}), "_generation", None)
+                        if gen:
+                            await update_config_status(self.settings, target, gen, "Failed", error_message=str(e))
+                    raise e
+                    
+        except RuntimeError as e:
+            if "acquire reconciliation lock" in str(e):
+                logger.warning("Another reconciler is already running. Skipping this loop.")
+                return
             raise e
+
         logger.info("Reconciliation complete.")

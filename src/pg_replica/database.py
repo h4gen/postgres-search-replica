@@ -1,5 +1,7 @@
 import logging
 import asyncio
+import json
+from contextlib import asynccontextmanager
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
@@ -11,6 +13,9 @@ logger = logging.getLogger(__name__)
 # Global pools
 _source_pool: AsyncConnectionPool | None = None
 _sink_pool: AsyncConnectionPool | None = None
+
+# Control Plane Constants
+RECONCILER_ADVISORY_LOCK_ID = 133742  # Unique ID for the reconciler lock
 
 
 async def init_pools(settings: Settings):
@@ -208,6 +213,130 @@ async def setup_state_table(settings: Settings, target_name: str):
                 "INSERT INTO _replica_state (key, last_id) VALUES (%s, '0') ON CONFLICT DO NOTHING",
                 (sub_name,),
             )
+
+
+async def ensure_config_history_table(settings: Settings):
+    """Create the _replica_config_history table in the Sink DB."""
+    logger.info("Ensuring Control Plane config history table exists in Sink...")
+    async with await get_sink_conn() as conn:
+        await conn.set_autocommit(True)
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS _replica_config_history (
+                    id SERIAL PRIMARY KEY,
+                    target_name TEXT NOT NULL,
+                    config_json JSONB NOT NULL,
+                    config_hash TEXT NOT NULL,
+                    generation INT NOT NULL DEFAULT 1,
+                    status TEXT NOT NULL DEFAULT 'Pending',
+                    error_message TEXT,
+                    observed_generation INT DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+                """
+            )
+            await cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_config_history_target ON _replica_config_history(target_name)"
+            )
+
+
+async def save_table_config(settings: Settings, target_name: str, config: TableConfig) -> int:
+    """Save a new configuration for a table and return the new generation."""
+    async with await get_sink_conn() as conn:
+        await conn.set_autocommit(True)
+        async with conn.cursor() as cur:
+            # 1. Get latest generation
+            await cur.execute(
+                "SELECT COALESCE(MAX(generation), 0) FROM _replica_config_history WHERE target_name = %s",
+                (target_name,)
+            )
+            curr_gen = (await cur.fetchone())[0]
+            new_gen = curr_gen + 1
+
+            # 2. Insert new config
+            await cur.execute(
+                """
+                INSERT INTO _replica_config_history (target_name, config_json, config_hash, generation, status)
+                VALUES (%s, %s, %s, %s, 'Pending')
+                """,
+                (
+                    target_name, 
+                    psycopg.types.json.Json(config.model_dump()), 
+                    config.get_config_hash(), 
+                    new_gen
+                )
+            )
+            return new_gen
+
+
+async def get_latest_table_config(settings: Settings, target_name: str) -> dict | None:
+    """Retrieve the latest configuration for a table."""
+    async with await get_sink_conn() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT config_json, config_hash, generation, status, error_message, observed_generation 
+                FROM _replica_config_history 
+                WHERE target_name = %s 
+                ORDER BY generation DESC LIMIT 1
+                """,
+                (target_name,)
+            )
+            return await cur.fetchone()
+
+
+async def update_config_status(
+    settings: Settings, 
+    target_name: str, 
+    generation: int, 
+    status: str, 
+    error_message: str | None = None,
+    observed_generation: int | None = None
+):
+    """Update the status of a specific configuration generation."""
+    async with await get_sink_conn() as conn:
+        await conn.set_autocommit(True)
+        async with conn.cursor() as cur:
+            updates = ["status = %s", "error_message = %s"]
+            params = [status, error_message]
+            
+            if observed_generation is not None:
+                updates.append("observed_generation = %s")
+                params.append(observed_generation)
+            
+            params.append(target_name)
+            params.append(generation)
+            
+            sql = f"UPDATE _replica_config_history SET {', '.join(updates)} WHERE target_name = %s AND generation = %s"
+            await cur.execute(sql, params)
+
+
+@asynccontextmanager
+async def reconciliation_lock():
+    """Context manager for distributed locking using Postgres advisory locks."""
+    async with await get_sink_conn() as conn:
+        # Advisory locks are session-level or transaction-level. 
+        # We use transaction-level for safety (automatically released on commit/rollback).
+        await conn.set_autocommit(False)
+        try:
+            async with conn.cursor() as cur:
+                logger.debug(f"Attempting to acquire reconciler lock ({RECONCILER_ADVISORY_LOCK_ID})...")
+                # pg_try_advisory_xact_lock returns True/False immediately
+                await cur.execute("SELECT pg_try_advisory_xact_lock(%s)", (RECONCILER_ADVISORY_LOCK_ID,))
+                locked = (await cur.fetchone())[0]
+                
+                if not locked:
+                    raise RuntimeError("Could not acquire reconciliation lock. Another instance matches.")
+                
+                logger.debug("Reconciliation lock acquired.")
+                yield
+                await conn.commit()
+        except Exception as e:
+            await conn.rollback()
+            raise e
+        finally:
+            logger.debug("Reconciliation lock released.")
 
 
 async def get_replica_state(
