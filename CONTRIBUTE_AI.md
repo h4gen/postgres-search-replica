@@ -28,6 +28,12 @@ This command executes the following critical lifecycle:
    - `psycopg.errors`: Often indicates triggers firing on missing tables.
    - `Failed to sync batch`: Indicates the data plane is broken while the test plane is idling.
    - `teardown source error`: Stale replication slots that will block the *next* test run.
+3. **The Mandatory Grep Protocol**:
+   Run the following command after `make test-dev` and ensure zero unexpected hits:
+   ```bash
+   grep -E "ERROR|WARNING" test_output.log | grep -v "Expected Failure Case"
+   ```
+   *Note: Real architectural errors are often swallowed as logs in background workers. If you see a log that shouldn't be there, the test is a failure.*
 
 ## 3. Maintaining CI Parity
 - **Environment Variables**: The `Makefile` sets `SOURCE_URL` and `SINK_URL` to match the Docker Compose setup. If you change a port in `docker-compose.yml`, you **must** update the `Makefile` defaults or CI will hang.
