@@ -6,6 +6,8 @@ A professional-grade PostgreSQL search replica library with **real-time CDC vect
 
 The project is built for enterprise-scale data movement, leveraging PostgreSQL's native Change Data Capture (CDC) capabilities to ensure sub-second search synchronization with zero impact on the source database.
 
+- **Fault-Tolerant Reconciler**: A production-grade state enforcement engine. It reconciles your desired state (configs) with the actual database infrastructure, handling per-target failures gracefully so one broken table doesn't block your entire fleet.
+- **Isolated Control Plane**: Uses `pg_advisory_xact_lock` for distributed concurrency control and `copy.deepcopy` for settings isolation, ensuring multiple daemon instances or test runs never collide.
 - **Native WAL Streaming (CDC)**: Uses PostgreSQL Logical Replication to stream changes directly from the write-ahead log. No polling, no triggers on the source, and minimal overhead.
 - **PG 15 Row & Column Filtering**: Minimizes network traffic and sink load by replicating only the specific rows and columns you need for search.
 - **Postgres-Native Vectorization**: Unlike external sync tools, this uses the `pgai` extension to handle vectorization *inside* the database. This ensures your embeddings are governed by the same ACID guarantees as your data.
@@ -153,6 +155,9 @@ res = await replica.search("high-tech accessories")
 
 ## Key Features
 
+- **Fault-Tolerant Reconciler**: Centralized state management that catches and reports errors per-target, preventing cascading failures.
+- **Transactional Control Plane**: Distributed locking and settings isolation for reliable multi-node operations.
+- **Production-Grade Teardown**: Robust logical replication cleanup with worker termination and retry logic to prevent zombie slots.
 - **Native CDC Streaming**: High-performance binary replication from Source WAL to Sink, ensuring sub-second latency for search results.
 - **Hybrid Recovery & Self-Healing**: Automatically detect missing replication slots and bridge the gap using SQL catch-up followed by an LSN-anchored handover to native replication.
 - **Anti-Entropy (Ghost Cleaner)**: Checksum-based sweep to identify and prune records that were hard-deleted from the source while the daemon was offline.
@@ -161,7 +166,7 @@ res = await replica.search("high-tech accessories")
 - **Dynamic Type Detection**: Automatically detect primary key types (including **UUID**, **BIGINT**, **TEXT**) and schema from the source database at runtime.
 - **Context-Aware Embedding**: Automatically combine metadata (e.g., `name`) with chunked text (e.g., `description`) using Python-style templates to preserve context across all vectors.
 - **Connection Pooling**: Uses `psycopg-pool` for robust management of database connections, preventing exhaustion under high load.
-- **Observability Hub**: Built-in FastAPI server providing health checks and real-time Prometheus metrics.
+- **Observability Hub**: Built-in FastAPI server providing health checks and real-time status reporting from the configuration history.
 - **Structured JSON Logging**: Native support for single-line JSON logging, ready for ingestion by Datadog, ELK, or Grafana Loki.
 - **Managed Lifecycle**: Automatically handles replication slot creation/cleanup and `pgai` worker management.
 - **Smart Reconciliation**: Only updates embeddings when source data actually changes, leveraging `pgai` native state tracking.

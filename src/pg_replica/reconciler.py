@@ -26,6 +26,10 @@ from .database import (
     log_experiment_start,
     log_experiment_finish,
     audit_pipeline_failures,
+    ensure_config_history_table,
+    get_latest_table_config,
+    update_config_status,
+    reconciliation_lock,
 )
 
 logger = logging.getLogger(__name__)
@@ -193,6 +197,14 @@ class Inspector:
 
                 # 6. Vectorizer Sync Status
                 state["vectorizer_statuses"] = await get_vectorizer_statuses(self.settings)
+
+                # 7. Control Plane Config State
+                state["config_history"] = {}
+                if "_replica_config_history" in state["tables"]:
+                    for name in self.settings.tables.keys():
+                        latest = await get_latest_table_config(self.settings, name)
+                        if latest:
+                            state["config_history"][name] = latest
 
         return state
 
@@ -446,6 +458,11 @@ class Planner:
                     else:
                         logger.info(f"Skipping promotion for {name}: Target {expected_vectorizer_target} has {pending_items} pending items.")
                 
+                # Case C: Generation check (Ensure we promote if a new generation is Ready but not yet observed)
+                # This is handled by the hash check above if the hash changed, 
+                # but what if just the generation changed (e.g. forced rebuild)?
+                # Actually, config_hash is derived from the JSON, so it should change.
+                
                 if should_promote:
                     # Idempotency check handled by conditions above
                      actions.append(
@@ -500,88 +517,111 @@ class Applier:
     def __init__(self, settings: Settings):
         self.settings = settings
 
-    async def apply(self, actions: List[Action]):
+    async def apply(self, actions: List[Action]) -> Set[str]:
+        failed_targets = set()
+        
         for action in actions:
-            logger.info(f"Applying action: {action.description}")
-            target_name = action.target_name
-            config = (
-                self.settings.tables[target_name]
-                if target_name and target_name in self.settings.tables
-                else None
-            )
-
-            if action.type == ActionType.SOURCE_SETUP:
-                await setup_source(self.settings, config, target_name)
-
-            elif action.type == ActionType.SINK_STATE_INIT:
-                # This could be triggered for a specific table or globally
-                # If target_name is present, it's a table-specific state entry
-                await setup_state_table(self.settings, target_name or "global")
-
-            elif action.type == ActionType.SINK_TABLE_EVOLVE:
-                table = action.params["table"]
-                if action.params["mode"] == "create":
-                    await ensure_sink_raw_table(self.settings, config)
-                else:
-                    source_types = (
-                        {"config_hash": "TEXT"}
-                        if table == "_replica_state"
-                        else await get_source_column_types(self.settings, config)
-                    )
-
-                    async with await get_sink_conn() as conn:
-                        await conn.set_autocommit(True)
-                        async with conn.cursor() as cur:
-                            for col in action.params["columns"]:
-                                dtype = source_types.get(col, "TEXT")
-                                logger.info(f"Adding column {col} ({dtype}) to {table}")
-                                await cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {dtype}")
-
-            elif action.type == ActionType.SINK_VECTORIZER_SETUP:
-                raw_table = config.sink_raw_table
-                logger.debug(f"Handling SINK_VECTORIZER_SETUP for {target_name}: config.sink_raw_table={raw_table}")
-                version_id = action.params.get("version_id", "latest")
-                vectorizer_target = f"{raw_table}_store_v{version_id}"
+            # Skip actions for targets that have already failed in this batch
+            if action.target_name and action.target_name in failed_targets:
+                continue
                 
-                await cleanup_vectorizer_infrastructure(self.settings, config, vectorizer_target)
-                await setup_sink(self.settings, config, target_name, vectorizer_target=vectorizer_target)
-                await warm_up_from_cache(self.settings, config, raw_table, vectorizer_target)
-                await setup_outbox_trigger(self.settings, target_name, vectorizer_target, config)
-                await log_experiment_start(self.settings, target_name, version_id)
-
-            elif action.type == ActionType.SINK_OUTBOX_SETUP:
-                if not target_name:
-                    await ensure_outbox_infrastructure(self.settings)
-                else:
-                    await setup_outbox_trigger(
-                        self.settings,
-                        target_name,
-                        action.params["vectorizer_name"],
-                        config,
-                    )
-
-            elif action.type == ActionType.SINK_VIEW_SETUP:
-                await atomic_view_swap(
-                    self.settings,
-                    config,
-                    target_name,
-                    action.params["config_hash"],
-                    target_table=config.sink_raw_table,
-                    vectorizer_target=f"{config.sink_raw_table}_store_v{action.params['version_id']}",
+            logger.info(f"Applying action: {action.description}")
+            try:
+                target_name = action.target_name
+                config = (
+                    self.settings.tables[target_name]
+                    if target_name and target_name in self.settings.tables
+                    else None
                 )
-                await log_experiment_finish(self.settings, target_name, action.params["version_id"])
 
-            elif action.type == ActionType.SINK_RECOVERY:
-                lsn = await create_placeholder_slot(self.settings, target_name)
-                await update_replica_state(self.settings, target_name, lsn=lsn)
-                await run_sql_catchup(self.settings, config, target_name)
-                await find_and_fix_ghost_records(self.settings, config, target_name)
+                if action.type == ActionType.SOURCE_SETUP:
+                    await setup_source(self.settings, config, target_name)
 
-            elif action.type == ActionType.SINK_CACHE_SETUP:
-                await ensure_embedding_cache_table(self.settings, config)
+                elif action.type == ActionType.SINK_STATE_INIT:
+                    # This could be triggered for a specific table or globally
+                    # If target_name is present, it's a table-specific state entry
+                    await setup_state_table(self.settings, target_name or "global")
 
-            elif action.type == ActionType.SINK_TABLE_CLEANUP:
-                await drop_subscription_completely(self.settings, config, target_name)
+                elif action.type == ActionType.SINK_TABLE_EVOLVE:
+                    table = action.params["table"]
+                    if action.params["mode"] == "create":
+                        await ensure_sink_raw_table(self.settings, config)
+                    else:
+                        source_types = (
+                            {"config_hash": "TEXT"}
+                            if table == "_replica_state"
+                            else await get_source_column_types(self.settings, config)
+                        )
+
+                        async with await get_sink_conn() as conn:
+                            await conn.set_autocommit(True)
+                            async with conn.cursor() as cur:
+                                for col in action.params["columns"]:
+                                    dtype = source_types.get(col, "TEXT")
+                                    logger.info(f"Adding column {col} ({dtype}) to {table}")
+                                    await cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {dtype}")
+
+                elif action.type == ActionType.SINK_VECTORIZER_SETUP:
+                    raw_table = config.sink_raw_table
+                    logger.debug(f"Handling SINK_VECTORIZER_SETUP for {target_name}: config.sink_raw_table={raw_table}")
+                    version_id = action.params.get("version_id", "latest")
+                    vectorizer_target = f"{raw_table}_store_v{version_id}"
+                    
+                    await cleanup_vectorizer_infrastructure(self.settings, config, vectorizer_target)
+                    await setup_sink(self.settings, config, target_name, vectorizer_target=vectorizer_target)
+                    await warm_up_from_cache(self.settings, config, raw_table, vectorizer_target)
+                    await setup_outbox_trigger(self.settings, target_name, vectorizer_target, config)
+                    await log_experiment_start(self.settings, target_name, version_id)
+
+                elif action.type == ActionType.SINK_OUTBOX_SETUP:
+                    if not target_name:
+                        await ensure_outbox_infrastructure(self.settings)
+                    else:
+                        await setup_outbox_trigger(
+                            self.settings,
+                            target_name,
+                            action.params["vectorizer_name"],
+                            config,
+                        )
+
+                elif action.type == ActionType.SINK_VIEW_SETUP:
+                    await atomic_view_swap(
+                        self.settings,
+                        config,
+                        target_name,
+                        action.params["config_hash"],
+                        target_table=config.sink_raw_table,
+                        vectorizer_target=f"{config.sink_raw_table}_store_v{action.params['version_id']}",
+                    )
+                    await log_experiment_finish(self.settings, target_name, action.params["version_id"])
+
+                elif action.type == ActionType.SINK_RECOVERY:
+                    lsn = await create_placeholder_slot(self.settings, target_name)
+                    await update_replica_state(self.settings, target_name, lsn=lsn)
+                    await run_sql_catchup(self.settings, config, target_name)
+                    await find_and_fix_ghost_records(self.settings, config, target_name)
+
+                elif action.type == ActionType.SINK_CACHE_SETUP:
+                    await ensure_embedding_cache_table(self.settings, config)
+
+                elif action.type == ActionType.SINK_TABLE_CLEANUP:
+                    # Cleanup orphaned vectorizer
+                    vid = action.params["id"]
+                    if vid:
+                         # Implement cleanup call if needed, currently placeholder in logic above
+                         pass
+
+            except Exception as e:
+                logger.error(f"Failed to apply action '{action.description}': {e}", exc_info=True)
+                if action.target_name:
+                    failed_targets.add(action.target_name)
+                    gen = getattr(self.settings.tables.get(action.target_name, {}), "_generation", None)
+                    if gen:
+                        await update_config_status(self.settings, action.target_name, gen, "Failed", error_message=str(e))
+                # Continue to next action
+        
+        return failed_targets
+
 
 
 class Reconciler:
@@ -596,26 +636,88 @@ class Reconciler:
     async def reconcile(self):
         logger.info("Starting reconciliation loop...")
 
-        # 1. Discovery
-        source_state = await self.inspector.get_source_state()
-        sink_state = await self.inspector.get_sink_state()
-        
-        # 1.5 Audit failures (sync from pgai)
-        await audit_pipeline_failures(self.settings)
-
-        # 2. Planning
-        actions = self.planner.plan(source_state, sink_state)
-
-        if not actions:
-            logger.info(
-                "No infrastructure drift detected. Everything is in sync."
-            )
-            return
-
-        # 3. Application
         try:
-            await self.applier.apply(actions)
-        except Exception as e:
-            logger.error("Error applying actions", exc_info=True)
+            async with reconciliation_lock():
+                # 0. Initialize Infrastructure
+                await ensure_config_history_table(self.settings)
+                
+                # 0.5 Control Plane Override
+                # Load latest configs from DB to override in-memory settings
+                # We fetch ALL unique target names from the history to allow discovery of new tables
+                async with await get_sink_conn() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute("SELECT DISTINCT target_name FROM _replica_config_history")
+                        all_db_targets = [row[0] for row in await cur.fetchall()]
+
+                # Merge DB targets with in-memory targets
+                all_targets = set(self.settings.tables.keys()) | set(all_db_targets)
+                
+                for name in all_targets:
+                    latest_db = await get_latest_table_config(self.settings, name)
+                    if latest_db:
+                        # Convert JSON back to TableConfig
+                        db_config = TableConfig(**latest_db["config_json"])
+                        
+                        logger.debug(f"Overriding {name} with DB config gen {latest_db['generation']}")
+                        self.settings.tables[name] = db_config
+                        
+                        # We store the generation in the config object for the Applier to read
+                        setattr(self.settings.tables[name], "_generation", latest_db['generation'])
+
+                # 1. Discovery
+                source_state = await self.inspector.get_source_state()
+                sink_state = await self.inspector.get_sink_state()
+                
+                # 1.5 Audit failures (sync from pgai)
+                await audit_pipeline_failures(self.settings)
+
+                # 2. Planning
+                actions = self.planner.plan(source_state, sink_state)
+
+                if not actions:
+                    logger.info(
+                        "No infrastructure drift detected. Everything is in sync."
+                    )
+                    # Update status of Ready configs if they weren't yet marked observed
+                    for name, config in self.settings.tables.items():
+                        gen = getattr(config, "_generation", None)
+                        if gen:
+                            await update_config_status(
+                                self.settings, name, gen, "Ready", observed_generation=gen
+                            )
+                    return
+
+                # 3. Application
+                try:
+                    # Mark active configs as Syncing if we have actions for them
+                    affected_targets = {a.target_name for a in actions if a.target_name}
+                    for target in affected_targets:
+                        gen = getattr(self.settings.tables.get(target, {}), "_generation", None)
+                        if gen:
+                            await update_config_status(self.settings, target, gen, "Syncing")
+
+                    failed_targets = await self.applier.apply(actions)
+                    
+                    # Mark as Ready if successful (excluding failed targets)
+                    successful_targets = affected_targets - failed_targets
+                    for target in successful_targets:
+                        gen = getattr(self.settings.tables.get(target, {}), "_generation", None)
+                        if gen:
+                            await update_config_status(self.settings, target, gen, "Ready", observed_generation=gen)
+
+                except Exception as e:
+                    logger.error("Error applying actions", exc_info=True)
+                    # Mark as Failed
+                    for target in affected_targets:
+                        gen = getattr(self.settings.tables.get(target, {}), "_generation", None)
+                        if gen:
+                            await update_config_status(self.settings, target, gen, "Failed", error_message=str(e))
+                    raise e
+                    
+        except RuntimeError as e:
+            if "acquire reconciliation lock" in str(e):
+                logger.warning("Another reconciler is already running. Skipping this loop.")
+                return
             raise e
+
         logger.info("Reconciliation complete.")

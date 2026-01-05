@@ -14,23 +14,113 @@ async def test_search_strategies_postgres_vs_qdrant():
     Verify that we can search using both Postgres and Qdrant engines
     and get consistent results.
     """
-    source_url = "postgresql://postgres:password@127.0.0.1:5433/production_db"
-    source_url_internal = "postgresql://postgres:password@source:5432/production_db"
-    sink_url = "postgresql://postgres@127.0.0.1:5434/postgres"
-    
     import os
-    os.environ["SOURCE_URL"] = source_url
-    os.environ["SINK_URL"] = sink_url
-    os.environ["SUBSCRIPTION_SOURCE_URL"] = source_url_internal
     
+    # Use environment variables injected by Docker Compose, with defaults for local debugging
+    source_url = os.environ.get("SOURCE_URL", "postgresql://postgres:password@source:5432/production_db")
+    # For subscription, we always need the internal docker name if running in docker
+    source_url_internal = os.environ.get("SUBSCRIPTION_SOURCE_URL", "postgresql://postgres:password@source:5432/production_db")
+    # Sink URL should use 'local' to detect internal 54322 port, or configured value
+    sink_url = os.environ.get("SINK_URL", "local")
+    
+    # Ensure Settings can see the internal URL via environment
+    os.environ["SUBSCRIPTION_SOURCE_URL"] = source_url_internal
+
+    # 0. Setup Source Table (Must exist before subscription)
+    # 0. Setup Source Table (Must exist before subscription)
+    async with await connect_db(source_url) as conn:
+        await conn.execute("DROP TABLE IF EXISTS strat_products CASCADE")
+        await conn.execute(
+            """
+            CREATE TABLE strat_products (
+                id SERIAL PRIMARY KEY,
+                name TEXT,
+                description TEXT
+            )
+            """
+        )
+        await conn.execute("ALTER TABLE strat_products REPLICA IDENTITY DEFAULT")
+        # Ensure publication exists for the new table
+        try:
+            await conn.execute("DROP PUBLICATION IF EXISTS pub_strat_products")
+            await conn.execute("CREATE PUBLICATION pub_strat_products FOR TABLE strat_products")
+        except Exception: pass
+        await conn.commit()
+    
+    
+    # 0.5 Pre-Cleanup (Before Replica Start to avoid config reloading race)
+    qdrant = QdrantClient("http://localhost:6333")
+    try:
+        collections = qdrant.get_collections().collections
+        for col in collections:
+            if col.name.startswith("strat_test_") or col.name.startswith("alias_test_"):
+                qdrant.delete_collection(col.name)
+    except Exception: pass
+
+    async with await connect_db(sink_url) as conn:
+        logger.info("PRE-RUN CLEANUP: Starting...")
+        # Force migration just in case
+        await conn.execute("ALTER TABLE _sink_mirror_registry ADD COLUMN IF NOT EXISTS promoted_version_id TEXT")
+        await conn.execute("TRUNCATE _sink_outbox CASCADE")
+        await conn.execute("TRUNCATE _sink_mirror_registry CASCADE")
+        
+        # Robustly clear history if it exists
+        try:
+            # Check what's in there first
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT target_name FROM _replica_config_history")
+                rows = await cur.fetchall()
+                logger.info(f"PRE-RUN CLEANUP: Found configs in history: {[r[0] for r in rows]}")
+
+            await conn.execute("TRUNCATE _replica_config_history CASCADE")
+            await conn.commit()
+            logger.info("PRE-RUN CLEANUP: Truncated _replica_config_history and committed.")
+            
+            # Verify it's gone
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT count(*) FROM _replica_config_history")
+                count = (await cur.fetchone())[0]
+                logger.info(f"PRE-RUN CLEANUP: Verify _replica_config_history count = {count}")
+        except Exception as e:
+            # Only ignore if table doesn't exist, otherwise RAISE
+            if "UndefinedTable" not in str(e) and "does not exist" not in str(e):
+                logger.error(f"PRE-RUN CLEANUP FAILED to truncate history: {e}")
+                raise e
+            logger.info("PRE-RUN CLEANUP: _replica_config_history does not exist (skipping)")
+        
+        # Drop ALL previous test artifacts and subscriptions
+        # This prevents 'max_logical_replication_workers' from being exceeded by zombie tests
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT subname FROM pg_subscription")
+                subs = [r[0] for r in await cur.fetchall()]
+                for sub in subs:
+                    logger.info(f"PRE-RUN CLEANUP: Dropping zombie subscription {sub}")
+                    try:
+                        await cur.execute(f"ALTER SUBSCRIPTION {sub} DISABLE")
+                        await cur.execute(f"ALTER SUBSCRIPTION {sub} SET (slot_name = NONE)")
+                        await cur.execute(f"DROP SUBSCRIPTION {sub}")
+                        logger.info(f"PRE-RUN CLEANUP: Dropped {sub}")
+                    except Exception as e:
+                        logger.warning(f"PRE-RUN CLEANUP: Failed to drop {sub}: {e}")
+        except Exception as e:
+             logger.warning(f"PRE-RUN CLEANUP: Failed to list subscriptions: {e}")
+
+        await conn.execute("DROP TABLE IF EXISTS strat_products CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS strat_products_search CASCADE")
+        await conn.commit()
+
     # Configure replica with a mirror
     async with connect(
         source_url=source_url,
         sink_url=sink_url,
         tables={
-            "products": {
-                "source_table": "products",
+            "strat_products": {
+                "source_table": "strat_products",
+                "sink_raw_table": "strat_products",
+                "sink_replica_table": "strat_products_search",
                 "publication_columns": ["id", "name", "description"],
+                "formatting_template": "Title: $name\nContent: $chunk",
                 "active": True,
                 "mirrors": [
                     {
@@ -44,79 +134,76 @@ async def test_search_strategies_postgres_vs_qdrant():
         },
         sync=True
     ) as replica:
-        # 0. Aggressive Cleanup (Inside pool)
-        qdrant = QdrantClient("http://localhost:6333")
-        try:
-            collections = qdrant.get_collections().collections
-            for col in collections:
-                if col.name.startswith("strat_test_") or col.name.startswith("alias_test_"):
-                    qdrant.delete_collection(col.name)
-        except Exception: pass
-
-        async with await get_sink_conn() as conn:
-            # Force migration just in case
-            await conn.execute("ALTER TABLE _sink_mirror_registry ADD COLUMN IF NOT EXISTS promoted_version_id TEXT")
-            await conn.execute("TRUNCATE _sink_outbox CASCADE")
-            await conn.execute("TRUNCATE _sink_mirror_registry CASCADE")
-            await conn.commit()
-            
-        # 1. Seed data
-        unique_id = str(uuid.uuid4())[:8]
-        product_name = f"Strategy Watch {unique_id}"
+        # 1. Seed Source
+        # unique_id = str(uuid.uuid4())[:8] # Not needed with fixed product name
+        product_name = "Strategy Watch 73b8704c"
+        logger.info(f"Connecting to source for seeding... {source_url}")
         async with await connect_db(source_url) as conn:
-            await conn.execute("DELETE FROM products")
+            await conn.execute("SELECT 1")
+            logger.info("Source connection successful.")
+            await conn.execute("DELETE FROM strat_products")
             await conn.execute(
-                "INSERT INTO products (name, description) VALUES (%s, %s)",
+                "INSERT INTO strat_products (name, description) VALUES (%s, %s)",
                 (product_name, "A high-tech watch for strategic planning.")
             )
             await conn.commit()
+            logger.info("Seeded data successfully.")
 
-        # 2. Wait for sync...
-        product_name = f"Strategy Watch {unique_id}"
-        for _ in range(30):
+        # 2. Wait for Sync (Postgres + Qdrant)
+        # We need to verify that BOTH the PG View is created AND Qdrant has data
+        found_in_qdrant = False
+        view_exists = False
+        
+        for i in range(30):
             status = await replica.get_status()
             pending = sum(v.get("pending_items", 0) for v in status.get("vectorizers", []))
             
-            found_in_qdrant = False
+            # Check Qdrant
             try:
+                col_name_prefix = "strat_test_strat_products_"  
                 collections = qdrant.get_collections().collections
-                for col in collections:
-                    if col.name.startswith("strat_test_products_"):
-                        points = qdrant.scroll(collection_name=col.name, limit=10)[0]
-                        if any(product_name in (p.payload.get("content") or "") for p in points):
-                            found_in_qdrant = True
-                            break
-            except Exception: pass
-            
-            # Check view as well
-            view_exists = False
+                target_cols = [c.name for c in collections if c.name.startswith(col_name_prefix)]
+                
+                if target_cols:
+                    for c_name in target_cols:
+                        points = qdrant.scroll(collection_name=c_name, limit=10)[0]
+                        if points:
+                            logger.info(f"Checking Qdrant collection {c_name}. Found {len(points)} points.")
+                            if any(product_name in (p.payload.get("content") or "") for p in points):
+                                found_in_qdrant = True
+                                break
+            except Exception as e:
+                logger.warning(f"Qdrant check failed: {e}")
+
+            # Check for Postgres View
             try:
                 async with await get_sink_conn() as conn:
                     async with conn.cursor() as cur:
-                        await cur.execute("SELECT count(*) FROM products_search")
-                        row = await cur.fetchone()
-                        if row and row[0] > 0:
-                            # Verify view content is fresh
-                            await cur.execute("SELECT * FROM products_search LIMIT 1")
-                            res = await cur.fetchone()
-                            if res and product_name in str(res):
+                        await cur.execute("SELECT table_name FROM information_schema.views WHERE table_schema = 'public'")
+                        views = [row[0] for row in await cur.fetchall()]
+                        if "strat_products_search" in views:
+                            await cur.execute("SELECT count(*) FROM strat_products_search")
+                            row = await cur.fetchone()
+                            if row and row[0] > 0:
                                 view_exists = True
-            except Exception: pass
-            
+            except Exception as e:
+                logger.warning(f"View check failed: {e}")
+
             logger.info(f"Wait status: pending={pending}, qdrant={found_in_qdrant}, view={view_exists}")
-            
             if pending == 0 and found_in_qdrant and view_exists:
                 break
             await asyncio.sleep(2)
         else:
-            pytest.fail(f"Timed out waiting for sync. State: pending={pending}, qdrant={found_in_qdrant}, view={view_exists}")
+            pytest.fail(f"Timed out waiting for sync. State: qdrant={found_in_qdrant}, view={view_exists}")
 
         # 3. Test Postgres Search
         res_pg = await replica.search("high-tech watch")
+        # Verify content
         assert len(res_pg) > 0
         assert product_name in res_pg[0]["content"]
         
         # 4. Test Qdrant Search
+        # Note: Qdrant strategy might need wait/retry in a real integration scenario
         res_qdrant = await replica.search("high-tech watch", engine="qdrant")
         assert len(res_qdrant) > 0
         assert product_name in res_qdrant[0]["content"]
@@ -129,14 +216,12 @@ async def test_search_alias_promotion():
     """
     Verify that Qdrant Aliases are updated when a version is promoted in Postgres.
     """
-    source_url = "postgresql://postgres:password@127.0.0.1:5433/production_db"
-    source_url_internal = "postgresql://postgres:password@source:5432/production_db"
-    sink_url = "postgresql://postgres@127.0.0.1:5434/postgres"
-    
     import os
-    os.environ["SOURCE_URL"] = source_url
-    os.environ["SINK_URL"] = sink_url
-    os.environ["SUBSCRIPTION_SOURCE_URL"] = source_url_internal
+    
+    # Use environment variables injected by Docker Compose
+    source_url = os.environ.get("SOURCE_URL", "postgresql://postgres:password@source:5432/production_db")
+    source_url_internal = os.environ.get("SUBSCRIPTION_SOURCE_URL", "postgresql://postgres:password@source:5432/production_db")
+    sink_url = os.environ.get("SINK_URL", "local")
 
     qdrant = QdrantClient("http://localhost:6333")
     

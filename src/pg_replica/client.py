@@ -20,9 +20,10 @@ class PGSearchReplica:
         """
         Initialize with optional configuration overrides.
         """
+        import copy
         # Isolate settings per instance and ensure validation runs
         self.settings = global_settings.__class__.model_validate(
-            {**global_settings.model_dump(), **kwargs}
+            {**copy.deepcopy(global_settings.model_dump()), **kwargs}
         )
         self._sync_mode = sync
         self._orchestrator: Optional[Orchestrator] = None

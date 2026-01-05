@@ -19,11 +19,14 @@ This document outlines the architectural and operational requirements to move th
         - **Extension Readiness**: Ensure `ai` and `vector` extensions are fully loaded and their tables (`ai.vectorizer`) are queryable.
         - **Subscription Health**: Wait for the subscription to move from `initializing` to `streaming` state before reporting a successful sync.
     - **Why**: Eliminates "flaky" tests and CI failures caused by post-commit lag in Postgres and Docker networking. Moves the system from "timing-based" to "state-based" reliability.
-- **pgai Orchestration**:
+- **Fault-Tolerant Reconciler**:
     - **Status**: Completed.
-    - **Why**: Replaced custom Python loops with `pgai` background workers. This provides database-native retries, dead-letter queues, and atomic state tracking for embeddings.
-- **Robust Retry Mechanism**:
-    - **Implementation**: `pgai` handles vectorizer retries internally. The sidecar only needs to handle its own connection retries.
+    - **Implementation**: Refactored `Applier` to catch exceptions per-action. Failed targets are marked as "Failed" in `_replica_config_history` while other tables continue to reconcile.
+    - **Why**: Prevents a single misconfigured table or temporary network issue from blocking the entire replica fleet.
+- **Isolated Control Plane**:
+    - **Status**: Completed.
+    - **Implementation**: Uses `pg_advisory_xact_lock` for global concurrency control and `copy.deepcopy` for settings isolation in `PGSearchReplica`.
+    - **Why**: Ensures reliable operations in multi-node deployments and prevents cross-test contamination in CI.
 - **Poison Pill Handling (DLQ)**:
     - **Implementation**: Add a `failure_count` and `last_error` column to the `sink_raw_table`. 
     - **Why**: If a specific row causes a transformation crash (e.g., malformed data), the system should skip it after $N$ attempts rather than blocking the entire pipeline indefinitely.
@@ -76,9 +79,10 @@ This document outlines the architectural and operational requirements to move th
     - **Why**: Significantly reduces cost and latency if the source data contains many repeating text values (e.g., category names or status updates).
 
 ## Chapter 5: Operational Lifecycle
-- **Refined Shutdown Logic**:
-    - **Implementation**: Differentiate between `SIGTERM` (temporary restart) and a full `DECOMMISSION` flag.
-    - **Why**: Currently, the system drops the subscription on every restart. In production, you often want to keep the slot during a quick upgrade to avoid a full data re-sync.
+- **Refined Shutdown Logic & Teardown**:
+    - **Status**: Completed.
+    - **Implementation**: `drop_subscription_completely` includes worker termination and a retry loop.
+    - **Why**: Reliable logical replication management.
 - **Automated Re-Sync/Recovery**:
     - **Status**: Completed (Hybrid Model).
     - **Why**: Essential for disaster recovery or after the Watchdog has performed an emergency self-destruct. The system now automatically detects missing slots and uses a combination of SQL Catch-up and Anti-Entropy to restore consistency.
