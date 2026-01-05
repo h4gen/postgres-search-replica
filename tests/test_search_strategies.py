@@ -175,6 +175,20 @@ async def test_search_strategies_postgres_vs_qdrant():
             except Exception as e:
                 logger.warning(f"Qdrant check failed: {e}")
 
+            # Check for Postgres View
+            try:
+                async with await get_sink_conn() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute("SELECT table_name FROM information_schema.views WHERE table_schema = 'public'")
+                        views = [row[0] for row in await cur.fetchall()]
+                        if "strat_products_search" in views:
+                            await cur.execute("SELECT count(*) FROM strat_products_search")
+                            row = await cur.fetchone()
+                            if row and row[0] > 0:
+                                view_exists = True
+            except Exception as e:
+                logger.warning(f"View check failed: {e}")
+
             logger.info(f"Wait status: pending={pending}, qdrant={found_in_qdrant}, view={view_exists}")
             if pending == 0 and found_in_qdrant and view_exists:
                 break
