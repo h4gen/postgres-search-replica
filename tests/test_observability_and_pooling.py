@@ -17,29 +17,55 @@ from pg_replica.database import (
 from pg_replica.config import settings
 from pythonjsonlogger.json import JsonFormatter
 
+from httpx import AsyncClient, ASGITransport
+
 # --- Observability and Pooling Tests ---
 
-client = TestClient(app)
 
-
-def test_observability_health_endpoint():
+@pytest.mark.asyncio
+async def test_observability_health_endpoint():
     """Verify the /health endpoint returns 200 OK."""
-    response = client.get("/health")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        response = await ac.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
 
-def test_observability_metrics_endpoint():
+@pytest.mark.asyncio
+async def test_observability_metrics_endpoint():
     """Verify the /metrics endpoint returns Prometheus format metrics."""
     # Seed some metrics
     update_replication_lag("test_table", 123.45)
     update_pgai_pending("test_table", 10)
 
-    response = client.get("/metrics")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        response = await ac.get("/metrics")
     assert response.status_code == 200
     content = response.text
     assert 'replication_lag_mb{table="test_table"} 123.45' in content
     assert 'pgai_pending_items{table="test_table"} 10.0' in content
+
+
+@pytest.mark.asyncio
+async def test_control_plane_summary_endpoint():
+    """Verify the /control-plane/summary endpoint returns valid infrastructure state."""
+    # Ensure pools are initialized for the background db calls
+    from pg_replica.database import init_pools, close_pools
+    await init_pools(settings)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            response = await ac.get("/control-plane/summary")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert "pipeline" in data
+        assert "source" in data["pipeline"]
+        assert "vectorizers" in data["pipeline"]
+        assert "mirrors" in data["pipeline"]
+        assert "projections" in data
+        assert "config_summaries" in data
+    finally:
+        await close_pools()
 
 
 # --- Connection Pool Tests ---

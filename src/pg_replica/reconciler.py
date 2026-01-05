@@ -23,6 +23,9 @@ from .database import (
     get_vectorizer_statuses,
     ensure_outbox_infrastructure,
     setup_outbox_trigger,
+    log_experiment_start,
+    log_experiment_finish,
+    audit_pipeline_failures,
 )
 
 logger = logging.getLogger(__name__)
@@ -544,6 +547,7 @@ class Applier:
                 await setup_sink(self.settings, config, target_name, vectorizer_target=vectorizer_target)
                 await warm_up_from_cache(self.settings, config, raw_table, vectorizer_target)
                 await setup_outbox_trigger(self.settings, target_name, vectorizer_target, config)
+                await log_experiment_start(self.settings, target_name, version_id)
 
             elif action.type == ActionType.SINK_OUTBOX_SETUP:
                 if not target_name:
@@ -565,6 +569,7 @@ class Applier:
                     target_table=config.sink_raw_table,
                     vectorizer_target=f"{config.sink_raw_table}_store_v{action.params['version_id']}",
                 )
+                await log_experiment_finish(self.settings, target_name, action.params["version_id"])
 
             elif action.type == ActionType.SINK_RECOVERY:
                 lsn = await create_placeholder_slot(self.settings, target_name)
@@ -594,6 +599,9 @@ class Reconciler:
         # 1. Discovery
         source_state = await self.inspector.get_source_state()
         sink_state = await self.inspector.get_sink_state()
+        
+        # 1.5 Audit failures (sync from pgai)
+        await audit_pipeline_failures(self.settings)
 
         # 2. Planning
         actions = self.planner.plan(source_state, sink_state)

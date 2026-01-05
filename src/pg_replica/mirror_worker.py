@@ -83,24 +83,46 @@ class MirrorWorker:
 
                     # 3. Dispatch to adapter
                     logger.info(f"MirrorWorker for {mirror_id}/{target_name} found {len(rows)} entries (last_id={last_id})")
+                    import time
+                    start_time = time.time()
                     try:
                         await adapter.sync_batch(entries)
+                        latency_ms = int((time.time() - start_time) * 1000)
                         
-                        # Update registry for sync progress
+                        # Update registry for sync progress + latency
                         new_last_id = entries[-1].id
                         await cur.execute(
                             """
-                            INSERT INTO _sink_mirror_registry (mirror_id, target_name, last_processed_id, updated_at)
-                            VALUES (%s, %s, %s, NOW())
+                            INSERT INTO _sink_mirror_registry (mirror_id, target_name, last_processed_id, last_sync_latency_ms, error_count, updated_at)
+                            VALUES (%s, %s, %s, %s, 0, NOW())
                             ON CONFLICT (mirror_id, target_name) 
-                            DO UPDATE SET last_processed_id = EXCLUDED.last_processed_id, updated_at = NOW()
+                            DO UPDATE SET 
+                                last_processed_id = EXCLUDED.last_processed_id, 
+                                last_sync_latency_ms = EXCLUDED.last_sync_latency_ms,
+                                error_count = 0,
+                                updated_at = NOW()
                             """,
-                            (mirror_id, target_name, new_last_id)
+                            (mirror_id, target_name, new_last_id, latency_ms)
                         )
                         await conn.commit()
                     except Exception as e:
                         await conn.rollback()
-                        logger.error(f"Failed to sync batch to mirror {mirror_id}: {e}")
+                        error_msg = str(e)
+                        logger.error(f"Failed to sync batch to mirror {mirror_id}: {error_msg}")
+                        # Record error in registry
+                        await cur.execute(
+                            """
+                            INSERT INTO _sink_mirror_registry (mirror_id, target_name, error_count, last_error, updated_at)
+                            VALUES (%s, %s, 1, %s, NOW())
+                            ON CONFLICT (mirror_id, target_name) 
+                            DO UPDATE SET 
+                                error_count = _sink_mirror_registry.error_count + 1,
+                                last_error = EXCLUDED.last_error,
+                                updated_at = NOW()
+                            """,
+                            (mirror_id, target_name, error_msg)
+                        )
+                        await conn.commit()
                         return # Stop processing this mirror if sync fails
 
                 # 4. Check for Version Promotion in Postgres (even if no new rows)
@@ -128,7 +150,12 @@ class MirrorWorker:
 
                         if promoted_version != last_mirrored_version:
                             logger.info(f"Promoting mirror {mirror_id} for {target_name} to version {promoted_version}...")
-                            await adapter.update_alias(target_name, promoted_version)
+                            
+                            # Use configured dimension to avoid 404s if collection doesn't exist yet
+                            config = self.settings.tables.get(target_name)
+                            vector_size = config.embedding_dimension if config else 768
+                            
+                            await adapter.update_alias(target_name, promoted_version, vector_size=vector_size)
                             await cur.execute(
                                 """
                                 INSERT INTO _sink_mirror_registry (mirror_id, target_name, promoted_version_id, updated_at)
