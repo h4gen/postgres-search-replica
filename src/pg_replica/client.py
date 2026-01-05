@@ -66,7 +66,7 @@ class PGSearchReplica:
         return self._conn
 
     async def search(
-        self, query: str, limit: int = 5, table: Optional[str] = None
+        self, query: str, limit: int = 5, table: Optional[str] = None, engine: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
         Perform a semantic or hybrid search.
@@ -75,6 +75,8 @@ class PGSearchReplica:
             query: The text to search for.
             limit: Number of results to return.
             table: The name of the table configuration to use.
+            engine: The search engine to use (postgres, qdrant, pinecone). 
+                    Defaults to the one in TableConfig.
         """
         if not self.settings.tables:
             raise RuntimeError("No tables configured for search.")
@@ -84,7 +86,7 @@ class PGSearchReplica:
             raise ValueError(f"Table configuration '{target_name}' not found.")
         
         config = self.settings.tables[target_name]
-        replica_table = config.sink_replica_table
+        search_engine = engine or config.search_engine
 
         # 1. Get embedding in Python
         ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
@@ -92,57 +94,25 @@ class PGSearchReplica:
         res = await client.embeddings(model=config.embedding_model, prompt=query)
         embedding = res["embedding"]
 
-        # 2. Search query logic
-        conn = await self._get_conn()
-        async with conn.cursor(row_factory=dict_row) as cur:
-            if config.search_profile == "hybrid":
-                # HYBRID SEARCH (RRF): Vector + Full-Text
-                sql = f"""
-                    WITH ranked AS (
-                        SELECT 
-                            {config.id_column}, 
-                            {config.target_content_column},
-                            row_number() OVER (ORDER BY {config.embedding_column} <=> %s) as vector_rank,
-                            row_number() OVER (ORDER BY ts_rank(ts_col, websearch_to_tsquery('english', %s)) DESC) as text_rank
-                        FROM {replica_table}
-                    )
-                    SELECT 
-                        {config.id_column}, 
-                        {config.target_content_column},
-                        (1.0 / (60 + vector_rank) + 1.0 / (60 + text_rank)) as score
-                    FROM ranked
-                    ORDER BY score DESC
-                    LIMIT %s
-                """
-                logger.debug(f"Executing Hybrid RRF search on {replica_table}")
-                await cur.execute(sql, (embedding, query, limit))
-            else:
-                # VECTOR SEARCH ONLY
-                sql = f"""
-                    SELECT 
-                        {config.id_column}, 
-                        {config.target_content_column},
-                        {config.embedding_column} <=> %s::vector as distance
-                    FROM {replica_table}
-                    ORDER BY distance ASC
-                    LIMIT %s
-                """
-                logger.debug(f"Executing Vector search on {replica_table}")
-                await cur.execute(sql, (embedding, limit))
-
-            rows = await cur.fetchall()
-            results = []
-            for row in rows:
-                item = {
-                    "id": row[config.id_column],
-                    "content": row[config.target_content_column],
-                }
-                if "score" in row:
-                    item["score"] = float(row["score"])
-                else:
-                    item["distance"] = float(row["distance"])
-                results.append(item)
-            return results
+        # 2. Execute via strategy
+        from .strategies import PostgresSearchStrategy, QdrantSearchStrategy
+        
+        strategies = {
+            "postgres": PostgresSearchStrategy(),
+            "qdrant": QdrantSearchStrategy(),
+        }
+        
+        strategy = strategies.get(search_engine)
+        if not strategy:
+            raise ValueError(f"Unsupported search engine: {search_engine}")
+            
+        return await strategy.search(
+            query=query,
+            embedding=embedding,
+            limit=limit,
+            config=config,
+            conn_provider=self._get_conn
+        )
 
     async def get_status(self) -> dict[str, Any]:
         """Get current status for all configured tables."""

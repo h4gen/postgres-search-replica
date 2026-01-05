@@ -122,9 +122,33 @@ from pg_replica import connect
 async def search_example():
     # Safe-by-default: sync=False prevents starting redundant workers or local PG
     async with connect(sink_url="postgresql://localhost:54322/postgres") as replica:
+        # Default engine (configured or postgres)
         results = await replica.search("AI research")
+        
+        # Explicitly target Qdrant
+        results_q = await replica.search("AI research", engine="qdrant")
+        
         for res in results:
             print(f"Content: {res['content']}, Distance: {res['distance']}")
+```
+
+### Unified Search API
+The client supports different search backends via the **Strategy Pattern**. This allows you to leverage specialized vector engines like Qdrant while maintaining a consistent application interface.
+
+```python
+# Configure a table to use Qdrant by default
+replica = connect(
+    tables={
+        "products": {
+            "source_table": "products",
+            "search_engine": "qdrant",
+            "mirrors": [{"id": "m1", "type": "qdrant", "url": "http://localhost:6333"}]
+        }
+    }
+)
+
+# This query executes directly against Qdrant!
+res = await replica.search("high-tech accessories")
 ```
 
 ## Key Features
@@ -144,7 +168,9 @@ async def search_example():
 - **Zero-Downtime Blue-Green Swaps**: Orchestrates versioned search indices. It builds new versions (e.g. `v2` with a different model) in the background and only promotes them to the live search view when 100% of rows are vectorized.
 - **Zero-Touch Config**: Automatically synchronizes publication columns and filters from Python settings to the database on startup.
 - **Multicast CDC Bridge**: Transactionally capture embeddings and sync them to external vector databases with persistent state tracking and retry logic.
+- **Unified Search Interface (Strategy Pattern)**: Switch between `postgres` and `qdrant` search engines dynamically with a single line of code, ensuring cross-engine result consistency.
 - **Cross-Engine Consistency (Mirror Handshake)**: Guarantees that external search engines are 100% caught up before Postgres version promotion.
+- **Atomic Mirror Aliases**: Automatically synchronizes downstream search engine aliases (e.g., Qdrant "production" alias) during Postgres view swaps, ensuring zero-downtime infrastructure migratons.
  
 ## Declarative Blue-Green Swaps
 
@@ -187,6 +213,7 @@ All settings can be configured via environment variables (e.g., `SOURCE_URL`) or
 | `ID_COLUMN` | `str` | `id` | The Primary Key column (must be numeric, UUID, or TEXT). |
 | `CONTENT_COLUMN` | `str` | `description` | The source column that will be chunked and vectorized. |
 | `TARGET_CONTENT_COLUMN` | `str` | `transformed_description`| The name of the text column in the final search View. |
+| `SEARCH_ENGINE` | `str` | `postgres` | The default engine to use for queries (`postgres` or `qdrant`). |
 | `ACTIVE` | `bool` | `True` | Declarative state. If `False`, the version will be built but not promoted to the live View. |
 
 ### 3. Replication & CDC Settings

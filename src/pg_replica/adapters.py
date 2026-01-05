@@ -22,6 +22,11 @@ class SinkAdapter(abc.ABC):
         """Sync a batch of entries to the destination."""
         pass
 
+    @abc.abstractmethod
+    async def update_alias(self, target_name: str, version_id: str):
+        """Update the 'production' alias to point to the specific versioned index."""
+        pass
+
 class QdrantSinkAdapter(SinkAdapter):
     def __init__(self, url: str, collection_prefix: str = ""):
         self.client = QdrantClient(url)
@@ -111,3 +116,51 @@ class QdrantSinkAdapter(SinkAdapter):
                 )
 
         logger.info(f"Synced {len(entries)} entries to Qdrant")
+
+    async def update_alias(self, target_name: str, version_id: str):
+        alias_name = f"{self.collection_prefix}{target_name}_production"
+        collection_name = self._get_collection_name(target_name, version_id)
+        
+        logger.info(f"Updating Qdrant alias {alias_name} -> {collection_name}")
+        
+        try:
+            # Qdrant aliases are updated via operations. 
+            # We use an atomic swap: Delete (if exists) + Create.
+            
+            self.client.update_collection_aliases(
+                change_aliases_operations=[
+                    models.DeleteAliasOperation(
+                        delete_alias=models.DeleteAlias(
+                            alias_name=alias_name
+                        )
+                    ),
+                    models.CreateAliasOperation(
+                        create_alias=models.CreateAlias(
+                            collection_name=collection_name,
+                            alias_name=alias_name
+                        )
+                    )
+                ]
+            )
+            logger.info(f"Successfully updated Qdrant alias {alias_name}")
+        except Exception as e:
+            # If Delete failed because it didn't exist, try just Create
+            if "not found" in str(e).lower():
+                try:
+                    self.client.update_collection_aliases(
+                        change_aliases_operations=[
+                            models.CreateAliasOperation(
+                                create_alias=models.CreateAlias(
+                                    collection_name=collection_name,
+                                    alias_name=alias_name
+                                )
+                            )
+                        ]
+                    )
+                    logger.info(f"Successfully created initial Qdrant alias {alias_name}")
+                    return
+                except Exception as inner_e:
+                    logger.error(f"Failed to create initial Qdrant alias {alias_name}: {inner_e}")
+                    raise inner_e
+            logger.error(f"Failed to update Qdrant alias {alias_name}: {e}")
+            raise e

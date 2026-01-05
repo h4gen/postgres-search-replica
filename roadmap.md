@@ -103,6 +103,7 @@ This document outlines the architectural and operational requirements to move th
         - **Atomic Promotion**: Use downstream-native **Aliases** to flip the "Production" pointer to the new collection once synced.
     - **Sink-Aware Client (Strategy Pattern)**:
         - **Implementation**: Update `PGSearchReplica.search()` to optionally target a configured downstream sink instead of Postgres SQL.
+        - **Status**: Completed
         - **Why**: Allows swapping the underlying search infrastructure (e.g., from PG to Qdrant) with zero application code changes.
     - **Mirror Sync Handshake (Blue-Green Consistency)**:
         - **Implementation**: Ensure mirrors are 100% caught up before the Reconciler promotes a search view in Postgres. (**Status: Completed**)
@@ -170,6 +171,7 @@ This document outlines the architectural and operational requirements to move th
     - **Why**: Facilitates qualitative "vibe checks" for human evaluators to understand the behavioral shift of a new model.
 - **Downstream Atomic Promotion (Aliases)**:
     - **Implementation**: Extend the Blue-Green swap logic to external sinks. Use target-native "Aliases" (e.g., Qdrant Aliases) to flip the "Live" pointer from `v1_collection` to `v2_collection` downstream once synced.
+    - **Status**: Completed
     - **Why**: Provides zero-downtime infrastructure swaps for external search engines, mirroring the internal Postgres view-swap behavior.
 
 ### Retrieval Capabilities

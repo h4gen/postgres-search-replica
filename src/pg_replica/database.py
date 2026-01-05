@@ -491,11 +491,14 @@ async def ensure_outbox_infrastructure(settings: Settings):
                     mirror_id TEXT NOT NULL,
                     target_name TEXT NOT NULL,
                     last_processed_id BIGINT DEFAULT 0,
+                    promoted_version_id TEXT,
                     updated_at TIMESTAMP DEFAULT NOW(),
                     PRIMARY KEY (mirror_id, target_name)
                 )
                 """
             )
+            # Migration: Ensure promoted_version_id exists
+            await cur.execute("ALTER TABLE _sink_mirror_registry ADD COLUMN IF NOT EXISTS promoted_version_id TEXT")
 
 
 async def setup_outbox_trigger(
