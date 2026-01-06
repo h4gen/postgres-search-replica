@@ -49,3 +49,36 @@ If it passes locally but fails in CI:
 ---
 
 **Final Rule**: If you didn't see the Reconciler logs moving in your terminal, the test didn't happen.
+
+## 5. UI Contribution & The Benchmarking Protocol
+
+The **Search Engineer Workbench** is a decoupled client application. To maintain architectural purity, follow these strict rules:
+
+### The "Decoupling" Mandate
+- **UI is an Observer**: The UI only consumes data via the `/control-plane/*` endpoints in `observability.py`. 
+- **Zero Business Logic Touch**: Contributing to the UI **must not** involve modifying `database.py`, `reconciler.py`, or `orchestrator.py`. If you need more data, enrich the Observability API, not the core persistence layer.
+- **Industrial Aesthetic**: Use base Shadcn UI components. Avoid "flashy" styles like glassmorphism. Focus on information density, monospace fonts for data, and industrial utility.
+
+### The UI Development Flow
+
+Before running the heavy, infrastructure-dependent UI suite, perform rapid diagnostics:
+
+1.  **Scope Check**: Run `make check` to catch any Python import or syntax errors instantly.
+2.  **API Unit Tests**: Run `make test-obs` to verify the Observability API endpoints (`/health`, `/summary`, `/dry-run`) in isolation without Docker.
+3.  **UI Build**: Run `make ui-build` to ensure Next.js type-safety and build stability.
+
+Only after these pass should you proceed to develop or debug the UI using the local benchmarking target:
+```bash
+make test-ui
+```
+This command:
+1.  **Seeds Reality**: Runs `tests/ui_benchmark_data.py` to register persisted table configs in the Sink DB.
+2.  **Simulates Traffic**: Starts `tests/live_data_generator.py` in the background to perform continuous CRUD on the source. This drives live sparklines and lag metrics.
+3.  **Orchestrates**: Starts the Next.js dev server on port `3001`.
+
+### Verification via Browser Actions (For AI Agents)
+When verifying UI changes, you **must** use a browser subagent to:
+1.  **Confirm Reactivity**: Wait 10s and verify that "Sync Latency" or "LSN Position" values are updating. If they are static, the connection to the Observability API or the live generator is broken.
+2.  **Verify Progress Bars**: Ensure `pgai` statuses are visible and reporting percentage progress.
+3.  **Test the Lab**: Navigate to `/settings`, select a table, and perform a "Pre-flight Check" (Dry Run). Confirm the projection cards appear with RAM and Action estimates.
+4.  **Audit Aesthetic**: Ensure the UI looks like an industrial control plane (sharp edges, terminal-style logs, professional density).

@@ -7,16 +7,25 @@ export SINK_URL ?= postgresql://postgres@localhost:5434/postgres
 
 help:
 	@echo "Available commands:"
-	@echo "  make dev              - Start development containers"
+	@echo "  make dev              - Start development containers (Source, Sink, Qdrant, Ollama)"
+	@echo "  make ui               - Start the Workbench UI locally (Next.js dev server)"
+	@echo "  make ui-build         - Build the Workbench UI for production"
 	@echo "  make down             - Stop development containers"
 	@echo "  make wait-for-infra   - Wait for all services to be ready"
 	@echo "  make test             - Run all tests (unit + integration)"
 	@echo "  make test-unit        - Run only unit tests"
 	@echo "  make test-integration - Run only integration tests. Pass ARGS=\"...\" for scoped tests."
 	@echo "  make test-dev         - Start infra, wait, and run tests"
+	@echo "  make test-ui          - Start infra, seed mock data, and launch Workbench"
 	@echo "  make lint             - Run ruff linter and formatter check"
 	@echo "  make type-check       - Run ty type checker"
 	@echo "  make clean            - Remove volumes and temporary files"
+
+ui:
+	cd webapp && npm run dev
+
+ui-build:
+	cd webapp && npm run build
 
 dev: clean
 	docker compose -f dev/docker-compose.yml up --build -d
@@ -65,13 +74,28 @@ test-integration:
 
 test-dev: dev wait-for-infra test
 
+test-ui: dev wait-for-infra
+	uv sync --extra test
+	@echo "Seeding UI Benchmark data..."
+	PYTHONPATH=src uv run python tests/ui_benchmark_data.py
+	@echo "Starting Live Data Generator..."
+	PYTHONPATH=src uv run python tests/live_data_generator.py &
+	@echo "Starting Workbench UI..."
+	cd webapp && npm run dev
+
+test-obs:
+	PYTHONPATH=src uv run pytest tests/test_observability.py -v
+
 lint:
 	uv run ruff check src tests
+
+check: lint
+	@echo "Performing fast import check..."
+	@PYTHONPATH=src uv run python -c "from pg_replica.observability import app; from pg_replica.main import main; print('Import check passed!')"
 
 type-check:
 	PYTHONPATH=src uv run ty check src
 
 clean:
 	docker compose -f dev/docker-compose.yml down -v
-	rm -rf .pytest_cache .venv
 

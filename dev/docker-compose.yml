@@ -31,6 +31,8 @@ services:
       - ollama
     ports:
       - "5434:54322"
+      - "8000:8000"
+      - "3000:3000"
 
   ollama:
     image: ollama/ollama:latest

@@ -13,7 +13,7 @@ from .database import (
     init_pools,
     close_pools,
 )
-from .observability import update_replication_lag
+from .metrics import update_replication_lag
 from pgai.vectorizer.worker import Worker
 from .mirror_worker import MirrorWorker
 from .utils import wait_until

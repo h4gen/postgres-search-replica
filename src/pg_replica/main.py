@@ -2,8 +2,9 @@ import asyncio
 import logging
 import signal
 import sys
+import subprocess
 import uvicorn
-from typing import Callable
+from typing import Callable, Optional
 from pythonjsonlogger.json import JsonFormatter
 from .config import settings
 from .reconciler import Reconciler
@@ -14,11 +15,8 @@ from .database import (
     init_pools,
     close_pools,
 )
-from .observability import (
-    update_replication_lag,
-    update_pgai_pending,
-    app as observability_app,
-)
+from .observability import app as observability_app
+from .metrics import update_replication_lag, update_pgai_pending_items as update_pgai_pending
 from .utils import wait_until
 
 # Configure structured JSON logging
@@ -74,11 +72,55 @@ async def run_daemon(loop: asyncio.AbstractEventLoop, handle_exit: Callable[[], 
         raise
 
 
+async def _is_port_open(port: int) -> bool:
+    try:
+        _, writer = await asyncio.open_connection("localhost", port)
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except Exception:
+        return False
+
 async def main():
     loop = asyncio.get_running_loop()
+    
+    pg_process: Optional[subprocess.Popen] = None
+    if settings.sink_url == "local":
+        data_dir = settings.data_dir
+        if not (data_dir / "PG_VERSION").exists():
+            logger.info(f"Initializing new Postgres data directory at {data_dir}...")
+            data_dir.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["initdb", "-D", str(data_dir)], check=True, capture_output=True)
+            with open(data_dir / "pg_hba.conf", "a") as f:
+                f.write("\nhost all all all trust\n")
+
+        port = settings.local_port
+        logger.info(f"Starting local Postgres on port {port}...")
+        run_dir = settings.base_dir / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        pg_process = subprocess.Popen([
+            "postgres", "-D", str(data_dir), "-p", str(port), "-k", str(run_dir),
+            "-c", "max_connections=100", "-c", "shared_preload_libraries=vector", "-c", "listen_addresses=*"
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        
+        async def wait_for_pg():
+            for _ in range(30):
+                if await _is_port_open(port):
+                    try:
+                        async with await connect_db(settings.resolved_sink_url):
+                            return True
+                    except Exception: pass
+                await asyncio.sleep(1)
+            return False
+
+        if not await wait_for_pg():
+            logger.critical("Failed to start local Postgres")
+            return
+
     await init_pools(settings)
 
-    config = uvicorn.Config(observability_app, host=settings.observability_host, port=settings.observability_port, log_level="error")
+    config = uvicorn.Config(observability_app, host=settings.observability_host, port=settings.observability_port, log_level="info")
     server = uvicorn.Server(config)
     server_task = asyncio.create_task(server.serve())
 
@@ -114,9 +156,15 @@ async def main():
         logger.info("Daemon task cancelled.")
     finally:
         for name, config_obj in settings.tables.items():
-            await drop_subscription_completely(settings, config_obj, name)
+            try:
+                await drop_subscription_completely(settings, config_obj, name)
+            except Exception: pass
         await close_pools()
         await server_task
+        if pg_process:
+            logger.info("Stopping local Postgres...")
+            pg_process.terminate()
+            pg_process.wait(timeout=10)
 
 
 if __name__ == "__main__":
