@@ -39,9 +39,14 @@ class MirrorWorker:
 
     async def _process_all_mirrors(self):
         # We process mirrors defined in ALL table configs
-        for target_name, config in self.settings.tables.items():
-            for mirror_cfg in config.mirrors:
-                await self._process_mirror(target_name, mirror_cfg)
+        for target_name, config in self.settings.pipelines.items():
+            for mirror_cfg in config.storage.mirrors:
+                # MirrorConfig is now an object, we need to convert to dict for legacy adapter code
+                # or update _process_mirror to handle objects.
+                # Let's check _process_mirror signature: it expects Dict[str, Any].
+                # So we verify if config.storage.mirrors is List[MirrorConfig] or List[Dict].
+                # It is List[MirrorConfig]. So we should use mirror_cfg.model_dump().
+                await self._process_mirror(target_name, mirror_cfg.model_dump())
 
     async def _process_mirror(self, target_name: str, mirror_cfg: Dict[str, Any]):
         mirror_id = mirror_cfg.get("id")
@@ -134,7 +139,7 @@ class MirrorWorker:
                         (sub_name,)
                     )
                     state_row = await cur.fetchone()
-                    if state_row:
+                    if state_row and state_row[0]:
                         current_hash = state_row[0]
                         promoted_version = current_hash[:8]
                         logger.debug(f"Found promoted hash {current_hash} (version {promoted_version}) for {sub_name}")
@@ -152,8 +157,9 @@ class MirrorWorker:
                             logger.info(f"Promoting mirror {mirror_id} for {target_name} to version {promoted_version}...")
                             
                             # Use configured dimension to avoid 404s if collection doesn't exist yet
-                            config = self.settings.tables.get(target_name)
-                            vector_size = config.embedding_dimension if config else 768
+                            # Use configured dimension to avoid 404s if collection doesn't exist yet
+                            config = self.settings.pipelines.get(target_name)
+                            vector_size = config.pipeline.embedding.dimension if config else 768
                             
                             await adapter.update_alias(target_name, promoted_version, vector_size=vector_size)
                             await cur.execute(

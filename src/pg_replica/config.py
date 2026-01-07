@@ -46,7 +46,7 @@ class TableConfig(BaseModel):
     # Column Mapping
     id_column: str = "id"
     content_column: str = "description"
-    target_content_column: str = "transformed_description"
+    target_content_column: str = "chunk"
     embedding_column: str = "embedding"
     
     # Search & Transformation
@@ -85,6 +85,7 @@ class TableConfig(BaseModel):
 
 
 from pydantic import model_validator
+from .config_v2 import SearchPipeline
 
 class Settings(BaseSettings):
     source_url: str
@@ -95,18 +96,18 @@ class Settings(BaseSettings):
     source_managed_by_admin: bool = False
 
     # Multi-Table Configuration
-    tables: Dict[str, TableConfig] = Field(default_factory=dict)
+    pipelines: Dict[str, SearchPipeline] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def validate_tables(self) -> "Settings":
-        # Ensure all tables are TableConfig objects
-        new_tables = {}
-        for k, v in self.tables.items():
+    def validate_pipelines(self) -> "Settings":
+        # Ensure all pipelines are SearchPipeline objects
+        new_pipelines = {}
+        for k, v in self.pipelines.items():
             if isinstance(v, dict):
-                new_tables[k] = TableConfig(**v)
+                new_pipelines[k] = SearchPipeline(**v)
             else:
-                new_tables[k] = v
-        self.tables = new_tables
+                new_pipelines[k] = v
+        self.pipelines = new_pipelines
         return self
 
     # Storage paths for local mode
@@ -148,6 +149,8 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+    
+
 
 
 settings = Settings()  # type: ignore[call-arg]

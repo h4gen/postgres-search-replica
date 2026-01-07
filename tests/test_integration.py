@@ -12,7 +12,7 @@ async def wait_for_pgai_sync(settings, target_name, expected_count=1, timeout=12
     import logging
     logger = logging.getLogger(__name__)
     start_time = time.time()
-    config = settings.tables[target_name]
+    config = settings.pipelines[target_name]
     embedding_table = None
 
     logger.info(f"Waiting for {expected_count} embeddings for target '{target_name}'...")
@@ -22,13 +22,13 @@ async def wait_for_pgai_sync(settings, target_name, expected_count=1, timeout=12
                 try:
                     await cur.execute(
                         "SELECT table_name FROM information_schema.view_table_usage WHERE view_name = %s AND (table_name LIKE '%%_store_v%%' OR table_name LIKE '%%_embedding%%') LIMIT 1",
-                        (config.sink_replica_table,),
+                        (f"{config.ingest.table}_search",),
                     )
                     row = await cur.fetchone()
                     if row: embedding_table = row[0]
                 except Exception: pass
 
-                current_table = embedding_table or f"{config.sink_raw_table}_store_v{config.get_version_id()}"
+                current_table = embedding_table or f"{config.ingest.table}_store_v{config.get_version_id()}"
 
                 try:
                     await cur.execute("SELECT source_table, pending_items FROM ai.vectorizer_status")
@@ -37,7 +37,7 @@ async def wait_for_pgai_sync(settings, target_name, expected_count=1, timeout=12
                 except Exception: pass
 
                 try:
-                    await cur.execute(f"SELECT count(*) FROM {current_table} WHERE {config.embedding_column} IS NOT NULL")
+                    await cur.execute(f"SELECT count(*) FROM {current_table} WHERE {config.pipeline.content_column} IS NOT NULL")
                     count = (await cur.fetchone())[0]
                     logger.info(f"Current embedding count for {target_name}: {count}/{expected_count}")
                     if count >= expected_count: return True
@@ -88,11 +88,12 @@ async def test_full_replication_flow():
     """Integration test for basic multi-table logic (one table)."""
     from unittest.mock import patch
     custom_settings = {
-        "tables": {
+        "pipelines": {
             "products": {
-                "source_table": "full_products",
-                "publication_columns": ["name", "description"],
-                "formatting_template": "$chunk $name",
+                "ingest": {"table": "full_products", "columns": ["name", "description"]},
+                "pipeline": {"template": "$chunk $name", "content_column": "description", "chunking": {"strategy": "recursive_character"}, "embedding": {"provider": "ollama", "model": "nomic-embed-text", "dimension": 768}},
+                "storage": {"postgres": {"profile": "vector"}},
+                "active": True
             }
         }
     }
@@ -116,13 +117,13 @@ async def test_full_replication_flow():
 
         async with PGSearchReplica(sync=True, **custom_settings) as replica:
             settings = replica.settings
-            config = settings.tables["products"]
+            config = settings.pipelines["products"]
 
             found = False
             for _ in range(10):
                 async with await connect_db(settings.resolved_sink_url) as conn:
                     async with conn.cursor() as cur:
-                        await cur.execute(f"SELECT count(*) FROM {config.sink_raw_table} WHERE name = 'SuperGadget'")
+                        await cur.execute(f"SELECT count(*) FROM {config.ingest.table} WHERE name = 'SuperGadget'")
                         if (await cur.fetchone())[0] > 0:
                             found = True
                             break
@@ -142,9 +143,17 @@ async def test_multi_table_search():
     """Verify that multiple tables can be searched independently."""
     from unittest.mock import patch
     custom_settings = {
-        "tables": {
-            "t1": {"source_table": "table1", "publication_columns": ["content"], "content_column": "content", "formatting_template": "$chunk $content"},
-            "t2": {"source_table": "table2", "publication_columns": ["content"], "content_column": "content", "formatting_template": "$chunk $content"},
+        "pipelines": {
+            "t1": {
+                "ingest": {"table": "table1", "columns": ["content"], "p_key": "id"},
+                "pipeline": {"template": "$chunk $content", "content_column": "content", "chunking": {"strategy": "recursive_character"}, "embedding": {"provider": "ollama", "model": "nomic-embed-text", "dimension": 768}},
+                "storage": {"postgres": {"profile": "vector"}}
+            },
+            "t2": {
+                "ingest": {"table": "table2", "columns": ["content"], "p_key": "id"},
+                "pipeline": {"template": "$chunk $content", "content_column": "content", "chunking": {"strategy": "recursive_character"}, "embedding": {"provider": "ollama", "model": "nomic-embed-text", "dimension": 768}},
+                "storage": {"postgres": {"profile": "vector"}}
+            }
         }
     }
     
@@ -185,11 +194,11 @@ async def test_hybrid_search_rrf():
     """Verify that hybrid search (RRF) view is created and contains ts_col."""
     from unittest.mock import patch
     custom_settings = {
-        "tables": {
+        "pipelines": {
             "hybrid": {
-                "source_table": "hybrid_products",
-                "search_profile": "hybrid",
-                "formatting_template": "$chunk $content",
+                "ingest": {"table": "hybrid_products", "columns": ["name", "description", "content"], "p_key": "id"},
+                "pipeline": {"template": "$chunk $content", "content_column": "content", "chunking": {"strategy": "recursive_character"}, "embedding": {"provider": "ollama", "model": "nomic-embed-text", "dimension": 768}},
+                "storage": {"postgres": {"profile": "hybrid"}}
             }
         }
     }
@@ -225,11 +234,11 @@ async def test_blue_green_swap():
     """Verify atomic swap with multi-table config."""
     from unittest.mock import patch
     base_config = {
-        "tables": {
+        "pipelines": {
             "swap": {
-                "source_table": "swap_products",
-                "embedding_model": "nomic-embed-text",
-                "formatting_template": "$chunk $content",
+                "ingest": {"table": "swap_products", "columns": ["name", "description", "content"], "p_key": "id"},
+                "pipeline": {"template": "$chunk $content", "content_column": "content", "chunking": {"strategy": "recursive_character"}, "embedding": {"provider": "ollama", "model": "nomic-embed-text", "dimension": 768}},
+                "storage": {"postgres": {"profile": "vector"}}
             }
         }
     }
@@ -264,12 +273,11 @@ async def test_blue_green_swap():
             
         # Trigger swap
         new_config = {
-            "tables": {
+            "pipelines": {
                 "swap": {
-                    "source_table": "swap_products",
-                    "embedding_model": "nomic-embed-text",
-                    "chunking_strategy": "recursive_character_text_splitter",
-                    "formatting_template": "$chunk NEW $content",
+                    "ingest": {"table": "swap_products", "columns": ["name", "description", "content"], "p_key": "id"},
+                    "pipeline": {"template": "$chunk NEW $content", "content_column": "content", "chunking": {"strategy": "recursive_character"}, "embedding": {"provider": "ollama", "model": "nomic-embed-text", "dimension": 768}},
+                    "storage": {"postgres": {"profile": "vector"}}
                 }
             }
         }

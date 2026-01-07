@@ -37,7 +37,7 @@ async def test_ghost_fix_uuid_repro():
 
         async with PGSearchReplica(sync=True, **custom_settings) as replica:
             # Manually trigger anti-entropy to reproduce the bug
-            config = replica.settings.tables["uuid_test"]
+            config = replica.settings.pipelines["uuid_test"]
             # To trigger the 'ghosts' logic, we need to have a record in sink that is NOT in source.
             # But the bug is even more basic: 'ghosts' is used before definition in the 'if ghosts:' check.
             

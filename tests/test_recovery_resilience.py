@@ -1,6 +1,7 @@
 import pytest
 import asyncio
 from pg_replica import PGSearchReplica, settings as global_settings
+from pg_replica.config_v2 import SearchPipeline, IngestConfig, PipelineConfig, StorageConfig, EmbeddingConfig
 from pg_replica.database import connect_db, check_slot_exists, check_and_protect_source, dict_row
 
 
@@ -41,7 +42,7 @@ async def wait_for_pgai_sync(settings, target_name, expected_count=1, timeout=60
     import logging
     logger = logging.getLogger(__name__)
     start_time = time.time()
-    config = settings.tables[target_name]
+    config = settings.pipelines[target_name]
     embedding_table = None
 
     logger.info(f"Waiting for {expected_count} embeddings for {target_name}...")
@@ -51,13 +52,13 @@ async def wait_for_pgai_sync(settings, target_name, expected_count=1, timeout=60
                 try:
                     await cur.execute(
                         "SELECT table_name FROM information_schema.view_table_usage WHERE view_name = %s AND (table_name LIKE '%%_store_v%%' OR table_name LIKE '%%_embedding%%') LIMIT 1",
-                        (config.sink_replica_table,),
+                        (f"{config.ingest.table}_search",),
                     )
                     row = await cur.fetchone()
                     if row: embedding_table = row[0]
                 except Exception: pass
 
-                current_table = embedding_table or f"{config.sink_raw_table}_store_v{config.get_version_id()}"
+                current_table = embedding_table or f"{config.ingest.table}_store_v{config.get_version_id()}"
 
                 # Check if subscription still exists
                 sub_name = f"sub_{target_name}"
@@ -67,7 +68,7 @@ async def wait_for_pgai_sync(settings, target_name, expected_count=1, timeout=60
                     return False
 
                 try:
-                    await cur.execute(f"SELECT count(*) FROM {current_table} WHERE {config.embedding_column} IS NOT NULL")
+                    await cur.execute(f"SELECT count(*) FROM {current_table} WHERE embedding IS NOT NULL")
                     res = await cur.fetchone()
                     count = res[0] if res else 0
                     if count >= expected_count: return True
@@ -86,12 +87,15 @@ async def test_uuid_recovery_flow():
     """Test recovery and catch up with UUID primary keys."""
     from unittest.mock import patch
     custom_settings = {
-        "tables": {
-            "uuid": {
-                "source_table": "uuid_products",
-                "id_column": "id",
-                "formatting_template": "$chunk $name",
-            }
+        "pipelines": {
+            "uuid": SearchPipeline(
+                ingest=IngestConfig(table="uuid_products", columns=["name", "description"], p_key="id"),
+                pipeline=PipelineConfig(
+                    template="$chunk $name", 
+                    content_column="description",
+                    embedding=EmbeddingConfig(provider="ollama", model="nomic-embed-text", dimension=768)
+                )
+            )
         }
     }
 
@@ -125,11 +129,15 @@ async def test_anti_entropy_ghost_cleaner():
     """Test that hard-deleted records are cleaned up by Anti-Entropy."""
     from unittest.mock import patch
     custom_settings = {
-        "tables": {
-            "ghost": {
-                "source_table": "ghost_products",
-                "formatting_template": "$chunk $name",
-            }
+        "pipelines": {
+            "ghost": SearchPipeline(
+                ingest=IngestConfig(table="ghost_products", columns=["name", "description"], p_key="id"),
+                pipeline=PipelineConfig(
+                    template="$chunk $name", 
+                    content_column="description",
+                    embedding=EmbeddingConfig(provider="ollama", model="nomic-embed-text", dimension=768)
+                )
+            )
         }
     }
 
@@ -179,12 +187,16 @@ async def test_self_destruct_and_auto_heal():
     """Test Watchdog self-destruct and subsequent auto-healing."""
     from unittest.mock import patch
     custom_settings = {
-        "tables": {
-            "heal": {
-                "source_table": "heal_products",
-                "max_slot_wal_keep_size_mb": -1, # Trigger instant self-destruct
-                "formatting_template": "$chunk $name",
-            }
+        "max_slot_wal_keep_size_mb": -1, # Trigger instant self-destruct (Global setting)
+        "pipelines": {
+            "heal": SearchPipeline(
+                ingest=IngestConfig(table="heal_products", columns=["name", "description"], p_key="id"),
+                pipeline=PipelineConfig(
+                    template="$chunk $name", 
+                    content_column="description",
+                    embedding=EmbeddingConfig(provider="ollama", model="nomic-embed-text", dimension=768)
+                )
+            )
         }
     }
 
@@ -228,7 +240,7 @@ async def test_self_destruct_and_auto_heal():
             await conn.execute("INSERT INTO heal_products (id, name, description) VALUES (2, 'During Gap', 'Post-destruct')")
 
         # Restart and heal
-        custom_settings["tables"]["heal"]["max_slot_wal_keep_size_mb"] = 1024
+        custom_settings["max_slot_wal_keep_size_mb"] = 1024
         async with PGSearchReplica(sync=True, **custom_settings) as replica:
             assert await wait_for_pgai_sync(replica.settings, "heal", expected_count=2, timeout=60)
             results = await replica.search("destruct", table="heal")

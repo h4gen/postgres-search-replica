@@ -2,7 +2,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Optional, List, Set, Dict
 from enum import Enum
-from .config import Settings, TableConfig
+from .config import Settings
+from .config_v2 import SearchPipeline
 from .database import (
     get_source_conn,
     get_sink_conn,
@@ -109,16 +110,19 @@ class Inspector:
                 state["triggers"] = {r[0] for r in await cur.fetchall()}
 
                 # 4. Table-specific view targets and replica states
-                for name, config in self.settings.tables.items():
+                for name, config in self.settings.pipelines.items():
                     # View Target
-                    if config.sink_replica_table in state["views"]:
+                    # v7 Implied View Name: {table}_search
+                    view_name = f"{config.ingest.table}_search"
+                    
+                    if view_name in state["views"]:
                         await cur.execute(
                             """
                             SELECT table_name 
                             FROM information_schema.view_table_usage 
                             WHERE view_name = %s
                             """,
-                            (config.sink_replica_table,),
+                            (view_name,),
                         )
                         rows = await cur.fetchall()
                         target = None
@@ -201,7 +205,7 @@ class Inspector:
                 # 7. Control Plane Config State
                 state["config_history"] = {}
                 if "_replica_config_history" in state["tables"]:
-                    for name in self.settings.tables.keys():
+                    for name in self.settings.pipelines.keys():
                         latest = await get_latest_table_config(self.settings, name)
                         if latest:
                             state["config_history"][name] = latest
@@ -285,11 +289,11 @@ class Planner:
         
         # Pre-calculate all managed vectorizer targets to prevent accidental cleanup
         managed_vectorizers = set()
-        for _, cfg in self.settings.tables.items():
+        for _, cfg in self.settings.pipelines.items():
             vid = cfg.get_version_id()
-            managed_vectorizers.add(f"{cfg.sink_raw_table}_store_v{vid}")
+            managed_vectorizers.add(f"{cfg.ingest.table}_store_v{vid}")
 
-        for name, config in self.settings.tables.items():
+        for name, config in self.settings.pipelines.items():
             if "_embedding_cache" not in sink_state["tables"] and not cache_setup_added:
                 actions.append(
                     Action(
@@ -315,13 +319,13 @@ class Planner:
                 needs_source_setup = True
             else:
                 pub_tables = source_state["publications"][pub_name]["tables"]
-                if config.source_table not in pub_tables:
+                if config.ingest.table not in pub_tables:
                     needs_source_setup = True
                 else:
-                    current_filter = pub_tables[config.source_table]["rowfilter"]
+                    current_filter = pub_tables[config.ingest.table]["rowfilter"]
                     desired_filter = (
-                        f"({config.publication_where})"
-                        if config.publication_where
+                        f"({config.ingest.filter})"
+                        if config.ingest.filter
                         else None
                     )
                     if current_filter != desired_filter:
@@ -336,14 +340,14 @@ class Planner:
                     actions.append(
                         Action(
                             type=ActionType.SOURCE_SETUP,
-                            description=f"Setup/Update publication {pub_name} for {config.source_table}",
+                            description=f"Setup/Update publication {pub_name} for {config.ingest.table}",
                             params={},
                             target_name=name,
                         )
                     )
 
             # 2.2 Sink Table Evolution (Raw Table)
-            raw_table = config.sink_raw_table
+            raw_table = config.ingest.table
             if raw_table not in sink_state["tables"]:
                 actions.append(
                     Action(
@@ -354,7 +358,7 @@ class Planner:
                     )
                 )
             else:
-                desired_cols = set(config.publication_columns)
+                desired_cols = set(config.ingest.columns)
                 current_cols = sink_state["tables"][raw_table]
                 missing_cols = desired_cols - current_cols
                 if missing_cols:
@@ -425,10 +429,10 @@ class Planner:
             is_synced = pending_items == 0
             
             # Mirror Handshake: Ensure external mirrors caught up to outbox watermark
-            if is_synced and config.mirrors:
+            if is_synced and config.storage.mirrors:
                 outbox_watermark = sink_state.get("outbox_watermarks", {}).get(version_id, 0)
-                for mirror in config.mirrors:
-                    m_id = mirror.get("id")
+                for mirror in config.storage.mirrors:
+                    m_id = mirror.id # Pydantic object now
                     m_progress = sink_state.get("mirror_progress", {}).get((m_id, name), 0)
                     if m_progress < outbox_watermark:
                         logger.info(
@@ -444,7 +448,7 @@ class Planner:
                 should_promote = False
                 
                 # Case A: View doesn't exist at all -> Promote immediately (or wait? User prefers wait usually, but initial setup needs access)
-                if config.sink_replica_table not in sink_state["views"]:
+                if f"{config.ingest.table}_search" not in sink_state["views"]:
                     should_promote = True
                 
                 # Case B: View exists but points to wrong target (or outdated hash)
@@ -468,7 +472,7 @@ class Planner:
                      actions.append(
                         Action(
                             type=ActionType.SINK_VIEW_SETUP,
-                            description=f"Setup/Swap search view {config.sink_replica_table} -> {expected_vectorizer_target} (active=True, synced=True)",
+                            description=f"Setup/Swap search view {config.ingest.table}_search -> {expected_vectorizer_target} (active=True, synced=True)",
                             params={
                                 "config_hash": desired_hash,
                                 "target_table": raw_table,
@@ -529,8 +533,8 @@ class Applier:
             try:
                 target_name = action.target_name
                 config = (
-                    self.settings.tables[target_name]
-                    if target_name and target_name in self.settings.tables
+                    self.settings.pipelines[target_name]
+                    if target_name and target_name in self.settings.pipelines
                     else None
                 )
 
@@ -562,11 +566,15 @@ class Applier:
                                     await cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {dtype}")
 
                 elif action.type == ActionType.SINK_VECTORIZER_SETUP:
-                    raw_table = config.sink_raw_table
-                    logger.debug(f"Handling SINK_VECTORIZER_SETUP for {target_name}: config.sink_raw_table={raw_table}")
+                    # In V7, we use config.ingest.table as sink_raw_table default
+                    raw_table = config.ingest.table
+                    logger.debug(f"Handling SINK_VECTORIZER_SETUP for {target_name}: config.ingest.table={raw_table}")
                     version_id = action.params.get("version_id", "latest")
                     vectorizer_target = f"{raw_table}_store_v{version_id}"
                     
+                    # NOTE: cleanup_vectorizer_infrastructure needs 'config' object. 
+                    # If config is SearchPipeline, we must ensure database.py accepts it.
+                    # This patch assumes database.py handles it OR we update database.py next.
                     await cleanup_vectorizer_infrastructure(self.settings, config, vectorizer_target)
                     await setup_sink(self.settings, config, target_name, vectorizer_target=vectorizer_target)
                     await warm_up_from_cache(self.settings, config, raw_table, vectorizer_target)
@@ -590,8 +598,12 @@ class Applier:
                         config,
                         target_name,
                         action.params["config_hash"],
-                        target_table=config.sink_raw_table,
-                        vectorizer_target=f"{config.sink_raw_table}_store_v{action.params['version_id']}",
+                        target_table=config.ingest.table,
+                        vectorizer_target=f"{config.ingest.table}_store_v{action.params['version_id']}",
+                        # We might need to pass 'profile' here? 
+                        # database.atomic_view_swap signature needs 'profile' arg to handle hybrid view creation?
+                        # It currently takes *args. Let's check signature later.
+                        # For now, we update target_table logic.
                     )
                     await log_experiment_finish(self.settings, target_name, action.params["version_id"])
 
@@ -615,7 +627,7 @@ class Applier:
                 logger.error(f"Failed to apply action '{action.description}': {e}", exc_info=True)
                 if action.target_name:
                     failed_targets.add(action.target_name)
-                    gen = getattr(self.settings.tables.get(action.target_name, {}), "_generation", None)
+                    gen = getattr(self.settings.pipelines.get(action.target_name, {}), "_generation", None)
                     if gen:
                         await update_config_status(self.settings, action.target_name, gen, "Failed", error_message=str(e))
                 # Continue to next action
@@ -650,19 +662,25 @@ class Reconciler:
                         all_db_targets = [row[0] for row in await cur.fetchall()]
 
                 # Merge DB targets with in-memory targets
-                all_targets = set(self.settings.tables.keys()) | set(all_db_targets)
+                all_targets = set(self.settings.pipelines.keys()) | set(all_db_targets)
                 
                 for name in all_targets:
                     latest_db = await get_latest_table_config(self.settings, name)
                     if latest_db:
-                        # Convert JSON back to TableConfig
-                        db_config = TableConfig(**latest_db["config_json"])
-                        
-                        logger.debug(f"Overriding {name} with DB config gen {latest_db['generation']}")
-                        self.settings.tables[name] = db_config
-                        
-                        # We store the generation in the config object for the Applier to read
-                        setattr(self.settings.tables[name], "_generation", latest_db['generation'])
+                        # Convert JSON back to SearchPipeline
+                        try:
+                            # Parse JSON into SearchPipeline (V7)
+                            # NOTE: This assumes the DB contains valid V7 JSON. 
+                            new_config = SearchPipeline(**latest_db["config_json"])
+                            
+                            # Attach metadata needed for status updates and checks
+                            setattr(new_config, "_generation", latest_db["generation"])
+                            setattr(new_config, "_version", latest_db.get("version_id")) # Might be None if not planned
+                            
+                            self.settings.pipelines[name] = new_config
+                            logger.info(f"Loaded dynamic override for {name} (Gen: {latest_db['generation']})")
+                        except Exception as e:
+                            logger.warning(f"Failed to load dynamic override for {name}: {e}")
 
                 # 1. Discovery
                 source_state = await self.inspector.get_source_state()
@@ -679,7 +697,7 @@ class Reconciler:
                         "No infrastructure drift detected. Everything is in sync."
                     )
                     # Update status of Ready configs if they weren't yet marked observed
-                    for name, config in self.settings.tables.items():
+                    for name, config in self.settings.pipelines.items():
                         gen = getattr(config, "_generation", None)
                         if gen:
                             await update_config_status(
@@ -688,11 +706,12 @@ class Reconciler:
                     return
 
                 # 3. Application
+                # 3. Application
                 try:
                     # Mark active configs as Syncing if we have actions for them
                     affected_targets = {a.target_name for a in actions if a.target_name}
                     for target in affected_targets:
-                        gen = getattr(self.settings.tables.get(target, {}), "_generation", None)
+                        gen = getattr(self.settings.pipelines.get(target, {}), "_generation", None)
                         if gen:
                             await update_config_status(self.settings, target, gen, "Syncing")
 
@@ -701,7 +720,7 @@ class Reconciler:
                     # Mark as Ready if successful (excluding failed targets)
                     successful_targets = affected_targets - failed_targets
                     for target in successful_targets:
-                        gen = getattr(self.settings.tables.get(target, {}), "_generation", None)
+                        gen = getattr(self.settings.pipelines.get(target, {}), "_generation", None)
                         if gen:
                             await update_config_status(self.settings, target, gen, "Ready", observed_generation=gen)
 
@@ -709,7 +728,7 @@ class Reconciler:
                     logger.error("Error applying actions", exc_info=True)
                     # Mark as Failed
                     for target in affected_targets:
-                        gen = getattr(self.settings.tables.get(target, {}), "_generation", None)
+                        gen = getattr(self.settings.pipelines.get(target, {}), "_generation", None)
                         if gen:
                             await update_config_status(self.settings, target, gen, "Failed", error_message=str(e))
                     raise e

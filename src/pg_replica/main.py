@@ -54,7 +54,7 @@ async def run_daemon(loop: asyncio.AbstractEventLoop, handle_exit: Callable[[], 
 
     async def monitoring_worker():
         while not stop_event.is_set():
-            for name in list(settings.tables.keys()):
+            for name in list(settings.pipelines.keys()):
                 try:
                     lag_mb = await check_and_protect_source(settings, name)
                     update_replication_lag(name, lag_mb)
@@ -113,7 +113,7 @@ async def main():
     except asyncio.CancelledError:
         logger.info("Daemon task cancelled.")
     finally:
-        for name, config_obj in settings.tables.items():
+        for name, config_obj in settings.pipelines.items():
             await drop_subscription_completely(settings, config_obj, name)
         await close_pools()
         await server_task

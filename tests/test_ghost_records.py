@@ -10,13 +10,12 @@ async def test_ghost_fix_uuid_regression():
     """Reproduce the NameError in find_and_fix_ghost_records with UUID IDs."""
     from unittest.mock import patch
     custom_settings = {
-        "tables": {
+        "pipelines": {
             "uuid_ghost": {
-                "source_table": "table_uuid_ghost",
-                "id_column": "id",
-                "publication_columns": ["id", "content"],
-                "content_column": "content",
-                "formatting_template": "$chunk $content",
+                "ingest": {"table": "table_uuid_ghost", "columns": ["id", "content"], "p_key": "id"},
+                "pipeline": {"template": "$chunk $content", "content_column": "content", "chunking": {"strategy": "recursive_character"}, "embedding": {"provider": "ollama", "model": "nomic-embed-text", "dimension": 768}},
+                "storage": {"postgres": {"profile": "vector"}},
+                "active": True
             }
         }
     }
@@ -37,12 +36,12 @@ async def test_ghost_fix_uuid_regression():
             await conn.execute("DELETE FROM _replica_state WHERE key = 'sub_uuid_ghost'")
 
         async with PGSearchReplica(sync=True, **custom_settings) as replica:
-            config = replica.settings.tables["uuid_ghost"]
+            # Clean Break: Use the pipelines shim to get a SearchPipeline object
+            config = replica.settings.pipelines["uuid_ghost"]
             
             # This SHOULD trigger Strategy 2 in find_and_fix_ghost_records
             # because ID type is UUID (non-numeric).
             # We don't even need actual ghosts to trigger the NameError, 
-            # because 'if ghosts:' check happens before any ghosts are found.
             
             logger = logging.getLogger("pg_replica.database")
             logger.info("Manually triggering anti-entropy sweep to check for NameError...")

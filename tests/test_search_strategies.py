@@ -114,22 +114,39 @@ async def test_search_strategies_postgres_vs_qdrant():
     async with connect(
         source_url=source_url,
         sink_url=sink_url,
-        tables={
+        pipelines={
             "strat_products": {
-                "source_table": "strat_products",
-                "sink_raw_table": "strat_products",
-                "sink_replica_table": "strat_products_search",
-                "publication_columns": ["id", "name", "description"],
-                "formatting_template": "Title: $name\nContent: $chunk",
-                "active": True,
-                "mirrors": [
-                    {
-                        "id": "qdrant_meta",
-                        "type": "qdrant",
-                        "url": "http://localhost:6333",
-                        "prefix": "strat_test_"
+                "ingest": {
+                    "table": "strat_products",
+                    "columns": ["id", "name", "description"],
+                    "p_key": "id"
+                },
+                "pipeline": {
+                    "template": "Title: $name\nContent: $chunk",
+                    "content_column": "description",
+                    "chunking": {
+                        "strategy": "recursive_character"
+                    },
+                    "embedding": {
+                         "provider": "ollama",
+                         "model": "nomic-embed-text",
+                         "dimension": 768
                     }
-                ]
+                },
+                "storage": {
+                    "postgres": { "profile": "vector" },
+                    "mirrors": [
+                        {
+                            "id": "qdrant_meta",
+                            "type": "qdrant",
+                            "config": {
+                                "url": "http://localhost:6333",
+                                "prefix": "strat_test_"
+                            }
+                        }
+                    ]
+                },
+                "active": True
             }
         },
         sync=True
@@ -229,13 +246,28 @@ async def test_search_alias_promotion():
     async with connect(
         source_url=source_url,
         sink_url=sink_url,
-        tables={
+        pipelines={
             "products": {
-                "source_table": "products",
-                "publication_columns": ["id", "name", "description"],
-                "formatting_template": "V1: $name $chunk",
-                "active": True,
-                "mirrors": [{"id": "m1", "type": "qdrant", "url": "http://localhost:6333", "prefix": "alias_test_"}]
+                "ingest": {
+                    "table": "products",
+                    "columns": ["id", "name", "description"],
+                    "p_key": "id"
+                },
+                "pipeline": {
+                    "template": "V1: $name $chunk",
+                    "content_column": "description",
+                    "chunking": {"strategy": "recursive_character"},
+                    "embedding": {"provider": "ollama", "model": "nomic-embed-text", "dimension": 768}
+                },
+                "storage": {
+                    "postgres": {"profile": "vector"},
+                    "mirrors": [{
+                        "id": "m1", 
+                        "type": "qdrant", 
+                        "config": {"url": "http://localhost:6333", "prefix": "alias_test_"}
+                    }]
+                },
+                "active": True
             }
         },
         sync=True
@@ -288,13 +320,28 @@ async def test_search_alias_promotion():
     async with connect(
         source_url=source_url,
         sink_url=sink_url,
-        tables={
+        pipelines={
             "products": {
-                "source_table": "products",
-                "publication_columns": ["id", "name", "description"],
-                "formatting_template": "V2: $name $chunk",
-                "active": True,
-                "mirrors": [{"id": "m1", "type": "qdrant", "url": "http://localhost:6333", "prefix": "alias_test_"}]
+                "ingest": {
+                    "table": "products",
+                    "columns": ["id", "name", "description"],
+                    "p_key": "id"
+                },
+                "pipeline": {
+                    "template": "V2: $name $chunk",
+                    "content_column": "description", # Must be explicit
+                    "chunking": {"strategy": "recursive_character"},
+                    "embedding": {"provider": "ollama", "model": "nomic-embed-text", "dimension": 768}
+                },
+                "storage": {
+                    "postgres": {"profile": "vector"},
+                    "mirrors": [{
+                        "id": "m1", 
+                        "type": "qdrant", 
+                        "config": {"url": "http://localhost:6333", "prefix": "alias_test_"}
+                    }]
+                },
+                "active": True
             }
         },
         sync=True
