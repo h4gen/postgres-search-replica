@@ -133,6 +133,12 @@ class Orchestrator:
                 except RuntimeError as e:
                     if "Self-destructed" in str(e):
                         logger.critical(f"Replicator target {name} stopped: {e}")
+                        logger.info(f"Attempting to auto-heal {name}...")
+                        try:
+                            await self.reconciler.reconcile()
+                            logger.info(f"Auto-heal for {name} successful.")
+                        except Exception as re:
+                            logger.error(f"Auto-heal failed: {re}")
                 except Exception as e:
                     logger.error(f"Error in watchdog for {name}: {e}")
             
@@ -156,11 +162,11 @@ class Orchestrator:
         from .database import ensure_outbox_infrastructure
         await ensure_outbox_infrastructure(self.settings)
 
-        reconciler = Reconciler(self.settings)
+        self.reconciler = Reconciler(self.settings)
         
         async def try_reconcile():
             try:
-                await reconciler.reconcile()
+                await self.reconciler.reconcile()
                 return True
             except Exception as e:
                 logger.warning(f"Reconciliation attempt failed: {e}")

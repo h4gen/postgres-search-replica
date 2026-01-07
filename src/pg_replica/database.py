@@ -959,6 +959,26 @@ async def setup_outbox_trigger(
                 """
             )
 
+            # 3. Backfill existing rows (Handling the Race Condition)
+            # Since the vectorizer might have already processed rows before we attached the trigger,
+            # we must check for any existing rows and insert them into the outbox if missing.
+            await cur.execute(
+                f"""
+                INSERT INTO _sink_outbox (target_name, version_id, source_id, action, payload)
+                SELECT 
+                    '{target_name}', 
+                    '{version_id}', 
+                    {config.ingest.p_key}::text, 
+                    'UPSERT', 
+                    jsonb_build_object(
+                        'content', chunk,
+                        'embedding', embedding::text
+                    )
+                FROM {vectorizer_name}
+                ON CONFLICT DO NOTHING
+                """
+            )
+
 
 
 

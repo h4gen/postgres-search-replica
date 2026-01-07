@@ -30,20 +30,36 @@ async def test_universal_outbox_capture_and_sync():
     async with connect(
         source_url=source_url_host,
         sink_url=sink_url_host,
-        tables={
+        pipelines={
             "products": {
-                "source_table": "products",
-                "publication_columns": ["id", "name", "description"],
-                "search_profile": "hybrid",
-                "active": True,
-                "mirrors": [
-                    {
-                        "id": "qdrant_test",
-                        "type": "qdrant",
-                        "url": "http://localhost:6333",
-                        "prefix": "test_"
+                "ingest": {
+                    "table": "products",
+                    "columns": ["id", "name", "description"],
+                    "p_key": "id"
+                },
+                "pipeline": {
+                    "template": "Title: $name\nContent: $chunk",
+                    "content_column": "description",
+                    "embedding": {
+                         "provider": "ollama",
+                         "model": "nomic-embed-text",
+                         "dimension": 768
                     }
-                ]
+                },
+                "storage": {
+                    "postgres": { "profile": "hybrid" },
+                    "mirrors": [
+                        {
+                            "id": "qdrant_test",
+                            "type": "qdrant",
+                            "config": {
+                                "url": "http://localhost:6333",
+                                "prefix": "test_"
+                            }
+                        }
+                    ]
+                },
+                "active": True
             }
         },
         sync=True

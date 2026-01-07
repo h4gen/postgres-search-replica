@@ -16,13 +16,16 @@ class MirrorWorker:
 
     def _get_adapter(self, mirror_cfg: Dict[str, Any]) -> SinkAdapter:
         m_type = mirror_cfg.get("type")
-        m_url = mirror_cfg.get("url")
+        # Support both flat and nested config (for backward compatibility or if flattened)
+        config_dict = mirror_cfg.get("config", {})
+        m_url = mirror_cfg.get("url") or config_dict.get("url")
         m_id = mirror_cfg.get("id")
         
         cache_key = f"{m_type}_{m_url}_{m_id}"
         if cache_key not in self.adapters:
             if m_type == "qdrant":
-                self.adapters[cache_key] = QdrantSinkAdapter(m_url, collection_prefix=mirror_cfg.get("prefix", ""))
+                prefix = mirror_cfg.get("prefix") or config_dict.get("prefix", "")
+                self.adapters[cache_key] = QdrantSinkAdapter(m_url, collection_prefix=prefix)
             else:
                 raise ValueError(f"Unsupported mirror type: {m_type}")
         return self.adapters[cache_key]
