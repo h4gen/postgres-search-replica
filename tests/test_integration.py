@@ -12,7 +12,7 @@ async def wait_for_pgai_sync(settings, target_name, expected_count=1, timeout=12
     import logging
     logger = logging.getLogger(__name__)
     start_time = time.time()
-    config = settings.tables[target_name]
+    config = settings.replicas[target_name]
     embedding_table = None
 
     logger.info(f"Waiting for {expected_count} embeddings for target '{target_name}'...")
@@ -20,15 +20,16 @@ async def wait_for_pgai_sync(settings, target_name, expected_count=1, timeout=12
         async with await connect_db(settings.resolved_sink_url) as conn:
             async with conn.cursor() as cur:
                 try:
+                    search_view = f"{target_name}_search"
                     await cur.execute(
                         "SELECT table_name FROM information_schema.view_table_usage WHERE view_name = %s AND (table_name LIKE '%%_store_v%%' OR table_name LIKE '%%_embedding%%') LIMIT 1",
-                        (config.sink_replica_table,),
+                        (search_view,),
                     )
                     row = await cur.fetchone()
                     if row: embedding_table = row[0]
                 except Exception: pass
 
-                current_table = embedding_table or f"{config.sink_raw_table}_store_v{config.get_version_id()}"
+                current_table = embedding_table or f"{config.source.table}_store_v{config.get_version_id()}"
 
                 try:
                     await cur.execute("SELECT source_table, pending_items FROM ai.vectorizer_status")
@@ -37,7 +38,8 @@ async def wait_for_pgai_sync(settings, target_name, expected_count=1, timeout=12
                 except Exception: pass
 
                 try:
-                    await cur.execute(f"SELECT count(*) FROM {current_table} WHERE {config.embedding_column} IS NOT NULL")
+                    embedding_col = "embedding"
+                    await cur.execute(f"SELECT count(*) FROM {current_table} WHERE {embedding_col} IS NOT NULL")
                     count = (await cur.fetchone())[0]
                     logger.info(f"Current embedding count for {target_name}: {count}/{expected_count}")
                     if count >= expected_count: return True
@@ -88,11 +90,10 @@ async def test_full_replication_flow():
     """Integration test for basic multi-table logic (one table)."""
     from unittest.mock import patch
     custom_settings = {
-        "tables": {
-            "products": {
-                "source_table": "full_products",
-                "publication_columns": ["name", "description"],
-                "formatting_template": "$chunk $name",
+        "replicas": {
+            "full_products": {
+                "source": {"table": "full_products", "columns": ["name", "description"]},
+                "formatting": {"template": "$chunk $name"},
             }
         }
     }
@@ -102,35 +103,35 @@ async def test_full_replication_flow():
         test_logger = logging.getLogger(__name__)
 
         async with await connect_db(global_settings.source_url, autocommit=True) as conn:
-            await robust_slot_cleanup(conn, "sub_products", test_logger)
+            await robust_slot_cleanup(conn, "sub_full_products", test_logger)
             await conn.execute("DROP TABLE IF EXISTS full_products CASCADE")
             await conn.execute("CREATE TABLE full_products (id SERIAL PRIMARY KEY, name TEXT, description TEXT)")
             await conn.execute("INSERT INTO full_products (name, description) VALUES ('SuperGadget', 'A really useful tool for testing')")
 
         async with await connect_db(global_settings.resolved_sink_url, autocommit=True) as conn:
-            await robust_subscription_cleanup(conn, "sub_products", test_logger)
+            await robust_subscription_cleanup(conn, "sub_full_products", test_logger)
             await conn.execute("DROP TABLE IF EXISTS full_products CASCADE")
-            await conn.execute("DELETE FROM _replica_state WHERE key = 'sub_products'")
+            await conn.execute("DELETE FROM _replica_state WHERE key = 'sub_full_products'")
             try: await conn.execute("DELETE FROM ai.vectorizer")
             except: pass
 
         async with PGSearchReplica(sync=True, **custom_settings) as replica:
             settings = replica.settings
-            config = settings.tables["products"]
+            config = settings.replicas["full_products"]
 
             found = False
             for _ in range(10):
                 async with await connect_db(settings.resolved_sink_url) as conn:
                     async with conn.cursor() as cur:
-                        await cur.execute(f"SELECT count(*) FROM {config.sink_raw_table} WHERE name = 'SuperGadget'")
+                        await cur.execute(f"SELECT count(*) FROM {config.source.table} WHERE name = 'SuperGadget'")
                         if (await cur.fetchone())[0] > 0:
                             found = True
                             break
                 await asyncio.sleep(1)
             assert found, "Native replication failed"
 
-            assert await wait_for_pgai_sync(settings, "products")
-            results = await replica.search("SuperGadget", table="products")
+            assert await wait_for_pgai_sync(settings, "full_products")
+            results = await replica.search("SuperGadget", table="full_products")
             assert len(results) > 0
             assert "SuperGadget" in results[0]["content"]
 
@@ -142,9 +143,15 @@ async def test_multi_table_search():
     """Verify that multiple tables can be searched independently."""
     from unittest.mock import patch
     custom_settings = {
-        "tables": {
-            "t1": {"source_table": "table1", "publication_columns": ["content"], "content_column": "content", "formatting_template": "$chunk $content"},
-            "t2": {"source_table": "table2", "publication_columns": ["content"], "content_column": "content", "formatting_template": "$chunk $content"},
+        "replicas": {
+            "t1": {
+                "source": {"table": "table1", "columns": ["content"]},
+                "formatting": {"template": "$chunk $content"}
+            },
+            "t2": {
+                "source": {"table": "table2", "columns": ["content"]},
+                "formatting": {"template": "$chunk $content"}
+            },
         }
     }
     
@@ -185,11 +192,11 @@ async def test_hybrid_search_rrf():
     """Verify that hybrid search (RRF) view is created and contains ts_col."""
     from unittest.mock import patch
     custom_settings = {
-        "tables": {
-            "hybrid": {
-                "source_table": "hybrid_products",
-                "search_profile": "hybrid",
-                "formatting_template": "$chunk $content",
+        "replicas": {
+            "hybrid_test": {
+                "source": {"table": "hybrid_products", "content_column": "content"},
+                "search": {"profile": "hybrid"},
+                "formatting": {"template": "$chunk $content"},
             }
         }
     }
@@ -197,24 +204,25 @@ async def test_hybrid_search_rrf():
     with patch.dict("os.environ", {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(global_settings)}):
         test_logger = logging.getLogger(__name__)
         async with await connect_db(global_settings.source_url, autocommit=True) as conn:
-            await robust_slot_cleanup(conn, "sub_hybrid", test_logger)
+            await robust_slot_cleanup(conn, "sub_hybrid_test", test_logger)
             await conn.execute("DROP TABLE IF EXISTS hybrid_products CASCADE")
             await conn.execute("CREATE TABLE hybrid_products (id SERIAL PRIMARY KEY, name TEXT, description TEXT, content TEXT)")
             await conn.execute("INSERT INTO hybrid_products (name, description, content) VALUES ('H1', 'D1', 'hybrid search test')")
 
         async with await connect_db(global_settings.resolved_sink_url, autocommit=True) as conn:
+            await robust_subscription_cleanup(conn, "sub_hybrid_test", test_logger)
             await conn.execute("DROP TABLE IF EXISTS hybrid_products CASCADE")
-            await conn.execute("DELETE FROM _replica_state WHERE key = 'sub_hybrid'")
+            await conn.execute("DELETE FROM _replica_state WHERE key = 'sub_hybrid_test'")
             try: await conn.execute("DELETE FROM ai.vectorizer")
             except: pass
 
         async with PGSearchReplica(sync=True, **custom_settings) as replica:
-            assert await wait_for_pgai_sync(replica.settings, "hybrid")
+            assert await wait_for_pgai_sync(replica.settings, "hybrid_test")
             
             # Verify view structure
             async with await connect_db(replica.settings.resolved_sink_url) as conn:
                 async with conn.cursor(row_factory=dict_row) as cur:
-                    await cur.execute("SELECT * FROM hybrid_products_search LIMIT 1")
+                    await cur.execute("SELECT * FROM hybrid_test_search LIMIT 1")
                     row = await cur.fetchone()
                     assert "ts_col" in row, "ts_col missing from hybrid view"
                     assert row["ts_col"] is not None
@@ -225,11 +233,11 @@ async def test_blue_green_swap():
     """Verify atomic swap with multi-table config."""
     from unittest.mock import patch
     base_config = {
-        "tables": {
+        "replicas": {
             "swap": {
-                "source_table": "swap_products",
-                "embedding_model": "nomic-embed-text",
-                "formatting_template": "$chunk $content",
+                "source": {"table": "swap_products", "content_column": "content"},
+                "vectorizer": {"model": "nomic-embed-text"},
+                "formatting": {"template": "$chunk $content"},
             }
         }
     }
@@ -245,7 +253,7 @@ async def test_blue_green_swap():
         async with await connect_db(global_settings.resolved_sink_url, autocommit=True) as conn:
             await conn.execute("DROP TABLE IF EXISTS swap_products CASCADE")
             await conn.execute("DELETE FROM _replica_state WHERE key = 'sub_swap'")
-            await conn.execute("DROP VIEW IF EXISTS swap_products_search CASCADE")
+            await conn.execute("DROP VIEW IF EXISTS swap_search CASCADE")
             try: await conn.execute("DELETE FROM ai.vectorizer")
             except: pass
 
@@ -254,34 +262,36 @@ async def test_blue_green_swap():
             
             async with await connect_db(replica.settings.resolved_sink_url) as conn:
                 async with conn.cursor() as cur:
-                    await cur.execute("SELECT table_name FROM information_schema.view_table_usage WHERE view_name = 'swap_products_search' AND table_name LIKE '%%_embedding_v%%'")
+                    await cur.execute("SELECT table_name FROM information_schema.view_table_usage WHERE view_name = 'swap_search' AND (table_name LIKE '%%_store_v%%' OR table_name LIKE '%%_embedding%%')")
                     row = await cur.fetchone()
                     if not row:
-                        await cur.execute("SELECT view_name, table_name FROM information_schema.view_table_usage WHERE view_name = 'swap_products_search'")
+                        await cur.execute("SELECT view_name, table_name FROM information_schema.view_table_usage WHERE view_name = 'swap_search'")
                         all_usage = await cur.fetchall()
-                        test_logger.info(f"Usage for swap_products_search: {all_usage}")
+                        test_logger.info(f"Usage for swap_search: {all_usage}")
                     v1 = row[0] if row else None
             
         # Trigger swap
         new_config = {
-            "tables": {
+            "replicas": {
                 "swap": {
-                    "source_table": "swap_products",
-                    "embedding_model": "nomic-embed-text",
-                    "chunking_strategy": "recursive_character_text_splitter",
-                    "formatting_template": "$chunk NEW $content",
+                    "source": {"table": "swap_products", "content_column": "content"},
+                    "vectorizer": {"model": "nomic-embed-text"},
+                    "formatting": {
+                        "template": "$chunk NEW $content",
+                        "chunking_strategy": "recursive_character_text_splitter"
+                    },
                 }
             }
         }
         async with PGSearchReplica(sync=True, **new_config) as replica:
             async with await connect_db(replica.settings.resolved_sink_url) as conn:
                 async with conn.cursor() as cur:
-                    await cur.execute("SELECT table_name FROM information_schema.view_table_usage WHERE view_name = 'swap_products_search' AND table_name LIKE '%%_embedding_v%%'")
+                    await cur.execute("SELECT table_name FROM information_schema.view_table_usage WHERE view_name = 'swap_search' AND (table_name LIKE '%%_store_v%%' OR table_name LIKE '%%_embedding%%')")
                     row = await cur.fetchone()
                     if not row:
-                        await cur.execute("SELECT view_name, table_name FROM information_schema.view_table_usage WHERE view_name = 'swap_products_search'")
+                        await cur.execute("SELECT view_name, table_name FROM information_schema.view_table_usage WHERE view_name = 'swap_search'")
                         all_usage = await cur.fetchall()
-                        test_logger.info(f"Usage for swap_products_search (v2): {all_usage}")
+                        test_logger.info(f"Usage for swap_search (v2): {all_usage}")
                     v2 = row[0] if row else None
             assert v1 is not None and v2 is not None, f"Metadata views not created (v1={v1}, v2={v2})"
             assert v1 != v2, "Blue-Green swap failed"

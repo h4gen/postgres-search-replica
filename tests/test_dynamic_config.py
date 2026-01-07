@@ -4,12 +4,15 @@ import logging
 from pg_replica import PGSearchReplica, settings as global_settings
 from pg_replica.database import (
     connect_db, 
-    save_table_config, 
-    get_latest_table_config, 
+    save_replica_config, 
+    get_latest_replica_config, 
     update_config_status,
     reconciliation_lock
 )
-from pg_replica.config import TableConfig
+from pg_replica.config import (
+    ReplicaConfig, SourceConfig, VectorizerConfig,
+    FormattingConfig, SearchConfig, MirrorsConfig
+)
 from pg_replica.reconciler import ActionType
 
 logger = logging.getLogger(__name__)
@@ -71,48 +74,50 @@ async def test_dynamic_config_override():
     
     target_name = "dynamic_test_v3"
     # Initial config (v1)
-    base_config = TableConfig(
-        source_table="products",
-        publication_columns=["name", "description"],
+    base_config = ReplicaConfig(
+        source=SourceConfig(table="products", columns=["name", "description"]),
+        vectorizer=VectorizerConfig(),
+        formatting=FormattingConfig(template="$chunk"),
+        search=SearchConfig(),
+        mirrors=MirrorsConfig()
     )
     
-    # Pass 'tables' directly as a keyword argument to override Settings
+    # Pass 'replicas' directly as a keyword argument to override Settings
     with patch.dict("os.environ", {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(global_settings)}):
-        replica = PGSearchReplica(tables={target_name: base_config})
+        replica = PGSearchReplica(replicas={target_name: base_config})
         await robust_cleanup(replica.settings) # CLEANUP FIRST
         await init_pools(replica.settings)
         reconciler = Reconciler(replica.settings)
         
         try:
             # 1. Start by getting current max gen (if any) and save next
-            db_state = await get_latest_table_config(replica.settings, target_name)
+            db_state = await get_latest_replica_config(replica.settings, target_name)
             initial_gen = db_state["generation"] if db_state else 0
             
-            gen1 = await save_table_config(replica.settings, target_name, base_config)
+            gen1 = await save_replica_config(replica.settings, target_name, base_config)
             assert gen1 == initial_gen + 1
             
             await reconciler.reconcile()
-            print(f"Tables after reconcile: {list(replica.settings.tables.keys())}")
-            assert target_name in replica.settings.tables
-            assert getattr(replica.settings.tables[target_name], "_generation") == gen1
+            print(f"Replicas after reconcile: {list(replica.settings.replicas.keys())}")
+            assert target_name in replica.settings.replicas
+            assert getattr(replica.settings.replicas[target_name], "_generation") == gen1
             
             # 2. Update config in DB (gen + 1)
-            new_config_data = base_config.model_dump()
-            new_config_data["publication_where"] = "id < 500"
-            new_config = TableConfig(**new_config_data)
+            new_config = base_config.model_copy(deep=True)
+            new_config.source.filter = "id < 500"
             
-            gen2 = await save_table_config(replica.settings, target_name, new_config)
+            gen2 = await save_replica_config(replica.settings, target_name, new_config)
             assert gen2 == gen1 + 1
             
             # 3. Reconcile again and verify override
             await reconciler.reconcile()
             
-            curr_config = replica.settings.tables[target_name]
-            assert curr_config.publication_where == "id < 500"
+            curr_config = replica.settings.replicas[target_name]
+            assert curr_config.source.filter == "id < 500"
             assert getattr(curr_config, "_generation") == gen2
             
             # 4. Verify Status in DB is updated to Ready
-            db_state_after = await get_latest_table_config(replica.settings, target_name)
+            db_state_after = await get_latest_replica_config(replica.settings, target_name)
             assert db_state_after["status"] == "Ready"
             assert db_state_after["observed_generation"] == gen2
         finally:
@@ -144,19 +149,22 @@ async def test_failed_config_status():
     from pg_replica.reconciler import Reconciler, Action, ActionType
     
     target_name = "fail_test_v3"
-    base_config = TableConfig(
-        source_table="products", 
-        publication_columns=["name"]
+    base_config = ReplicaConfig(
+        source=SourceConfig(table="products", columns=["name"]),
+        vectorizer=VectorizerConfig(),
+        formatting=FormattingConfig(template="$chunk"),
+        search=SearchConfig(),
+        mirrors=MirrorsConfig()
     )
     
-    replica = PGSearchReplica(tables={target_name: base_config})
+    replica = PGSearchReplica(replicas={target_name: base_config})
     await robust_cleanup(replica.settings) # CLEANUP FIRST
     await init_pools(replica.settings)
     reconciler = Reconciler(replica.settings)
     
     try:
         # Insert a config that we'll try to apply
-        gen = await save_table_config(replica.settings, target_name, base_config)
+        gen = await save_replica_config(replica.settings, target_name, base_config)
         
         # Mock planning to ALWAYS return one action for our target
         mock_action = Action(
@@ -178,7 +186,7 @@ async def test_failed_config_status():
                     pytest.fail("Reconcile should have raised Simulated Failure")
                 
         # Verify status in DB
-        db_state = await get_latest_table_config(replica.settings, target_name)
+        db_state = await get_latest_replica_config(replica.settings, target_name)
         assert db_state["status"] == "Failed"
         assert "Simulated Failure" in db_state["error_message"]
     finally:

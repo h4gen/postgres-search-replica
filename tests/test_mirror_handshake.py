@@ -1,6 +1,9 @@
 import pytest
 import asyncio
-from pg_replica.config import Settings, TableConfig
+from pg_replica.config import (
+    Settings, ReplicaConfig, SourceConfig, VectorizerConfig,
+    FormattingConfig, SearchConfig, MirrorsConfig, MirrorTarget
+)
 from pg_replica.reconciler import Planner, ActionType
 
 def test_planner_blocks_promotion_if_mirrors_lag():
@@ -11,17 +14,20 @@ def test_planner_blocks_promotion_if_mirrors_lag():
     settings = Settings(
         source_url="postgresql://localhost/src",
         sink_url="postgresql://localhost/sink",
-        tables={
-            "t1": TableConfig(
-                source_table="table1",
-                mirrors=[{"id": "m1", "type": "qdrant", "url": "http://q1"}]
+        replicas={
+            "t1": ReplicaConfig(
+                source=SourceConfig(table="table1", columns=["id", "name"]),
+                vectorizer=VectorizerConfig(),
+                formatting=FormattingConfig(template="$chunk"),
+                search=SearchConfig(),
+                mirrors=MirrorsConfig(targets=[MirrorTarget(id="m1", type="qdrant", url="http://q1")])
             )
         }
     )
     planner = Planner(settings)
-    config = settings.tables["t1"]
+    config = settings.replicas["t1"]
     v_id = config.get_version_id()
-    expected_target = f"{config.sink_raw_table}_store_v{v_id}"
+    expected_target = f"{config.source.table}_store_v{v_id}"
 
     source_state = {
         "publications": {f"pub_t1": {"tables": {"table1": {"rowfilter": None}}}},
@@ -36,14 +42,14 @@ def test_planner_blocks_promotion_if_mirrors_lag():
             "_replica_state": {"key", "config_hash"},
             "_embedding_cache": {"text_hash"},
             "_sink_outbox": {"id"},
-            config.sink_raw_table: set(config.publication_columns),
+            config.source.table: set(config.source.columns),
         },
-        "views": {config.sink_replica_table},
+        "views": {f"{config.source.table}_search"},
         "view_targets": {"t1": "old_target"},
         "replica_states": {"t1": {"config_hash": "old_hash"}},
         "triggers": {f"trg_outbox_t1_{v_id}"},
         "vectorizers": {
-            config.sink_raw_table: [
+            config.source.table: [
                 {"id": 2, "target_table": expected_target},
             ]
         },

@@ -51,6 +51,7 @@ async def test_control_plane_summary_endpoint():
     """Verify the /control-plane/summary endpoint returns valid infrastructure state."""
     # Ensure pools are initialized for the background db calls
     from pg_replica.database import init_pools, close_pools
+    from pg_replica.config import settings
     await init_pools(settings)
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:

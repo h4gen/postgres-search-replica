@@ -2,7 +2,7 @@ import asyncio
 import logging
 import json
 from typing import List, Dict, Any
-from .config import Settings, TableConfig
+from .config import Settings, ReplicaConfig
 from .database import get_sink_conn
 from .adapters import OutboxEntry, QdrantSinkAdapter, SinkAdapter
 
@@ -38,14 +38,14 @@ class MirrorWorker:
             await asyncio.sleep(2) # Poll interval
 
     async def _process_all_mirrors(self):
-        # We process mirrors defined in ALL table configs
-        for target_name, config in self.settings.tables.items():
-            for mirror_cfg in config.mirrors:
+        # We process mirrors defined in ALL replica configs
+        for target_name, config in self.settings.replicas.items():
+            for mirror_cfg in config.mirrors.targets:
                 await self._process_mirror(target_name, mirror_cfg)
 
-    async def _process_mirror(self, target_name: str, mirror_cfg: Dict[str, Any]):
-        mirror_id = mirror_cfg.get("id")
-        adapter = self._get_adapter(mirror_cfg)
+    async def _process_mirror(self, target_name: str, mirror_cfg: Any):
+        mirror_id = mirror_cfg.id
+        adapter = self._get_adapter(mirror_cfg.model_dump())
         
         async with await get_sink_conn() as conn:
             async with conn.cursor() as cur:
@@ -152,8 +152,8 @@ class MirrorWorker:
                             logger.info(f"Promoting mirror {mirror_id} for {target_name} to version {promoted_version}...")
                             
                             # Use configured dimension to avoid 404s if collection doesn't exist yet
-                            config = self.settings.tables.get(target_name)
-                            vector_size = config.embedding_dimension if config else 768
+                            config = self.settings.replicas.get(target_name)
+                            vector_size = config.vectorizer.dimension if config else 768
                             
                             await adapter.update_alias(target_name, promoted_version, vector_size=vector_size)
                             await cur.execute(

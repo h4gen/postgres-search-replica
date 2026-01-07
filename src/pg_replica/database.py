@@ -6,7 +6,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from pgvector.psycopg import register_vector_async as register_vector  # type: ignore
-from .config import Settings, TableConfig
+from .config import Settings, ReplicaConfig
 from .utils import wait_until
 
 logger = logging.getLogger(__name__)
@@ -86,30 +86,30 @@ async def connect_db(url: str, **kwargs):
     return conn
 
 
-async def wait_for_source_table(settings: Settings, config: TableConfig, timeout: int = 30):
+async def wait_for_source_table(settings: Settings, config: ReplicaConfig, timeout: int = 30):
     """Wait for a table to exist on the Source DB."""
     async def table_exists():
         async with await get_source_conn() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "SELECT 1 FROM information_schema.tables WHERE table_name = %s",
-                    (config.source_table,),
+                    (config.source.table,),
                 )
                 if await cur.fetchone():
                     return True
                 
                 await cur.execute(
                     "SELECT 1 FROM pg_class WHERE relname = %s",
-                    (config.source_table,),
+                    (config.source.table,),
                 )
                 return await cur.fetchone() is not None
 
-    logger.info(f"Waiting for source table {config.source_table} to be visible...")
+    logger.info(f"Waiting for source table {config.source.table} to be visible...")
     try:
         await wait_until(table_exists, timeout=timeout, interval=0.1)
         return True
     except asyncio.TimeoutError:
-        logger.error(f"Timed out waiting for source table {config.source_table}")
+        logger.error(f"Timed out waiting for source table {config.source.table}")
         return False
 
 
@@ -140,16 +140,19 @@ async def is_publication_valid(pub_name: str) -> bool:
 
 
 async def get_source_column_types(
-    settings: Settings, config: TableConfig
+    settings: Settings, config: ReplicaConfig
 ) -> dict[str, str]:
     """Query the Source DB's information_schema to get column types."""
     logger.info(
-        f"Detecting column types for {config.source_table} on source..."
+        f"Detecting column types for {config.source.table} on source..."
     )
     
     # Pre-flight readiness check to avoid race conditions in tests
     if not await wait_for_source_table(settings, config):
-        raise RuntimeError(f"Source table {config.source_table} not found after timeout")
+        raise RuntimeError(f"Source table {config.source.table} not found after timeout")
+
+    # IMPORTANT: Ensure PK is included in detection, even if not in publication_columns
+    cols_to_detect = set(config.source.columns) | {config.source.primary_key, config.source.content_column}
 
     async with await get_source_conn() as conn:
         async with conn.cursor() as cur:
@@ -160,7 +163,7 @@ async def get_source_column_types(
                 WHERE table_name = %s 
                 AND column_name = ANY(%s)
                 """,
-                (config.source_table, config.publication_columns),
+                (config.source.table, list(cols_to_detect)),
             )
             rows = await cur.fetchall()
             # Map data_type to something we can use in CREATE TABLE
@@ -179,22 +182,51 @@ async def get_source_column_types(
             return types
 
 
-async def setup_source(settings: Settings, config: TableConfig, target_name: str):
+def get_replica_sync_columns(config: ReplicaConfig, source_types: Dict[str, str]) -> Set[str]:
+    """Centralized logic to determine which columns must be synced."""
+    import string
+    
+    # 1. Base columns from config
+    sync_cols = set(config.source.columns)
+    
+    # 2. Add PK and Content Column (Infrastructure requirements)
+    sync_cols.add(config.source.primary_key)
+    sync_cols.add(config.source.content_column)
+    
+    # 3. Add columns from formatting template
+    template_vars = [
+        t[1] or t[2] 
+        for t in string.Template.pattern.findall(config.formatting.template) 
+        if t[1] or t[2]
+    ]
+    for var in template_vars:
+        # 'chunk' is a special keyword provided by pgai, not a source column
+        if var != "chunk" and var in source_types:
+            sync_cols.add(var)
+            
+    return sync_cols
+
+
+async def setup_source(settings: Settings, config: ReplicaConfig, target_name: str):
     """Remotely initialize the source publication."""
     pub_name = f"pub_{target_name}"
     logger.info(f"Setting up remote source publication {pub_name}...")
     
     # Pre-flight readiness check to avoid race conditions in tests
     if not await wait_for_source_table(settings, config):
-        raise RuntimeError(f"Source table {config.source_table} not found after timeout")
+        raise RuntimeError(f"Source table {config.source.table} not found after timeout")
 
     async with await get_source_conn() as conn:
         await conn.set_autocommit(True)
         async with conn.cursor() as cur:
-            cols = ", ".join(config.publication_columns)
+            # Re-fetch source types to ensure we have the full catalog
+            source_types = await get_source_column_types(settings, config)
+            sync_cols = get_replica_sync_columns(config, source_types)
+            cols = ", ".join(sync_cols)
+            
             where_clause = (
-                f" WHERE ({config.publication_where})"
-                if config.publication_where
+                f" WHERE ({config.source.filter})"
+                if config.source.filter
                 else ""
             )
 
@@ -205,12 +237,15 @@ async def setup_source(settings: Settings, config: TableConfig, target_name: str
                 logger.info(
                     f"Creating publication {pub_name} on Source for columns ({cols}){where_clause}..."
                 )
+                col_def = f"({cols})" if cols else ""
                 await cur.execute(
-                    f"CREATE PUBLICATION {pub_name} FOR TABLE {config.source_table} ({cols}){where_clause}"
+                    f"CREATE PUBLICATION {pub_name} FOR TABLE {config.source.table} {col_def}{where_clause}"
                 )
             else:
+                col_def = f"({cols})" if cols else ""
+                logger.info(f"Updating publication {pub_name} for columns ({cols})...")
                 await cur.execute(
-                    f"ALTER PUBLICATION {pub_name} SET TABLE {config.source_table} ({cols}){where_clause}"
+                    f"ALTER PUBLICATION {pub_name} SET TABLE {config.source.table} {col_def}{where_clause}"
                 )
             await conn.commit()
 
@@ -266,8 +301,8 @@ async def ensure_config_history_table(settings: Settings):
             )
 
 
-async def save_table_config(settings: Settings, target_name: str, config: TableConfig) -> int:
-    """Save a new configuration for a table and return the new generation."""
+async def save_replica_config(settings: Settings, target_name: str, config: ReplicaConfig) -> int:
+    """Save a new configuration for a replica and return the new generation."""
     async with await get_sink_conn() as conn:
         await conn.set_autocommit(True)
         async with conn.cursor() as cur:
@@ -295,8 +330,8 @@ async def save_table_config(settings: Settings, target_name: str, config: TableC
             return new_gen
 
 
-async def get_latest_table_config(settings: Settings, target_name: str) -> dict | None:
-    """Retrieve the latest configuration for a table."""
+async def get_latest_replica_config(settings: Settings, target_name: str) -> dict | None:
+    """Retrieve the latest configuration for a replica."""
     async with await get_sink_conn() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -383,9 +418,6 @@ async def get_replica_state(
             return None, None
 
 
-    return statuses
-
-
 async def get_source_health(settings: Settings) -> dict:
     """Query current health state of the Source DB replication."""
     logger.debug("Fetching source health metadata...")
@@ -424,11 +456,11 @@ async def get_vectorizer_statuses(settings: Settings) -> dict[str, int]:
             # 1. Try generic ai.vectorizer_status (pgai 0.4.0+)
             try:
                 await cur.execute(
-                    "SELECT source_table, pending_items FROM ai.vectorizer_status"
+                    "SELECT name, pending_items FROM ai.vectorizer_status"
                 )
                 rows = await cur.fetchall()
-                for table, pending in rows:
-                    statuses[table] = pending
+                for name, pending in rows:
+                    statuses[name] = pending
             except Exception:
                 # Fallback implementation if specific view unavailable
                 pass
@@ -499,13 +531,13 @@ def estimate_hnsw_ram(dimension: int, row_count: int, M: int = 16) -> int:
     return total_bytes
 
 
-async def get_resource_projections(settings: Settings, config: TableConfig) -> dict:
+async def get_resource_projections(settings: Settings, config: ReplicaConfig) -> dict:
     """Estimate costs and hardware needs for a build."""
-    logger.debug(f"Calculating projections for {config.source_table}...")
+    logger.debug(f"Calculating projections for {config.source.table}...")
     
     async with await get_source_conn() as conn:
         async with conn.cursor() as cur:
-            await cur.execute(f"SELECT count(*) FROM {config.source_table}")
+            await cur.execute(f"SELECT count(*) FROM {config.source.table}")
             row = await cur.fetchone()
             row_count = row[0] if row else 0
 
@@ -514,15 +546,15 @@ async def get_resource_projections(settings: Settings, config: TableConfig) -> d
     estimated_tokens = row_count * 100 
     estimated_cost_usd = (estimated_tokens / 1_000_000) * 0.10
     
-    ram_bytes = estimate_hnsw_ram(config.embedding_dimension, row_count)
+    ram_bytes = estimate_hnsw_ram(config.vectorizer.dimension, row_count)
 
     return {
         "row_count": row_count,
         "estimated_tokens": estimated_tokens,
         "estimated_cost_usd": round(estimated_cost_usd, 4),
         "estimated_ram_mb": round(ram_bytes / (1024 * 1024), 2),
-        "embedding_model": config.embedding_model,
-        "dimension": config.embedding_dimension
+        "embedding_model": config.vectorizer.model,
+        "dimension": config.vectorizer.dimension
     }
 
 
@@ -555,8 +587,8 @@ async def log_experiment_finish(settings: Settings, target_name: str, version_id
                 """
                 UPDATE _search_experiment_logs 
                 SET finished_at = NOW(), 
-                    success_rate = %s,
-                    metadata = metadata || %s::jsonb
+                success_rate = %s,
+                metadata = metadata || %s::jsonb
                 WHERE target_name = %s AND version_id = %s AND finished_at IS NULL
                 """,
                 (1.0 if success else 0.0, psycopg.types.json.Json({"status": "promoted"}), target_name, version_id)
@@ -598,7 +630,6 @@ async def update_replica_state(
     """Update high-water mark or LSN in the state table for a specific target."""
     sub_name = f"sub_{target_name}"
     async with await get_sink_conn() as conn:
-        await conn.set_autocommit(True)
         async with conn.cursor() as cur:
             if last_id is not None and lsn is not None:
                 await cur.execute(
@@ -613,11 +644,11 @@ async def update_replica_state(
             elif lsn is not None:
                 await cur.execute(
                     "UPDATE _replica_state SET last_lsn = %s, updated_at = NOW() WHERE key = %s",
-                    (str(lsn), sub_name),
+                    (str(last_id), sub_name),
                 )
 
 
-async def ensure_embedding_cache_table(settings: Settings, config: TableConfig):
+async def ensure_embedding_cache_table(settings: Settings, config: ReplicaConfig):
     """Create the Postgres-native embedding cache table."""
     logger.info("Ensuring embedding cache table exists...")
     async with await get_sink_conn() as conn:
@@ -641,11 +672,11 @@ async def ensure_embedding_cache_table(settings: Settings, config: TableConfig):
                 if row:
                     current_dim = row[0]
                     if (
-                        current_dim != config.embedding_dimension
+                        current_dim != config.vectorizer.dimension
                         and current_dim != -1
                     ):
                         logger.warning(
-                            f"Cache dimension mismatch ({current_dim} vs {config.embedding_dimension}). Purging cache."
+                            f"Cache dimension mismatch ({current_dim} vs {config.vectorizer.dimension}). Purging cache."
                         )
                         await cur.execute("DROP TABLE _embedding_cache CASCADE")
 
@@ -653,7 +684,7 @@ async def ensure_embedding_cache_table(settings: Settings, config: TableConfig):
                 f"""
                 CREATE TABLE IF NOT EXISTS _embedding_cache (
                     text_hash TEXT PRIMARY KEY,
-                    embedding vector({config.embedding_dimension}),
+                    embedding vector({config.vectorizer.dimension}),
                     model_name TEXT,
                     created_at TIMESTAMP DEFAULT NOW()
                 )
@@ -661,12 +692,13 @@ async def ensure_embedding_cache_table(settings: Settings, config: TableConfig):
             )
 
 async def cleanup_vectorizer_infrastructure(
-    settings: Settings, config: TableConfig, vectorizer_name: str
+    settings: Settings, config: ReplicaConfig, vectorizer_name: str
 ):
     """Robustly clean up all infrastructure for a specific vectorizer."""
     logger.info(f"Robust cleanup for vectorizer {vectorizer_name}...")
     
     embedding_view = vectorizer_name.replace("_store", "_embedding")
+    sink_replica_table = f"{config.source.table}_search"
     
     async with await get_sink_conn() as conn:
         await conn.set_autocommit(True)
@@ -678,13 +710,13 @@ async def cleanup_vectorizer_infrastructure(
                 -- 1. Check if ANY view is using this as its target (safety)
                 SELECT table_name INTO live_target 
                 FROM information_schema.view_table_usage 
-                WHERE view_name = '{config.sink_replica_table}' 
+                WHERE view_name = '{sink_replica_table}' 
                 AND table_name IN ('{vectorizer_name}', '{embedding_view}') 
                 LIMIT 1;
                 
                 -- 2. If it's live, we MUST drop the replica view first
                 IF live_target IS NOT NULL THEN
-                    EXECUTE 'DROP VIEW IF EXISTS ' || quote_ident('{config.sink_replica_table}') || ' CASCADE';
+                    EXECUTE 'DROP VIEW IF EXISTS ' || quote_ident('{sink_replica_table}') || ' CASCADE';
                 END IF;
 
                 -- 3. Drop the pgai vectorizer if it exists
@@ -724,10 +756,10 @@ async def cleanup_vectorizer_infrastructure(
                     JOIN pg_proc p ON tg.tgfoid = p.oid
                     JOIN pg_namespace n ON c.relnamespace = n.oid
                     WHERE n.nspname = 'public' 
-                      AND c.relname = '{config.sink_raw_table}'
+                      AND c.relname = '{config.source.table}'
                       AND p.prosrc ILIKE '%{vectorizer_name}%'
                 LOOP
-                    EXECUTE 'DROP TRIGGER IF EXISTS ' || quote_ident(live_target) || ' ON ' || quote_ident('{config.sink_raw_table}') || ' CASCADE';
+                    EXECUTE 'DROP TRIGGER IF EXISTS ' || quote_ident(live_target) || ' ON ' || quote_ident('{config.source.table}') || ' CASCADE';
                 END LOOP;
             END $$;
             """
@@ -735,7 +767,7 @@ async def cleanup_vectorizer_infrastructure(
 
 async def atomic_view_swap(
     settings: Settings,
-    config: TableConfig,
+    config: ReplicaConfig,
     target_name: str,
     config_hash: str,
     target_table: str | None = None,
@@ -745,8 +777,10 @@ async def atomic_view_swap(
     Update the search view to point to the latest table version and
     record the new config hash atomically. Supports Hybrid RRF.
     """
-    raw_table = target_table or config.sink_raw_table
+    raw_table = target_table or config.source.table
     sub_name = f"sub_{target_name}"
+    # Search view name is ALWAYS based on the stable replica key (target_name)
+    sink_replica_table = f"{target_name}_search"
     
     # Resolve embedding view name
     embedding_view = f"{raw_table}_embedding"
@@ -764,175 +798,90 @@ async def atomic_view_swap(
                     embedding_view = vectorizer_target.replace("_store", "_embedding")
 
         logger.info(
-            f"Performing atomic view swap targeting {raw_table} (Profile: {config.search_profile})..."
+            f"Performing atomic view swap targeting {raw_table} (Profile: {config.search.profile})..."
         )
 
         await conn.set_autocommit(False)
         try:
             async with conn.cursor() as cur:
-                await cur.execute(f"DROP VIEW IF EXISTS {config.sink_replica_table}")
+                await cur.execute(f"DROP VIEW IF EXISTS {sink_replica_table}")
                 
-                if config.search_profile == "hybrid":
+                if config.search.profile == "hybrid":
                     # HYBRID SEARCH (RRF): Vector + Full-Text
                     # We create a view that exposes both, allowing the SEARCH query 
                     # to perform Rank Fusion logic.
                     logger.info("Implementing Hybrid View with RRF scoring support...")
                     await cur.execute(
                         f"""
-                        CREATE VIEW {config.sink_replica_table} AS
+                        CREATE VIEW {sink_replica_table} AS
                         SELECT 
-                            r.{config.id_column},
-                            e.chunk as {config.target_content_column},
-                            e.{config.embedding_column},
+                            r.{config.source.primary_key},
+                            e.chunk as {config.formatting.target_content_column},
+                            e.{config.search.embedding_column},
                             to_tsvector('english', e.chunk) as ts_col
                         FROM {raw_table} r
-                        LEFT JOIN {embedding_view} e ON r.{config.id_column} = e.{config.id_column}
+                        LEFT JOIN {embedding_view} e ON r.{config.source.primary_key} = e.{config.source.primary_key}
                     """
                     )
                 else:
                     # VECTOR SEARCH ONLY
                     await cur.execute(
                         f"""
-                        CREATE VIEW {config.sink_replica_table} AS
+                        CREATE VIEW {sink_replica_table} AS
                         SELECT 
-                            r.{config.id_column},
-                            e.chunk as {config.target_content_column},
-                            e.{config.embedding_column}
+                            r.{config.source.primary_key},
+                            e.chunk as {config.formatting.target_content_column},
+                            e.{config.search.embedding_column}
                         FROM {raw_table} r
-                        LEFT JOIN {embedding_view} e ON r.{config.id_column} = e.{config.id_column}
+                        LEFT JOIN {embedding_view} e ON r.{config.source.primary_key} = e.{config.source.primary_key}
                     """
                     )
 
-                # Update State Hash
+                # Update state
                 await cur.execute(
-                    "UPDATE _replica_state SET config_hash = %s, updated_at = NOW() WHERE key = %s",
+                    "UPDATE _replica_state SET config_hash = %s WHERE key = %s",
                     (config_hash, sub_name),
                 )
             await conn.commit()
+            logger.info(f"Successfully swapped view for {target_name} to {raw_table}")
         except Exception as e:
             await conn.rollback()
             raise e
 
-async def ensure_outbox_infrastructure(settings: Settings):
-    """Create the _sink_outbox and _sink_mirror_registry tables."""
-    logger.info("Ensuring Universal Outbox infrastructure exists in Sink...")
-    async with await get_sink_conn() as conn:
-        await conn.set_autocommit(True)
-        async with conn.cursor() as cur:
-            # 1. The Outbox: Transactional log of vectorized changes
-            await cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS _sink_outbox (
-                    id BIGSERIAL PRIMARY KEY,
-                    target_name TEXT NOT NULL,
-                    version_id TEXT NOT NULL,
-                    source_id TEXT NOT NULL,
-                    action TEXT NOT NULL, -- UPSERT, DELETE
-                    payload JSONB, -- {content: "...", embedding: [...]}
-                    created_at TIMESTAMP DEFAULT NOW()
-                )
-                """
-            )
-            # Index for the MirrorWorker to poll efficiently
-            await cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_sink_outbox_id ON _sink_outbox(id)"
-            )
-
-            # 2. Mirror Registry: Track progress of external sinks
-            await cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS _sink_mirror_registry (
-                    mirror_id TEXT NOT NULL,
-                    target_name TEXT NOT NULL,
-                    last_processed_id BIGINT DEFAULT 0,
-                    promoted_version_id TEXT,
-                    error_count INT DEFAULT 0,
-                    last_error TEXT,
-                    last_sync_latency_ms INT,
-                    updated_at TIMESTAMP DEFAULT NOW(),
-                    PRIMARY KEY (mirror_id, target_name)
-                )
-                """
-            )
-            # Migration: Ensure operational columns exist
-            await cur.execute("ALTER TABLE _sink_mirror_registry ADD COLUMN IF NOT EXISTS promoted_version_id TEXT")
-            await cur.execute("ALTER TABLE _sink_mirror_registry ADD COLUMN IF NOT EXISTS error_count INT DEFAULT 0")
-            await cur.execute("ALTER TABLE _sink_mirror_registry ADD COLUMN IF NOT EXISTS last_error TEXT")
-            await cur.execute("ALTER TABLE _sink_mirror_registry ADD COLUMN IF NOT EXISTS last_sync_latency_ms INT")
-
-            # 3. Experiment Logs: Track build history
-            await cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS _search_experiment_logs (
-                    id SERIAL PRIMARY KEY,
-                    target_name TEXT NOT NULL,
-                    version_id TEXT NOT NULL,
-                    started_at TIMESTAMP DEFAULT NOW(),
-                    finished_at TIMESTAMP,
-                    total_rows INT DEFAULT 0,
-                    success_rate FLOAT,
-                    tokens_used BIGINT DEFAULT 0,
-                    metadata JSONB
-                )
-                """
-            )
-
-            # 4. Pipeline Failures: Trace poison pills
-            await cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS _pipeline_failures (
-                    id SERIAL PRIMARY KEY,
-                    target_name TEXT NOT NULL,
-                    version_id TEXT NOT NULL,
-                    source_id TEXT NOT NULL,
-                    error_message TEXT,
-                    failed_at TIMESTAMP DEFAULT NOW(),
-                    context JSONB,
-                    resolved BOOLEAN DEFAULT FALSE
-                )
-                """
-            )
-
-
 async def setup_outbox_trigger(
-    settings: Settings, target_name: str, vectorizer_name: str, config: TableConfig
+    settings: Settings, target_name: str, vectorizer_name: str, config: ReplicaConfig
 ):
     """
     Attach a trigger to the internal pgai store table to capture 
-    all vectorization events into the _sink_outbox.
+    changes for external mirroring (Drift Detection).
     """
-    version_id = config.get_version_id()
-    # The pgai store table is the vectorizer_name itself (v_store_v1)
-    # We want to capture when vectors ARE CREATED.
-    
-    logger.info(f"Setting up outbox trigger for {vectorizer_name}...")
-    
-    trigger_fn_name = f"fn_capture_outbox_{target_name}_{version_id}"
-    trigger_name = f"trg_outbox_{target_name}_{version_id}"
+    version_id = vectorizer_name.split("_store_")[1] if "_store_" in vectorizer_name else "latest"
+    trigger_name = f"trg_mirror_outbox_{version_id}"
+    trigger_fn_name = f"fn_mirror_outbox_{version_id}"
 
     async with await get_sink_conn() as conn:
         await conn.set_autocommit(True)
         async with conn.cursor() as cur:
             # 1. Create the Trigger Function
             # Note: pgai keeps source PK in its store table.
-            # We assume config.id_column is present in the pgai store.
+            # We assume config.source.primary_key is present in the pgai store.
             await cur.execute(
                 f"""
                 CREATE OR REPLACE FUNCTION {trigger_fn_name}() RETURNS TRIGGER AS $$
                 BEGIN
                     IF (TG_OP = 'DELETE') THEN
                         INSERT INTO _sink_outbox (target_name, version_id, source_id, action)
-                        VALUES ('{target_name}', '{version_id}', OLD.{config.id_column}::text, 'DELETE');
+                        VALUES ('{target_name}', '{version_id}', OLD.{config.source.primary_key}::text, 'DELETE');
                     ELSE
                         INSERT INTO _sink_outbox (target_name, version_id, source_id, action, payload)
                         VALUES (
                             '{target_name}', 
                             '{version_id}', 
-                            NEW.{config.id_column}::text, 
+                            NEW.{config.source.primary_key}::text, 
                             'UPSERT', 
                             jsonb_build_object(
                                 'content', NEW.chunk,
-                                'embedding', NEW.embedding::text -- cast to text for JSON
+                                'embedding', NEW.embedding
                             )
                         );
                     END IF;
@@ -942,8 +891,7 @@ async def setup_outbox_trigger(
                 """
             )
 
-            # 2. Attach Trigger to pgai STORE table
-            # We use AFTER INSERT OR UPDATE OR DELETE
+            # 2. Attach Trigger
             await cur.execute(
                 f"""
                 DROP TRIGGER IF EXISTS {trigger_name} ON {vectorizer_name};
@@ -953,89 +901,71 @@ async def setup_outbox_trigger(
                 """
             )
 
-
-
-
 async def warm_up_from_cache(
-    settings: Settings, config: TableConfig, source_table: str, target_store_table: str
+    settings: Settings, config: ReplicaConfig, source_table: str, target_store_table: str
 ):
     """Populate a new embedding table from the cache to avoid re-calls."""
     logger.info(f"Warming up {target_store_table} from cache...")
-
     async with await get_sink_conn() as conn:
         await conn.set_autocommit(True)
         async with conn.cursor() as cur:
             await cur.execute(
-                "SELECT 1 FROM information_schema.tables WHERE table_name = %s",
-                (target_store_table,),
+                "SELECT 1 FROM information_schema.tables WHERE table_name = '_embedding_cache'"
             )
             if not await cur.fetchone():
-                logger.info(f"Table {target_store_table} not found yet, skipping warm-up.")
                 return
 
             await cur.execute(
                 f"""
-                INSERT INTO {target_store_table} ({config.id_column}, {config.embedding_column})
-                SELECT r.{config.id_column}, c.embedding
+                INSERT INTO {target_store_table} ({config.source.primary_key}, embedding)
+                SELECT r.{config.source.primary_key}, c.embedding
                 FROM {source_table} r
-                JOIN _embedding_cache c ON md5(COALESCE(r.{config.content_column}, '')::text || %s) = c.text_hash
+                JOIN _embedding_cache c ON md5(COALESCE(r.{config.source.content_column}, '')::text || %s) = c.text_hash
                 ON CONFLICT DO NOTHING
                 """,
-                (config.embedding_model,),
+                (config.vectorizer.model,),
             )
 
 
 async def check_slot_exists(settings: Settings, target_name: str) -> bool:
-    """Check if the replication slot exists on the Source DB."""
+    """Check if replication slot exists on Source."""
     sub_name = f"sub_{target_name}"
     async with await get_source_conn() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                "SELECT 1 FROM pg_replication_slots WHERE slot_name = %s",
-                (sub_name,),
+                "SELECT 1 FROM pg_replication_slots WHERE slot_name = %s", (sub_name,)
             )
             return await cur.fetchone() is not None
 
 
-async def create_placeholder_slot(settings: Settings, target_name: str) -> str:
-    """Create a logical replication slot on Source and return its consistent LSN."""
+async def get_slot_flush_lsn(settings: Settings, target_name: str) -> str | None:
+    """Get the confirmed flush LSN for a slot."""
     sub_name = f"sub_{target_name}"
-    logger.info(f"Creating placeholder replication slot {sub_name} on Source...")
     async with await get_source_conn() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                "SELECT restart_lsn FROM pg_replication_slots WHERE slot_name = %s",
+                "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = %s",
                 (sub_name,),
             )
-            res = await cur.fetchone()
-            if res:
-                lsn = str(res[0])
-                logger.info(f"Slot already exists at LSN: {lsn}")
-                return lsn
-
-            await cur.execute(
-                "SELECT lsn FROM pg_create_logical_replication_slot(%s, 'pgoutput', false, true)",
-                (sub_name,),
-            )
-            res = await cur.fetchone()
-            if not res:
-                raise RuntimeError("Failed to create replication slot")
-            lsn = str(res[0])
-            logger.info(f"Created slot at LSN: {lsn}")
+            row = await cur.fetchone()
+            lsn = str(row[0]) if row and row[0] else None
             return lsn
 
 
-async def ensure_sink_raw_table(settings: Settings, config: TableConfig):
+async def ensure_sink_raw_table(settings: Settings, config: ReplicaConfig):
     """Ensure the raw table exists in the Sink DB with correct types."""
-    target = config.sink_raw_table
+    target = config.source.table
     source_types = await get_source_column_types(settings, config)
     async with await get_sink_conn() as conn:
         await conn.set_autocommit(True)
         async with conn.cursor() as cur:
             cols_sql = []
-            for col in config.publication_columns:
+            # Ensure PK and Content are strictly used
+            final_cols = set(config.source.columns) | {config.source.primary_key, config.source.content_column}
+
+            for col in final_cols:
                 dtype = source_types.get(col, "TEXT")
-                if col == config.id_column:
+                if col == config.source.primary_key:
                     cols_sql.append(f"{col} {dtype} PRIMARY KEY")
                 else:
                     cols_sql.append(f"{col} {dtype}")
@@ -1047,7 +977,7 @@ async def ensure_sink_raw_table(settings: Settings, config: TableConfig):
 
 async def setup_sink(
     settings: Settings,
-    config: TableConfig,
+    config: ReplicaConfig,
     target_name: str,
     target_table: str | None = None,
     vectorizer_target: str | None = None,
@@ -1055,7 +985,7 @@ async def setup_sink(
     """Initialize the sink table and subscription."""
     sub_name = f"sub_{target_name}"
     pub_name = f"pub_{target_name}"
-    target = target_table or config.sink_raw_table
+    target = target_table or config.source.table
 
     await setup_state_table(settings, target_name)
     source_types = await get_source_column_types(settings, config)
@@ -1068,24 +998,54 @@ async def setup_sink(
         await register_vector(conn)
 
         async with conn.cursor() as cur:
+            # Ensure PK and Content column are ALWAYS included
+            sync_cols = set(config.source.columns)
+            if "*" in sync_cols:
+                sync_cols = set(source_types.keys())
+            
+            # Ensure PK and Content are always included
+            sync_cols = get_replica_sync_columns(config, source_types)
+            
             cols_sql = []
-            for col in config.publication_columns:
+            for col in sync_cols:
                 dtype = source_types.get(col, "TEXT")
-                if col == config.id_column:
+                if col == config.source.primary_key:
                     cols_sql.append(f"{col} {dtype} PRIMARY KEY")
                 else:
                     cols_sql.append(f"{col} {dtype}")
 
-            await cur.execute(
-                f"CREATE TABLE IF NOT EXISTS {target} ({', '.join(cols_sql)})"
-            )
+            try:
+                # 1. Create table if it doesn't exist
+                await cur.execute(
+                    f"CREATE TABLE IF NOT EXISTS {target} ({', '.join(cols_sql)})"
+                )
+                
+                # 2. Schema Evolution: Check for missing columns and add them
+                # This handles cases where the table exists (e.g. from previous tests) but is missing new columns
+                await cur.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
+                    (target,)
+                )
+                existing_columns = {row[0] for row in await cur.fetchall()}
+                logger.info(f"Checking schema evolution for {target}. Existing: {existing_columns}. Required: {sync_cols}")
+                
+                for col in sync_cols:
+                    if col not in existing_columns:
+                        dtype = source_types.get(col, "TEXT")
+                        logger.info(f"Schema Evolution: Adding missing column {col} ({dtype}) to {target}")
+                        await cur.execute(f"ALTER TABLE {target} ADD COLUMN IF NOT EXISTS {col} {dtype}")
+
+            except Exception as e:
+                # Log but ignore concurrent creation errors to avoid race conditions
+                logger.warning(f"Ignored error during table setup/evolution for {target}: {e}")
+                pass
 
             try:
                 await cur.execute("CREATE EXTENSION IF NOT EXISTS ai CASCADE")
             except Exception:
                 import pgai
                 pgai.install(settings.resolved_sink_url)
-            target = config.sink_raw_table
+            
             vectorizer_name = vectorizer_target or f"{target}_store"
             logger.info(f"Setting up sink for {target_name}, target table: {target}, vectorizer: {vectorizer_name}")
             await cur.execute(
@@ -1093,9 +1053,11 @@ async def setup_sink(
                 (vectorizer_name,),
             )
 
+            versioned_view = vectorizer_name.replace("_store", "_embedding")
+            destination_sql = f", destination => ai.destination_table(target_table => '{vectorizer_name}', view_name => '{versioned_view}')"
+            
             if not await cur.fetchone():
-                versioned_view = vectorizer_name.replace("_store", "_embedding")
-                destination_sql = f", destination => ai.destination_table(target_table => '{vectorizer_name}', view_name => '{versioned_view}')"
+                pass # We still use destination_sql for create_vectorizer call below
 
             # Retry loop for pgai creation to handle intermittent registration lag
             async def try_create_vectorizer():
@@ -1105,10 +1067,10 @@ async def setup_sink(
                         SELECT ai.create_vectorizer(
                             '{target}'::regclass,
                             name => %s,
-                            loading => ai.loading_column('{config.content_column}'),
-                            embedding => ai.embedding_{config.embedding_provider}('{config.embedding_model}', {config.embedding_dimension}),
-                            chunking => ai.chunking_{config.chunking_strategy}(),
-                            formatting => ai.formatting_python_template('{config.formatting_template}'),
+                            loading => ai.loading_column('{config.source.content_column}'),
+                            embedding => ai.embedding_{config.vectorizer.provider}('{config.vectorizer.model}', {config.vectorizer.dimension}),
+                            chunking => ai.chunking_{config.formatting.chunking_strategy}(),
+                            formatting => ai.formatting_python_template('{config.formatting.template}'),
                             if_not_exists => true
                             {destination_sql}
                         )
@@ -1124,7 +1086,7 @@ async def setup_sink(
 
             await wait_until(try_create_vectorizer, timeout=20.0, interval=2.0)
 
-            # Enable triggers
+            # Enable pgai triggers
             await cur.execute(
                 f"""
                 DO $$
@@ -1178,27 +1140,31 @@ async def setup_sink(
                 await cur.execute(f"ALTER SUBSCRIPTION {sub_name} REFRESH PUBLICATION")
 
 
-async def run_sql_catchup(settings: Settings, config: TableConfig, target_name: str):
+async def run_sql_catchup(settings: Settings, config: ReplicaConfig, target_name: str):
     """Perform Keyset Pagination for catch-up."""
     last_id_str, _ = await get_replica_state(settings, target_name)
     last_id = last_id_str if last_id_str != "0" else None
     batch_size = 5000
     total_synced = 0
+    raw_table = config.source.table
 
     while True:
         async with await get_source_conn() as source_conn:
             async with source_conn.cursor(row_factory=dict_row) as cur:
-                cols = ", ".join(config.publication_columns)
-                where_clause = f"({config.publication_where.replace('%', '%%')})" if config.publication_where else "TRUE"
+                # Ensure PK, Content, and Template columns are always included
+                source_types = await get_source_column_types(settings, config)
+                sync_cols = get_replica_sync_columns(config, source_types)
+                cols = ", ".join(sync_cols)
+                where_clause = f"({config.source.filter.replace('%', '%%')})" if config.source.filter else "TRUE"
 
                 if last_id is None:
                     await cur.execute(
-                        f"SELECT {cols} FROM {config.source_table} WHERE {where_clause} ORDER BY {config.id_column} ASC LIMIT %s",
+                        f"SELECT {cols} FROM {raw_table} WHERE {where_clause} ORDER BY {config.source.primary_key} ASC LIMIT %s",
                         (batch_size,),
                     )
                 else:
                     await cur.execute(
-                        f"SELECT {cols} FROM {config.source_table} WHERE {where_clause} AND {config.id_column} > %s ORDER BY {config.id_column} ASC LIMIT %s",
+                        f"SELECT {cols} FROM {raw_table} WHERE {where_clause} AND {config.source.primary_key} > %s ORDER BY {config.source.primary_key} ASC LIMIT %s",
                         (last_id, batch_size),
                     )
                 rows = await cur.fetchall()
@@ -1211,41 +1177,44 @@ async def run_sql_catchup(settings: Settings, config: TableConfig, target_name: 
             async with sink_conn.cursor() as cur:
                 col_names = list(rows[0].keys())
                 placeholders = ", ".join(["%s"] * len(col_names))
-                update_set = ", ".join([f"{c} = EXCLUDED.{c}" for c in col_names if c != config.id_column])
+                update_set = ", ".join([f"{c} = EXCLUDED.{c}" for c in col_names if c != config.source.primary_key])
+                
+                conflict_action = f"DO UPDATE SET {update_set}" if update_set else "DO NOTHING"
+                
                 upsert_query = f"""
-                    INSERT INTO {config.sink_raw_table} ({', '.join(col_names)})
+                    INSERT INTO {raw_table} ({', '.join(col_names)})
                     VALUES ({placeholders})
-                    ON CONFLICT ({config.id_column}) DO UPDATE SET {update_set}
+                    ON CONFLICT ({config.source.primary_key}) {conflict_action}
                 """
                 data = [tuple(row.values()) for row in rows]
                 await cur.executemany(upsert_query, data)
 
-        last_id = rows[-1][config.id_column]
+        last_id = rows[-1][config.source.primary_key]
         total_synced += len(rows)
         await update_replica_state(settings, target_name, last_id=str(last_id))
     logger.info(f"Catch-up complete for {target_name}: {total_synced} rows.")
 
 
-async def find_and_fix_ghost_records(settings: Settings, config: TableConfig, target_name: str):
+async def find_and_fix_ghost_records(settings: Settings, config: ReplicaConfig, target_name: str):
     """Anti-Entropy sweep to find and delete hard-deleted records."""
     logger.info(f"Starting Anti-Entropy sweep for {target_name}...")
+    raw_table = config.source.table
     
     # Pre-flight readiness check to avoid race conditions in tests
     if not await wait_for_source_table(settings, config):
-        raise RuntimeError(f"Source table {config.source_table} not found after timeout")
+        raise RuntimeError(f"Source table {raw_table} not found after timeout")
 
     chunk_size = 50000
     
     # 1. Range discovery: absolute union of Source and Sink IDs
-    # This ensures we catch deletions at the very beginning or end of the tables.
     all_ids = []
     
     async with await get_sink_conn() as conn:
         async with conn.cursor() as cur:
             try:
-                await cur.execute(f"SELECT {config.id_column} FROM {config.sink_raw_table} ORDER BY {config.id_column} ASC LIMIT 1")
+                await cur.execute(f"SELECT {config.source.primary_key} FROM {raw_table} ORDER BY {config.source.primary_key} ASC LIMIT 1")
                 row_min = await cur.fetchone()
-                await cur.execute(f"SELECT {config.id_column} FROM {config.sink_raw_table} ORDER BY {config.id_column} DESC LIMIT 1")
+                await cur.execute(f"SELECT {config.source.primary_key} FROM {raw_table} ORDER BY {config.source.primary_key} DESC LIMIT 1")
                 row_max = await cur.fetchone()
                 
                 if row_min: # If row_min is not None, table is not empty
@@ -1257,9 +1226,9 @@ async def find_and_fix_ghost_records(settings: Settings, config: TableConfig, ta
     async with await get_source_conn() as s_conn:
         async with s_conn.cursor() as s_cur:
             try:
-                await s_cur.execute(f"SELECT {config.id_column} FROM {config.source_table} ORDER BY {config.id_column} ASC LIMIT 1")
+                await s_cur.execute(f"SELECT {config.source.primary_key} FROM {raw_table} ORDER BY {config.source.primary_key} ASC LIMIT 1")
                 row_min = await s_cur.fetchone()
-                await s_cur.execute(f"SELECT {config.id_column} FROM {config.source_table} ORDER BY {config.id_column} DESC LIMIT 1")
+                await s_cur.execute(f"SELECT {config.source.primary_key} FROM {raw_table} ORDER BY {config.source.primary_key} DESC LIMIT 1")
                 row_max = await s_cur.fetchone()
                 
                 if row_min:
@@ -1274,17 +1243,17 @@ async def find_and_fix_ghost_records(settings: Settings, config: TableConfig, ta
 
     min_id_raw, max_id_raw = min(all_ids), max(all_ids)
     source_types = await get_source_column_types(settings, config)
-    id_type = source_types.get(config.id_column, "TEXT")
+    id_type = source_types.get(config.source.primary_key, "TEXT")
 
     # 2. Strategy: Set Comparison for UUIDs/Strings or Small Tables
     if id_type not in ("INT", "BIGINT"):
         async with await get_source_conn() as s_conn:
             async with s_conn.cursor() as s_cur:
-                await s_cur.execute(f"SELECT {config.id_column} FROM {config.source_table}")
+                await s_cur.execute(f"SELECT {config.source.primary_key} FROM {raw_table}")
                 source_ids = set(r[0] for r in await s_cur.fetchall())
         async with await get_sink_conn() as k_conn:
             async with k_conn.cursor() as k_cur:
-                await k_cur.execute(f"SELECT {config.id_column} FROM {config.sink_raw_table}")
+                await k_cur.execute(f"SELECT {config.source.primary_key} FROM {raw_table}")
                 sink_ids = [r[0] for r in await k_cur.fetchall()]
         
         ghosts = [kid for kid in sink_ids if kid not in source_ids]
@@ -1292,7 +1261,7 @@ async def find_and_fix_ghost_records(settings: Settings, config: TableConfig, ta
             logger.info(f"Found {len(ghosts)} ghosts in {target_name} via set comparison")
             async with await get_sink_conn() as k_conn:
                 async with k_conn.cursor() as k_cur:
-                    await k_cur.execute(f"DELETE FROM {config.sink_raw_table} WHERE {config.id_column} = ANY(%s)", (ghosts,))
+                    await k_cur.execute(f"DELETE FROM {raw_table} WHERE {config.source.primary_key} = ANY(%s)", (ghosts,))
                 await k_conn.commit()
         return
 
@@ -1303,11 +1272,11 @@ async def find_and_fix_ghost_records(settings: Settings, config: TableConfig, ta
         end_id = start_id + chunk_size
         async with await get_source_conn() as s_conn:
             async with s_conn.cursor() as s_cur:
-                await s_cur.execute(f"SELECT count(*), bit_xor({config.id_column}) FROM {config.source_table} WHERE {config.id_column} BETWEEN %s AND %s", (start_id, end_id))
+                await s_cur.execute(f"SELECT count(*), bit_xor({config.source.primary_key}) FROM {raw_table} WHERE {config.source.primary_key} BETWEEN %s AND %s", (start_id, end_id))
                 s_count, s_xor = await s_cur.fetchone()
         async with await get_sink_conn() as k_conn:
             async with k_conn.cursor() as k_cur:
-                await k_cur.execute(f"SELECT count(*), bit_xor({config.id_column}) FROM {config.sink_raw_table} WHERE {config.id_column} BETWEEN %s AND %s", (start_id, end_id))
+                await k_cur.execute(f"SELECT count(*), bit_xor({config.source.primary_key}) FROM {raw_table} WHERE {config.source.primary_key} BETWEEN %s AND %s", (start_id, end_id))
                 k_count, k_xor = await k_cur.fetchone()
         
         logger.debug(f"Range {start_id}-{end_id}: Source(count={s_count}, xor={s_xor}), Sink(count={k_count}, xor={k_xor})")
@@ -1316,29 +1285,30 @@ async def find_and_fix_ghost_records(settings: Settings, config: TableConfig, ta
             logger.info(f"Drift detected in range {start_id}-{end_id} for {target_name}. Performing deep check...")
             async with await get_source_conn() as s_conn:
                 async with s_conn.cursor() as s_cur:
-                    await s_cur.execute(f"SELECT {config.id_column} FROM {config.source_table} WHERE {config.id_column} BETWEEN %s AND %s", (start_id, end_id))
+                    await s_cur.execute(f"SELECT {config.source.primary_key} FROM {raw_table} WHERE {config.source.primary_key} BETWEEN %s AND %s", (start_id, end_id))
                     s_ids = set(r[0] for r in await s_cur.fetchall())
             async with await get_sink_conn() as k_conn:
                 async with k_conn.cursor() as k_cur:
-                    await k_cur.execute(f"SELECT {config.id_column} FROM {config.sink_raw_table} WHERE {config.id_column} BETWEEN %s AND %s", (start_id, end_id))
+                    await k_cur.execute(f"SELECT {config.source.primary_key} FROM {raw_table} WHERE {config.source.primary_key} BETWEEN %s AND %s", (start_id, end_id))
                     k_ids = [r[0] for r in await k_cur.fetchall()]
                     ghosts = [kid for kid in k_ids if kid not in s_ids]
                     if ghosts:
                         logger.warning(f"Found {len(ghosts)} ghosts in range {start_id}-{end_id} for {target_name}: {ghosts}")
                         async with await get_sink_conn() as del_conn:
                             async with del_conn.cursor() as del_cur:
-                                await del_cur.execute(f"DELETE FROM {config.sink_raw_table} WHERE {config.id_column} = ANY(%s)", (ghosts,))
+                                await del_cur.execute(f"DELETE FROM {raw_table} WHERE {config.source.primary_key} = ANY(%s)", (ghosts,))
                             await del_conn.commit()
 
 
-async def drop_subscription_completely(settings: Settings, config: TableConfig, target_name: str):
+async def drop_subscription_completely(settings: Settings, config: ReplicaConfig, target_name: str):
     """Drop replication objects for a specific target."""
     sub_name = f"sub_{target_name}"
+    sink_replica_table = f"{config.source.table}_search"
     logger.info(f"Dropping replication {sub_name} for {target_name}...")
     try:
         async with await connect_db(settings.resolved_sink_url) as conn:
             await conn.set_autocommit(True)
-            await conn.execute(f"DROP VIEW IF EXISTS {config.sink_replica_table} CASCADE")
+            await conn.execute(f"DROP VIEW IF EXISTS {sink_replica_table} CASCADE")
             
             # Retry loop for dropping subscription to handle "sync in progress"
             async def try_drop_subscription():
@@ -1372,7 +1342,7 @@ async def drop_subscription_completely(settings: Settings, config: TableConfig, 
                         
             # Cleanup vectorizers
             async with conn.cursor() as cur:
-                await cur.execute("SELECT id FROM ai.vectorizer WHERE name LIKE %s", (f"{config.sink_raw_table}_store%",))
+                await cur.execute("SELECT id FROM ai.vectorizer WHERE name LIKE %s", (f"{config.source.table}_store%",))
                 for (vid,) in await cur.fetchall():
                     await cur.execute(f"SELECT ai.drop_vectorizer({vid}, drop_all => true)")
     except Exception as e:
@@ -1387,16 +1357,117 @@ async def drop_subscription_completely(settings: Settings, config: TableConfig, 
     except Exception as e: logger.warning(f"teardown source error: {e}")
 
 
+async def ensure_outbox_infrastructure(settings: Settings):
+    """Ensure the outbox table and drift detection tables exist."""
+    logger.info("Ensuring Outbox Mirroring infrastructure...")
+    async with await get_sink_conn() as conn:
+        await conn.set_autocommit(True)
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS _sink_outbox (
+                    id BIGSERIAL PRIMARY KEY,
+                    target_name TEXT NOT NULL,
+                    version_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    action TEXT NOT NULL, 
+                    payload JSONB,
+                    processed BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+                """
+            )
+            await cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_target_version ON _sink_outbox(target_name, version_id)")
+            await cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_processed ON _sink_outbox(processed) WHERE processed = FALSE")
+            
+            await cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS _sink_mirror_registry (
+                    mirror_id TEXT NOT NULL,
+                    target_name TEXT NOT NULL,
+                    last_processed_id BIGINT DEFAULT 0,
+                    promoted_version_id TEXT,
+                    error_count INT DEFAULT 0,
+                    last_error TEXT,
+                    last_sync_latency_ms INT,
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    PRIMARY KEY (mirror_id, target_name)
+                )
+                """
+            )
+
+async def ensure_observability_infrastructure(settings: Settings):
+    """Ensure observability tables exist for experiments and failure tracking."""
+    logger.info("Ensuring Observability infrastructure...")
+    async with await get_sink_conn() as conn:
+        await conn.set_autocommit(True)
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS _search_experiment_logs (
+                    id BIGSERIAL PRIMARY KEY,
+                    target_name TEXT NOT NULL,
+                    version_id TEXT NOT NULL,
+                    started_at TIMESTAMP DEFAULT NOW(),
+                    finished_at TIMESTAMP,
+                    success_rate FLOAT,
+                    metadata JSONB DEFAULT '{}'::jsonb
+                )
+                """
+            )
+            await cur.execute("CREATE INDEX IF NOT EXISTS idx_experiments_target ON _search_experiment_logs(target_name, version_id)")
+            
+            await cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS _pipeline_failures (
+                    id BIGSERIAL PRIMARY KEY,
+                    target_name TEXT,
+                    version_id TEXT,
+                    source_id TEXT UNIQUE,
+                    error_message TEXT,
+                    context JSONB,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+                """
+            )
+
+async def create_placeholder_slot(settings: Settings, target_name: str) -> str:
+    """Create a replication slot on the source to hold WAL position."""
+    sub_name = f"sub_{target_name}"
+    logger.info(f"Creating placeholder slot {sub_name} on Source...")
+    
+    async with await get_source_conn() as conn:
+        async with conn.cursor() as cur:
+            try:
+                # Use pgoutput for standard logical replication
+                await cur.execute(
+                    f"SELECT lsn FROM pg_create_logical_replication_slot('{sub_name}', 'pgoutput')"
+                )
+                row = await cur.fetchone()
+                return str(row[0]) if row else None
+            except Exception as e:
+                if "already exists" in str(e):
+                    await conn.rollback()
+                    logger.warning(f"Slot {sub_name} already exists, retrieving LSN...")
+                    await cur.execute(
+                        "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = %s", 
+                        (sub_name,)
+                    )
+                    row = await cur.fetchone()
+                    return str(row[0]) if row else None
+                raise e
+
+
 async def check_and_protect_source(settings: Settings, target_name: str) -> float:
     """Monitor lag and self-destruct if needed."""
     sub_name = f"sub_{target_name}"
-    config = settings.tables[target_name]
+    config = settings.replicas[target_name]
     try:
         async with await get_source_conn() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) / 1024 / 1024 FROM pg_replication_slots WHERE slot_name = %s", (sub_name,))
                 res = await cur.fetchone()
-                if res and float(res[0]) > settings.max_slot_wal_keep_size_mb:
+                if res and float(res[0]) > config.source.max_slot_wal_keep_size_mb:
                     await drop_subscription_completely(settings, config, target_name)
                     raise RuntimeError("Self-destructed to protect Source DB.")
                 return float(res[0]) if res else 0.0

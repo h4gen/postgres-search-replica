@@ -30,20 +30,24 @@ async def test_universal_outbox_capture_and_sync():
     async with connect(
         source_url=source_url_host,
         sink_url=sink_url_host,
-        tables={
-            "products": {
-                "source_table": "products",
-                "publication_columns": ["id", "name", "description"],
-                "search_profile": "hybrid",
+        replicas={
+            "outbox_products": {
+                "source": {
+                    "table": "outbox_products",
+                    "columns": ["id", "name", "description"]
+                },
+                "search": {"profile": "hybrid"},
                 "active": True,
-                "mirrors": [
-                    {
-                        "id": "qdrant_test",
-                        "type": "qdrant",
-                        "url": "http://localhost:6333",
-                        "prefix": "test_"
-                    }
-                ]
+                "mirrors": {
+                    "targets": [
+                        {
+                            "id": "qdrant_test",
+                            "type": "qdrant",
+                            "url": "http://localhost:6333",
+                            "prefix": "test_"
+                        }
+                    ]
+                }
             }
         },
         sync=True
@@ -54,8 +58,10 @@ async def test_universal_outbox_capture_and_sync():
         
         # 2. Insert data into Source
         async with await connect_db(source_url_host) as conn:
+            await conn.execute("DROP TABLE IF EXISTS outbox_products CASCADE")
+            await conn.execute("CREATE TABLE outbox_products (id SERIAL PRIMARY KEY, name TEXT, description TEXT)")
             await conn.execute(
-                "INSERT INTO products (name, description) VALUES (%s, %s)",
+                "INSERT INTO outbox_products (name, description) VALUES (%s, %s)",
                 ("Outbox Test Product", "This product should end up in the outbox and then in Qdrant.")
             )
             await conn.commit()
@@ -89,7 +95,7 @@ async def test_universal_outbox_capture_and_sync():
                 # We expect a collection named 'products_v...'
                 collections = qdrant.get_collections().collections
                 for col in collections:
-                    if col.name.startswith("test_products_"):
+                    if col.name.startswith("test_outbox_products_"):
                         points = qdrant.scroll(collection_name=col.name, limit=1)[0]
                         if points:
                             found_in_qdrant = True

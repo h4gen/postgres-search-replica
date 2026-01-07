@@ -4,6 +4,7 @@ import pytest
 import uuid
 from qdrant_client import QdrantClient
 from pg_replica import connect
+from pg_replica.config import Settings, ReplicaConfig, SourceConfig, FormattingConfig, SearchConfig, MirrorsConfig
 from pg_replica.database import get_sink_conn, dict_row, connect_db
 
 logger = logging.getLogger(__name__)
@@ -114,25 +115,28 @@ async def test_search_strategies_postgres_vs_qdrant():
     async with connect(
         source_url=source_url,
         sink_url=sink_url,
-        tables={
+        replicas={
             "strat_products": {
-                "source_table": "strat_products",
-                "sink_raw_table": "strat_products",
-                "sink_replica_table": "strat_products_search",
-                "publication_columns": ["id", "name", "description"],
-                "formatting_template": "Title: $name\nContent: $chunk",
+                "source": {
+                    "table": "strat_products",
+                    "columns": ["id", "name", "description"]
+                },
+                "formatting": {"template": "Title: $name\nContent: $chunk"},
                 "active": True,
-                "mirrors": [
-                    {
-                        "id": "qdrant_meta",
-                        "type": "qdrant",
-                        "url": "http://localhost:6333",
-                        "prefix": "strat_test_"
-                    }
-                ]
+                "mirrors": {
+                    "targets": [
+                        {
+                            "id": "qdrant_meta",
+                            "type": "qdrant",
+                            "url": "http://localhost:6333",
+                            "prefix": "strat_test_"
+                        }
+                    ]
+                }
             }
         },
-        sync=True
+        sync=True,
+        subscription_connection_url=source_url_internal,
     ) as replica:
         # 1. Seed Source
         # unique_id = str(uuid.uuid4())[:8] # Not needed with fixed product name
@@ -196,16 +200,29 @@ async def test_search_strategies_postgres_vs_qdrant():
         else:
             pytest.fail(f"Timed out waiting for sync. State: qdrant={found_in_qdrant}, view={view_exists}")
 
-        # 3. Test Postgres Search
-        res_pg = await replica.search("high-tech watch")
+        # 3. Test Postgres Search (with retry)
+        # Note: Postgres search might need a moment for the view/index to be fully consistent
+        res_pg = []
+        for _ in range(10):
+            res_pg = await replica.search("high-tech watch")
+            if len(res_pg) > 0:
+                break
+            await asyncio.sleep(1)
+            
         # Verify content
-        assert len(res_pg) > 0
+        assert len(res_pg) > 0, "Postgres search returned no results"
         assert product_name in res_pg[0]["content"]
         
         # 4. Test Qdrant Search
         # Note: Qdrant strategy might need wait/retry in a real integration scenario
-        res_qdrant = await replica.search("high-tech watch", engine="qdrant")
-        assert len(res_qdrant) > 0
+        res_qdrant = []
+        for _ in range(10):
+            res_qdrant = await replica.search("high-tech watch", engine="qdrant")
+            if len(res_qdrant) > 0:
+                break
+            await asyncio.sleep(1)
+
+        assert len(res_qdrant) > 0, "Qdrant search returned no results"
         assert product_name in res_qdrant[0]["content"]
         
         # Verify result consistency
@@ -225,24 +242,49 @@ async def test_search_alias_promotion():
 
     qdrant = QdrantClient("http://localhost:6333")
     
+    # Pre-clean sink table to avoid schema drift issues from previous tests
+    # We must construct Settings to resolve the sink URL (e.g. "local" -> localhost)
+    settings = Settings(source_url=source_url, sink_url=sink_url)
+    async with await connect_db(settings.resolved_sink_url) as conn:
+        await conn.set_autocommit(True)
+        # 0. Clean slate for Table
+        await conn.execute("DROP TABLE IF EXISTS products CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS alias_products CASCADE")
+        
+        # 0.5 Clean slate for Subscription (Prevent stale slot reuse)
+        for sub in ["sub_products", "sub_alias_products"]:
+            try:
+                 await conn.execute(f"ALTER SUBSCRIPTION {sub} DISABLE")
+                 await conn.execute(f"ALTER SUBSCRIPTION {sub} SET (slot_name = NONE)")
+                 await conn.execute(f"DROP SUBSCRIPTION IF EXISTS {sub}")
+            except Exception:
+                 pass
+
     # 1. Start with Version 1
     async with connect(
         source_url=source_url,
         sink_url=sink_url,
-        tables={
-            "products": {
-                "source_table": "products",
-                "publication_columns": ["id", "name", "description"],
-                "formatting_template": "V1: $name $chunk",
+        replicas={
+            "alias_products": {
+                "source": {
+                    "table": "alias_products",
+                    "columns": ["id", "name", "description"]
+                },
+                "formatting": {"template": "V1: $name $chunk"},
                 "active": True,
-                "mirrors": [{"id": "m1", "type": "qdrant", "url": "http://localhost:6333", "prefix": "alias_test_"}]
+                "mirrors": {
+                    "targets": [{"id": "m1", "type": "qdrant", "url": "http://localhost:6333", "prefix": "alias_test_"}]
+                }
             }
         },
-        sync=True
+        sync=True,
+        subscription_connection_url=source_url_internal,
     ) as replica:
         # Seed data to ensure outbox/mirrors have something to do
         async with await connect_db(source_url) as conn:
-            await conn.execute("INSERT INTO products (name, description) VALUES ('V1 Product', 'Description')")
+            await conn.execute("DROP TABLE IF EXISTS alias_products CASCADE")
+            await conn.execute("CREATE TABLE alias_products AS SELECT * FROM products")
+            await conn.execute("INSERT INTO alias_products (name, description) VALUES ('V1 Product', 'Description')")
             await conn.commit()
 
         # Force migration
@@ -251,12 +293,12 @@ async def test_search_alias_promotion():
             await conn.commit()
 
         # Wait for promotion (Postgres)
-        logger.info("Waiting for Postgres view products_search...")
+        logger.info("Waiting for Postgres view alias_products_search...")
         for i in range(30):
             try:
                 async with await get_sink_conn() as conn:
                     async with conn.cursor() as cur:
-                        await cur.execute("SELECT count(*) FROM products_search")
+                        await cur.execute("SELECT count(*) FROM alias_products_search")
                         logger.info(f"Postgres view is ready (attempt {i})")
                         break
             except Exception: pass
@@ -265,12 +307,12 @@ async def test_search_alias_promotion():
             pytest.fail("Timed out waiting for Postgres view")
         
         # Verify Qdrant Alias points to V1
-        logger.info("Waiting for Qdrant Alias alias_test_products_production...")
+        logger.info("Waiting for Qdrant Alias alias_test_alias_products_production...")
         v1_collection = None
         for i in range(30):
             try:
                 aliases = qdrant.get_aliases().aliases
-                found = next((a for a in aliases if a.alias_name == "alias_test_products_production"), None)
+                found = next((a for a in aliases if a.alias_name == "alias_test_alias_products_production"), None)
                 if found:
                     v1_collection = found.collection_name
                     logger.info(f"Qdrant Alias discovered: {v1_collection}")
@@ -282,22 +324,27 @@ async def test_search_alias_promotion():
             collections = [c.name for c in qdrant.get_collections().collections]
             pytest.fail(f"Timed out waiting for V1 Qdrant Alias. Available collections: {collections}")
             
-        assert "alias_test_products_" in v1_collection
+        assert "alias_test_alias_products_" in v1_collection
 
     # 2. Upgrade to Version 2 (Change formatting)
     async with connect(
         source_url=source_url,
         sink_url=sink_url,
-        tables={
-            "products": {
-                "source_table": "products",
-                "publication_columns": ["id", "name", "description"],
-                "formatting_template": "V2: $name $chunk",
+        replicas={
+            "alias_products": {
+                "source": {
+                    "table": "alias_products",
+                    "columns": ["id", "name", "description"]
+                },
+                "formatting": {"template": "V2: $name $chunk"},
                 "active": True,
-                "mirrors": [{"id": "m1", "type": "qdrant", "url": "http://localhost:6333", "prefix": "alias_test_"}]
+                "mirrors": {
+                    "targets": [{"id": "m1", "type": "qdrant", "url": "http://localhost:6333", "prefix": "alias_test_"}]
+                }
             }
         },
-        sync=True
+        sync=True,
+        subscription_connection_url=source_url_internal,
     ) as replica:
         # Wait for promotion to V2 (Postgres)
         logger.info("Waiting for Postgres view promotion to V2...")
@@ -305,7 +352,7 @@ async def test_search_alias_promotion():
             try:
                 async with await get_sink_conn() as conn:
                     async with conn.cursor() as cur:
-                        await cur.execute("SELECT view_definition FROM information_schema.views WHERE table_name = 'products_search'")
+                        await cur.execute("SELECT view_definition FROM information_schema.views WHERE table_name = 'alias_products_search'")
                         row = await cur.fetchone()
                         if row and v1_collection not in row[0]: # View definition changed to new target
                             logger.info("Postgres view promoted to V2")
@@ -319,21 +366,21 @@ async def test_search_alias_promotion():
         logger.info("Waiting for Qdrant Alias to follow V1 -> V2...")
         for _ in range(30):
             aliases = qdrant.get_aliases().aliases
-            found = next((a for a in aliases if a.alias_name == "alias_test_products_production"), None)
+            found = next((a for a in aliases if a.alias_name == "alias_test_alias_products_production"), None)
             if found and found.collection_name != v1_collection:
                 logger.info(f"Qdrant Alias promoted to {found.collection_name}")
                 break
             await asyncio.sleep(1)
             
         aliases = qdrant.get_aliases().aliases
-        found = next((a for a in aliases if a.alias_name == "alias_test_products_production"), None)
+        found = next((a for a in aliases if a.alias_name == "alias_test_alias_products_production"), None)
         assert found.collection_name != v1_collection
-        assert "alias_test_products_" in found.collection_name
+        assert "alias_test_alias_products_" in found.collection_name
         
         # Final check: search via alias (with retry to handle eventual searchability)
         logger.info("Verifying search via Qdrant Alias...")
         for _ in range(10):
-            res = await replica.search("watch", engine="qdrant")
+            res = await replica.search("Product", engine="qdrant")
             if len(res) > 0:
                 logger.info(f"Search success: found {len(res)} results")
                 break

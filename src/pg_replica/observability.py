@@ -5,10 +5,10 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest, Gauge
 from pg_replica.database import (
     get_pipeline_summary, 
     get_resource_projections, 
-    save_table_config,
-    get_latest_table_config
+    save_replica_config,
+    get_latest_replica_config
 )
-from pg_replica.config import settings, TableConfig
+from pg_replica.config import settings, ReplicaConfig
 from pg_replica.reconciler import Planner, Inspector
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ async def control_plane_summary():
     
     # Enrich with projections for each table
     projections = {}
-    for table_name, config in settings.tables.items():
+    for table_name, config in settings.replicas.items():
         try:
             projections[table_name] = await get_resource_projections(settings, config)
         except Exception as e:
@@ -58,22 +58,22 @@ async def control_plane_summary():
         "projections": projections,
         "config_summaries": {
             k: {
-                "search_profile": v.search_profile,
-                "model": v.embedding_model,
+                "search_profile": v.search.profile,
+                "model": v.vectorizer.model,
                 "version_id": v.get_version_id(),
                 "generation": getattr(v, "_generation", 0)
-            } for k, v in settings.tables.items()
+            } for k, v in settings.replicas.items()
         }
     }
 
 
 @app.post("/control-plane/config/{target_name}")
-async def update_config(target_name: str, config: TableConfig):
+async def update_config(target_name: str, config: ReplicaConfig):
     """
     Apply a new configuration for a table.
     Runs admission validation (Dry Run) before persisting.
     """
-    if target_name not in settings.tables:
+    if target_name not in settings.replicas:
         raise HTTPException(status_code=404, detail=f"Target {target_name} not found in current settings")
 
     # 1. Admission Control / Dry Run
@@ -82,22 +82,22 @@ async def update_config(target_name: str, config: TableConfig):
     sink_state = await inspector.get_sink_state()
     
     # Temporarily override to see if it plans correctly
-    orig_config = settings.tables[target_name]
-    settings.tables[target_name] = config
+    orig_config = settings.replicas[target_name]
+    settings.replicas[target_name] = config
     
     planner = Planner(settings)
     try:
         actions = planner.plan(source_state, sink_state)
         # If planning succeeds, we consider it valid for now
     except Exception as e:
-        settings.tables[target_name] = orig_config
+        settings.replicas[target_name] = orig_config
         raise HTTPException(status_code=400, detail=f"Configuration rejected by Planner: {e}")
     finally:
         # Restore original config for the main process loop
-        settings.tables[target_name] = orig_config
+        settings.replicas[target_name] = orig_config
 
     # 2. Persist
-    generation = await save_table_config(settings, target_name, config)
+    generation = await save_replica_config(settings, target_name, config)
     
     return {
         "status": "accepted",
@@ -109,23 +109,23 @@ async def update_config(target_name: str, config: TableConfig):
 
 
 @app.get("/control-plane/dry-run/{target_name}")
-async def dry_run(target_name: str, config: TableConfig = None):
+async def dry_run(target_name: str, config: ReplicaConfig = None):
     """
     Preview actions and resource projections for a proposed configuration.
     If no config provided, uses the latest one from DB or Settings.
     """
-    if target_name not in settings.tables:
+    if target_name not in settings.replicas:
         raise HTTPException(status_code=404, detail=f"Target {target_name} not found")
 
-    target_config = config or settings.tables[target_name]
+    target_config = config or settings.replicas[target_name]
     
     inspector = Inspector(settings)
     source_state = await inspector.get_source_state()
     sink_state = await inspector.get_sink_state()
     
     # Override
-    orig_config = settings.tables[target_name]
-    settings.tables[target_name] = target_config
+    orig_config = settings.replicas[target_name]
+    settings.replicas[target_name] = target_config
     
     planner = Planner(settings)
     actions = planner.plan(source_state, sink_state)
@@ -134,7 +134,7 @@ async def dry_run(target_name: str, config: TableConfig = None):
     projections = await get_resource_projections(settings, target_config)
     
     # Restore
-    settings.tables[target_name] = orig_config
+    settings.replicas[target_name] = orig_config
     
     return {
         "target_name": target_name,

@@ -30,7 +30,7 @@ async def wait_until(
             if result:
                 return result
         except Exception as e:
-            logger.debug(f"Predicate raised exception: {e}")
+            logger.warning(f"Predicate raised exception: {e}")
             
         if asyncio.get_event_loop().time() - start_time >= timeout:
             raise asyncio.TimeoutError(f"{message} (waited {timeout}s)")

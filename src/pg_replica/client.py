@@ -62,6 +62,7 @@ class PGSearchReplica:
     async def _get_conn(self):
         if not self._conn or self._conn.closed:
             self._conn = await connect_db(self.settings.resolved_sink_url)
+            await self._conn.set_autocommit(True)
             from pgvector.psycopg import register_vector_async
             await register_vector_async(self._conn)
         return self._conn
@@ -79,20 +80,20 @@ class PGSearchReplica:
             engine: The search engine to use (postgres, qdrant, pinecone). 
                     Defaults to the one in TableConfig.
         """
-        if not self.settings.tables:
-            raise RuntimeError("No tables configured for search.")
+        if not self.settings.replicas:
+            raise RuntimeError("No replicas configured for search.")
 
-        target_name = table or next(iter(self.settings.tables))
-        if target_name not in self.settings.tables:
-            raise ValueError(f"Table configuration '{target_name}' not found.")
+        target_name = table or next(iter(self.settings.replicas))
+        if target_name not in self.settings.replicas:
+            raise ValueError(f"Replica configuration '{target_name}' not found.")
         
-        config = self.settings.tables[target_name]
-        search_engine = engine or config.search_engine
+        config = self.settings.replicas[target_name]
+        search_engine = engine or config.search.target_engine
 
         # 1. Get embedding in Python
         ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
         client = AsyncClient(host=ollama_host)
-        res = await client.embeddings(model=config.embedding_model, prompt=query)
+        res = await client.embeddings(model=config.vectorizer.model, prompt=query)
         embedding = res["embedding"]
 
         # 2. Execute via strategy
@@ -111,6 +112,7 @@ class PGSearchReplica:
             query=query,
             embedding=embedding,
             limit=limit,
+            target_name=target_name,
             config=config,
             conn_provider=self._get_conn
         )

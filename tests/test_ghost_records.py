@@ -10,13 +10,15 @@ async def test_ghost_fix_uuid_regression():
     """Reproduce the NameError in find_and_fix_ghost_records with UUID IDs."""
     from unittest.mock import patch
     custom_settings = {
-        "tables": {
+        "replicas": {
             "uuid_ghost": {
-                "source_table": "table_uuid_ghost",
-                "id_column": "id",
-                "publication_columns": ["id", "content"],
-                "content_column": "content",
-                "formatting_template": "$chunk $content",
+                "source": {
+                    "table": "table_uuid_ghost",
+                    "primary_key": "id",
+                    "columns": ["id", "content"],
+                    "content_column": "content"
+                },
+                "formatting": {"template": "$chunk $content"},
             }
         }
     }
@@ -37,7 +39,7 @@ async def test_ghost_fix_uuid_regression():
             await conn.execute("DELETE FROM _replica_state WHERE key = 'sub_uuid_ghost'")
 
         async with PGSearchReplica(sync=True, **custom_settings) as replica:
-            config = replica.settings.tables["uuid_ghost"]
+            config = replica.settings.replicas["uuid_ghost"]
             
             # This SHOULD trigger Strategy 2 in find_and_fix_ghost_records
             # because ID type is UUID (non-numeric).

@@ -2,13 +2,16 @@
 import asyncio
 import pytest
 import psycopg
-from pg_replica.config import Settings, TableConfig
+from pg_replica.config import (
+    Settings, ReplicaConfig, SourceConfig, VectorizerConfig,
+    FormattingConfig, SearchConfig, MirrorsConfig
+)
 from pg_replica.reconciler import Reconciler
 from pg_replica.database import get_sink_conn
 
 # Test Data
 TABLE_NAME = "products"
-REPLICA_TABLE = "search_products"
+REPLICA_TABLE = f"{TABLE_NAME}_search"
 
 @pytest.mark.asyncio
 async def test_declarative_blue_green_orchestration():
@@ -52,12 +55,12 @@ async def test_declarative_blue_green_orchestration():
     
     # This is for the Sink container to connect to the Source container
     from tests.test_integration import get_internal_source_url
-    os.environ["SUBSCRIPTION_SOURCE_URL"] = get_internal_source_url(Settings(source_url=source_url, sink_url=sink_url, tables={}))
+    os.environ["SUBSCRIPTION_SOURCE_URL"] = get_internal_source_url(Settings(source_url=source_url, sink_url=sink_url, replicas={}))
 
     settings = Settings(
         source_url=source_url,
         sink_url=sink_url,
-        tables={}
+        replicas={}
     )
     
     # Initialize connection pools
@@ -67,7 +70,11 @@ async def test_declarative_blue_green_orchestration():
     async with await get_sink_conn() as conn:
         async with conn.cursor() as cur:
             await cur.execute(f"DROP VIEW IF EXISTS {REPLICA_TABLE}")
-            await cur.execute("TRUNCATE TABLE _replica_state CASCADE")
+            try:
+                await cur.execute("TRUNCATE TABLE _replica_state CASCADE")
+                await cur.execute("TRUNCATE TABLE _replica_config_history CASCADE")
+            except Exception:
+                pass
             # Clean up vectorizers only if the extension table exists
             await cur.execute("""
                 SELECT EXISTS (
@@ -81,16 +88,16 @@ async def test_declarative_blue_green_orchestration():
     reconciler = Reconciler(settings)
 
     print("\n--- Phase 1: Initial Deployment (v1) ---")
-    config_v1 = TableConfig(
-        source_table=TABLE_NAME,
-        sink_raw_table=TABLE_NAME,
-        sink_replica_table=REPLICA_TABLE,
-        publication_columns=["id", "name", "description"],
-        embedding_model="nomic-embed-text", # v1 model
+    config_v1 = ReplicaConfig(
+        source=SourceConfig(table=TABLE_NAME, columns=["id", "name", "description"]),
+        vectorizer=VectorizerConfig(model="nomic-embed-text"),
+        formatting=FormattingConfig(template="$chunk"),
+        search=SearchConfig(),
+        mirrors=MirrorsConfig(),
         active=True
     )
     
-    settings.tables = {"v1": config_v1}
+    settings.replicas = {"v1": config_v1}
     
     # 1.1 First Reconcile: Should create infra and view (since it's bootstrap)
     await reconciler.reconcile()
@@ -105,10 +112,17 @@ async def test_declarative_blue_green_orchestration():
 
     print("\n--- Phase 2: Add v2 (Scanning) ---")
     # Change model to trigger new version
-    config_v2 = config_v1.model_copy(update={"embedding_model": "all-minilm", "active": False})
+    config_v2 = ReplicaConfig(
+        source=config_v1.source.model_copy(),
+        vectorizer=VectorizerConfig(model="all-minilm"),
+        formatting=config_v1.formatting.model_copy(),
+        search=config_v1.search.model_copy(),
+        mirrors=config_v1.mirrors.model_copy(),
+        active=False
+    )
     
     # We must keep v1 in settings so it doesn't get cleaned up!
-    settings.tables = {"v1": config_v1, "v2": config_v2}
+    settings.replicas = {"v1": config_v1, "v2": config_v2}
     
     await reconciler.reconcile()
     
@@ -123,7 +137,7 @@ async def test_declarative_blue_green_orchestration():
     # Swap active flags
     config_v1.active = False
     config_v2.active = True
-    settings.tables = {"v1": config_v1, "v2": config_v2}
+    settings.replicas = {"v1": config_v1, "v2": config_v2}
     
     # Running reconcile now:
     # v2 is active but likely NOT synced yet (unless dataset is tiny).
