@@ -144,7 +144,7 @@ class Orchestrator:
             
             await self._log_pgai_status()
             try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=30)
+                await asyncio.wait_for(self._stop_event.wait(), timeout=2)
             except asyncio.TimeoutError:
                 continue
 
