@@ -147,7 +147,7 @@ async def wait_for_pgai_sync(sink_conn):
                 try:
                     await cur.execute(
                         "SELECT table_name FROM information_schema.view_table_usage WHERE view_name = %s AND (table_name LIKE '%%_store_v%%' OR table_name LIKE '%%_embedding%%') LIMIT 1",
-                        (f"{config.ingest.table}_search",),
+                        (f"{target_name}_search",),
                     )
                     row = await cur.fetchone()
                     if row: embedding_table = row[0]

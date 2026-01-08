@@ -57,6 +57,13 @@ async def test_anti_entropy_ghost_cleaner(clean_db, robust_slot_cleanup, interna
         await source_conn.execute("DROP TABLE IF EXISTS ghost_products CASCADE")
         await source_conn.execute("CREATE TABLE ghost_products (id INT PRIMARY KEY, name TEXT, description TEXT)")
         await source_conn.execute("INSERT INTO ghost_products (id, name, description) VALUES (1, 'Item 1', 'Desc 1'), (2, 'Item 2', 'Desc 2')")
+        
+        # Pre-initialize infrastructure using standard path
+        async with PGSearchReplica(sync=False, **custom_settings) as pre_init:
+            from pg_replica.database import ensure_outbox_infrastructure, init_pools, close_pools
+            await init_pools(pre_init.settings)
+            await ensure_outbox_infrastructure(pre_init.settings)
+            await close_pools()
 
         async with PGSearchReplica(sync=True, **custom_settings) as replica:
             assert await wait_for_pgai_sync(replica.settings, "ghost", expected_count=2)

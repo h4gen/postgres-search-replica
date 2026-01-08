@@ -55,6 +55,8 @@ class Action:
     params: Dict[str, Any]
     target_name: Optional[str] = None  # The key in settings.tables
     is_transactional: bool = True
+    ephemeral_config: Optional[SearchPipeline] = None  # For shadow branches not in global settings
+
 
 
 class Inspector:
@@ -110,10 +112,20 @@ class Inspector:
                 state["triggers"] = {r[0] for r in await cur.fetchall()}
 
                 # 4. Table-specific view targets and replica states
+                all_targets = []
                 for name, config in self.settings.pipelines.items():
+                    all_targets.append((name, config))
+                    for branch in config.storage.branches:
+                        branch_target = f"{name}_branch_{branch.name}"
+                        # Construct a virtual config for the branch
+                        branch_config = config.model_copy(deep=True)
+                        branch_config.pipeline = branch.pipeline
+                        all_targets.append((branch_target, branch_config))
+
+                for target_name, config in all_targets:
                     # View Target
-                    # v7 Implied View Name: {table}_search
-                    view_name = f"{config.ingest.table}_search"
+                    # v7 Implied View Name: {target_name}_search
+                    view_name = f"{target_name}_search"
                     
                     if view_name in state["views"]:
                         await cur.execute(
@@ -138,11 +150,13 @@ class Inspector:
                                     break
                         if not target and rows:
                              target = rows[0][0]
-                        state["view_targets"][name] = target
+                        state["view_targets"][target_name] = target
 
                     # Replica State
                     # Each table has its own state entry keyed by subscription name
-                    sub_name = f"sub_{name}"
+                    # Branches use the same sub as the parent
+                    parent_name = target_name.split("_branch_")[0]
+                    sub_name = f"sub_{parent_name}"
                     if "_replica_state" in state["tables"]:
                         cols = state["tables"]["_replica_state"]
                         query_cols = ["last_id", "last_lsn"]
@@ -156,7 +170,7 @@ class Inspector:
                         )
                         r = await cur.fetchone()
                         if r:
-                            state["replica_states"][name] = dict(zip(query_cols, r))
+                            state["replica_states"][target_name] = dict(zip(query_cols, r))
 
                 # 5. Outbox & Mirror Handshake State
                 state["outbox_watermarks"] = {}
@@ -289,9 +303,17 @@ class Planner:
         
         # Pre-calculate all managed vectorizer targets to prevent accidental cleanup
         managed_vectorizers = set()
-        for _, cfg in self.settings.pipelines.items():
+        for name, cfg in self.settings.pipelines.items():
             vid = cfg.get_version_id()
             managed_vectorizers.add(f"{cfg.ingest.table}_store_v{vid}")
+            # Protect branches too
+            for branch in cfg.storage.branches:
+                # Mirror logic from _expand_branches
+                branch_shadow_target = f"{name}_branch_{branch.name}"
+                branch_cfg = cfg.model_copy(deep=True)
+                branch_cfg.pipeline = branch.pipeline
+                branch_rev = branch_cfg.get_version_id()
+                managed_vectorizers.add(f"{branch_shadow_target}_store_v{branch_rev}")
 
         for name, config in self.settings.pipelines.items():
             if "_embedding_cache" not in sink_state["tables"] and not cache_setup_added:
@@ -457,7 +479,7 @@ class Planner:
                 should_promote = False
                 
                 # Case A: View doesn't exist at all -> Promote immediately (or wait? User prefers wait usually, but initial setup needs access)
-                if f"{config.ingest.table}_search" not in sink_state["views"]:
+                if f"{name}_search" not in sink_state["views"]:
                     should_promote = True
                 
                 # Case B: View exists but points to wrong target (or outdated hash)
@@ -481,7 +503,7 @@ class Planner:
                      actions.append(
                         Action(
                             type=ActionType.SINK_VIEW_SETUP,
-                            description=f"Setup/Swap search view {config.ingest.table}_search -> {expected_vectorizer_target} (active=True, synced=True)",
+                            description=f"Setup/Swap search view {name}_search -> {expected_vectorizer_target} (active=True, synced=True)",
                             params={
                                 "config_hash": desired_hash,
                                 "target_table": raw_table,
@@ -523,6 +545,102 @@ class Planner:
 
         return actions
 
+    def _expand_branches(
+        self, source_state: Dict[str, Any], sink_state: Dict[str, Any]
+    ) -> List[Action]:
+        """
+        Generates actions for Declarative Branches (which are not in settings.pipelines).
+        Uses ephemeral configs attached to Actions.
+        """
+        actions = []
+        
+        # Iterate over all MAIN pipelines looking for branches
+        for parent_name, parent_config in self.settings.pipelines.items():
+            if not parent_config.storage.branches:
+                continue
+
+            for branch in parent_config.storage.branches:
+                # 1. Create Shadow Config (Ephemeral)
+                # We clone the parent but override the pipeline and naming context
+                shadow_config = parent_config.model_copy(deep=True)
+                shadow_config.pipeline = branch.pipeline
+                # Mark as active so infrastructure gets built
+                shadow_config.active = True 
+                
+                # Construct Shadow Target Name
+                # Convention: {parent}_branch_{branch_name}
+                shadow_target_name = f"{parent_name}_branch_{branch.name}"
+                
+                # 2. Generate Actions
+                # 2.0 Source Publication
+                # Ensure a publication exists for this branch on the source
+                actions.append(
+                    Action(
+                        type=ActionType.SOURCE_SETUP, 
+                        description=f"Ensure publication for branch {shadow_target_name}", 
+                        params={}, 
+                        target_name=shadow_target_name,
+                        ephemeral_config=shadow_config
+                    )
+                )
+
+                # 2.1 Sink Table
+                raw_table = shadow_config.ingest.table
+                if raw_table not in sink_state["tables"]:
+                     actions.append(
+                        Action(
+                            type=ActionType.SINK_TABLE_EVOLVE,
+                            description=f"Create sink table {raw_table} (for branch {shadow_target_name})",
+                            params={"mode": "create", "table": raw_table},
+                            target_name=shadow_target_name,
+                            ephemeral_config=shadow_config
+                        )
+                    )
+                
+                # 2.2 Vectorizer
+                version_id = shadow_config.get_version_id()
+                # Use a unique vectorizer name for the branch to differentiate from main
+                vectorizer_target = f"{shadow_target_name}_store_v{version_id}"
+                
+                vectorizers = sink_state.get("vectorizers", {}).get(raw_table, [])
+                vectorizer_exists = any(v.get("target_table") == vectorizer_target for v in vectorizers)
+
+                if not vectorizer_exists:
+                    actions.append(
+                        Action(
+                            type=ActionType.SINK_VECTORIZER_SETUP,
+                            description=f"Setup Shadow Vectorizer for {shadow_target_name} ({version_id})",
+                            params={
+                                "version_id": version_id,
+                                "vectorizer_target_name": vectorizer_target,
+                                "publication_name": f"pub_{parent_name}"
+                            },
+                            target_name=shadow_target_name,
+                            ephemeral_config=shadow_config
+                        )
+                    )
+                
+                # 2.3 View Setup
+                current_view_target = sink_state["view_targets"].get(shadow_target_name)
+                
+                # Check if view needs setup/swap
+                if f"{shadow_target_name}_search" not in sink_state["views"] or current_view_target != vectorizer_target:
+                    actions.append(
+                        Action(
+                            type=ActionType.SINK_VIEW_SETUP,
+                            description=f"Setup Shadow View for {shadow_target_name}",
+                            params={
+                                "config_hash": shadow_config.get_config_hash(), 
+                                "version_id": version_id,
+                                "vectorizer_target_name": vectorizer_target
+                            },
+                            target_name=shadow_target_name,
+                            ephemeral_config=shadow_config
+                        )
+                    )
+
+        return actions
+
 
 class Applier:
     """Executes the plan generated by the Planner."""
@@ -541,11 +659,15 @@ class Applier:
             logger.info(f"Applying action: {action.description}")
             try:
                 target_name = action.target_name
-                config = (
-                    self.settings.pipelines[target_name]
-                    if target_name and target_name in self.settings.pipelines
-                    else None
-                )
+                # Priority: Ephemeral Config (Branch) -> Global Settings (Main)
+                config = action.ephemeral_config
+                if not config:
+                     config = (
+                        self.settings.pipelines[target_name]
+                        if target_name and target_name in self.settings.pipelines
+                        else None
+                    )
+
 
                 if action.type == ActionType.SOURCE_SETUP:
                     await setup_source(self.settings, config, target_name)
@@ -579,12 +701,15 @@ class Applier:
                     raw_table = config.ingest.table
                     logger.debug(f"Handling SINK_VECTORIZER_SETUP for {target_name}: config.ingest.table={raw_table}")
                     version_id = action.params.get("version_id", "latest")
-                    vectorizer_target = f"{raw_table}_store_v{version_id}"
+                    
+                    # Allow overriding the default naming convention (e.g. for branches)
+                    vectorizer_target = action.params.get("vectorizer_target_name") or f"{raw_table}_store_v{version_id}"
+                    publication_name = action.params.get("publication_name") # Optional override
                     
                     # NOTE: cleanup_vectorizer_infrastructure needs 'config' object. 
                     # If config is SearchPipeline, we must ensure database.py accepts it.
                     # This patch assumes database.py handles it OR we update database.py next.
-                    await cleanup_vectorizer_infrastructure(self.settings, config, vectorizer_target)
+                    await cleanup_vectorizer_infrastructure(self.settings, config, target_name, vectorizer_target)
                     await setup_sink(self.settings, config, target_name, vectorizer_target=vectorizer_target)
                     await warm_up_from_cache(self.settings, config, raw_table, vectorizer_target)
                     await setup_outbox_trigger(self.settings, target_name, vectorizer_target, config)
@@ -602,13 +727,16 @@ class Applier:
                         )
 
                 elif action.type == ActionType.SINK_VIEW_SETUP:
+                    # Allow overriding the vectorizer target name (e.g. for branches)
+                    vectorizer_target = action.params.get("vectorizer_target_name") or f"{config.ingest.table}_store_v{action.params['version_id']}"
+                    
                     await atomic_view_swap(
                         self.settings,
                         config,
                         target_name,
                         action.params["config_hash"],
                         target_table=config.ingest.table,
-                        vectorizer_target=f"{config.ingest.table}_store_v{action.params['version_id']}",
+                        vectorizer_target=vectorizer_target,
                         # We might need to pass 'profile' here? 
                         # database.atomic_view_swap signature needs 'profile' arg to handle hybrid view creation?
                         # It currently takes *args. Let's check signature later.
@@ -620,6 +748,7 @@ class Applier:
                     lsn = await create_placeholder_slot(self.settings, target_name)
                     await update_replica_state(self.settings, target_name, lsn=lsn)
                     await run_sql_catchup(self.settings, config, target_name)
+                    # Anti-entropy cleanup
                     await find_and_fix_ghost_records(self.settings, config, target_name)
 
                 elif action.type == ActionType.SINK_CACHE_SETUP:
@@ -700,6 +829,10 @@ class Reconciler:
 
                 # 2. Planning
                 actions = self.planner.plan(source_state, sink_state)
+                # 2.5 Branch Expansion
+                branch_actions = self.planner._expand_branches(source_state, sink_state)
+                actions.extend(branch_actions)
+
 
                 if not actions:
                     logger.info(
@@ -714,7 +847,6 @@ class Reconciler:
                             )
                     return
 
-                # 3. Application
                 # 3. Application
                 try:
                     # Mark active configs as Syncing if we have actions for them

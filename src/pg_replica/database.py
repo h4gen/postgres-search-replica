@@ -56,11 +56,17 @@ async def close_pools():
     global _source_pool, _sink_pool
     if _source_pool:
         logger.info("Closing source connection pool...")
-        await _source_pool.close()
+        try:
+            await _source_pool.close()
+        except (asyncio.CancelledError, Exception):
+            pass
         _source_pool = None
     if _sink_pool:
         logger.info("Closing sink connection pool...")
-        await _sink_pool.close()
+        try:
+            await _sink_pool.close()
+        except (asyncio.CancelledError, Exception):
+            pass
         _sink_pool = None
 
 
@@ -183,6 +189,7 @@ async def get_source_column_types(
 async def setup_source(settings: Settings, config: SearchPipeline, target_name: str):
     """Remotely initialize the source publication."""
     pub_name = f"pub_{target_name}"
+    print(f"DEBUG: setup_source called for {pub_name}")
     logger.info(f"Setting up remote source publication {pub_name}...")
     
     # Pre-flight readiness check to avoid race conditions in tests
@@ -199,6 +206,7 @@ async def setup_source(settings: Settings, config: SearchPipeline, target_name: 
                 else ""
             )
 
+            # Ensure publication exists (idempotent check)
             await cur.execute(
                 f"SELECT 1 FROM pg_publication WHERE pubname = '{pub_name}'"
             )
@@ -210,6 +218,7 @@ async def setup_source(settings: Settings, config: SearchPipeline, target_name: 
                     f"CREATE PUBLICATION {pub_name} FOR TABLE {config.ingest.table} ({cols}){where_clause}"
                 )
             else:
+                logger.debug(f"Publication {pub_name} exists. Updating definition...")
                 await cur.execute(
                     f"ALTER PUBLICATION {pub_name} SET TABLE {config.ingest.table} ({cols}){where_clause}"
                 )
@@ -662,7 +671,7 @@ async def ensure_embedding_cache_table(settings: Settings, config: SearchPipelin
             )
 
 async def cleanup_vectorizer_infrastructure(
-    settings: Settings, config: SearchPipeline, vectorizer_name: str
+    settings: Settings, config: SearchPipeline, target_name: str, vectorizer_name: str
 ):
     """Robustly clean up all infrastructure for a specific vectorizer."""
     logger.info(f"Robust cleanup for vectorizer {vectorizer_name}...")
@@ -679,13 +688,13 @@ async def cleanup_vectorizer_infrastructure(
                 -- 1. Check if ANY view is using this as its target (safety)
                 SELECT table_name INTO live_target 
                 FROM information_schema.view_table_usage 
-                WHERE view_name = '{config.ingest.table}_search' 
+                WHERE view_name = '{target_name}_search' 
                 AND table_name IN ('{vectorizer_name}', '{embedding_view}') 
                 LIMIT 1;
                 
                 -- 2. If it's live, we MUST drop the replica view first
                 IF live_target IS NOT NULL THEN
-                    EXECUTE 'DROP VIEW IF EXISTS ' || quote_ident('{config.ingest.table}_search') || ' CASCADE';
+                    EXECUTE 'DROP VIEW IF EXISTS ' || quote_ident('{target_name}_search') || ' CASCADE';
                 END IF;
 
                 -- 3. Drop the pgai vectorizer if it exists
@@ -771,7 +780,7 @@ async def atomic_view_swap(
         await conn.set_autocommit(False)
         try:
             async with conn.cursor() as cur:
-                await cur.execute(f"DROP VIEW IF EXISTS {config.ingest.table}_search")
+                await cur.execute(f"DROP VIEW IF EXISTS {target_name}_search")
                 
                 extra_cols = ",\n                            ".join([f"r.{c}" for c in config.ingest.columns if c != config.ingest.p_key])
                 if extra_cols:
@@ -784,7 +793,7 @@ async def atomic_view_swap(
                     logger.info("Implementing Hybrid View with RRF scoring support...")
                     await cur.execute(
                         f"""
-                        CREATE VIEW {config.ingest.table}_search AS
+                        CREATE VIEW {target_name}_search AS
                         SELECT 
                             r.{config.ingest.p_key},
                             e.chunk as chunk,
@@ -798,7 +807,7 @@ async def atomic_view_swap(
                     # VECTOR SEARCH ONLY
                     await cur.execute(
                         f"""
-                        CREATE VIEW {config.ingest.table}_search AS
+                        CREATE VIEW {target_name}_search AS
                         SELECT 
                             r.{config.ingest.p_key},
                             e.chunk as chunk,
@@ -827,7 +836,7 @@ async def ensure_outbox_infrastructure(settings: Settings):
             # 1. The Outbox: Transactional log of vectorized changes
             await cur.execute(
                 """
-                CREATE TABLE IF NOT EXISTS _sink_outbox (
+                CREATE TABLE IF NOT EXISTS public._sink_outbox (
                     id BIGSERIAL PRIMARY KEY,
                     target_name TEXT NOT NULL,
                     version_id TEXT NOT NULL,
@@ -840,7 +849,7 @@ async def ensure_outbox_infrastructure(settings: Settings):
             )
             # Index for the MirrorWorker to poll efficiently
             await cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_sink_outbox_id ON _sink_outbox(id)"
+                "CREATE INDEX IF NOT EXISTS idx_sink_outbox_id ON public._sink_outbox(id)"
             )
 
             # 2. Mirror Registry: Track progress of external sinks
@@ -926,10 +935,10 @@ async def setup_outbox_trigger(
                 CREATE OR REPLACE FUNCTION {trigger_fn_name}() RETURNS TRIGGER AS $$
                 BEGIN
                     IF (TG_OP = 'DELETE') THEN
-                        INSERT INTO _sink_outbox (target_name, version_id, source_id, action)
+                        INSERT INTO public._sink_outbox (target_name, version_id, source_id, action)
                         VALUES ('{target_name}', '{version_id}', OLD.{config.ingest.p_key}::text, 'DELETE');
                     ELSE
-                        INSERT INTO _sink_outbox (target_name, version_id, source_id, action, payload)
+                        INSERT INTO public._sink_outbox (target_name, version_id, source_id, action, payload)
                         VALUES (
                             '{target_name}', 
                             '{version_id}', 
@@ -949,14 +958,21 @@ async def setup_outbox_trigger(
 
             # 2. Attach Trigger to pgai STORE table
             # We use AFTER INSERT OR UPDATE OR DELETE
-            await cur.execute(
-                f"""
-                DROP TRIGGER IF EXISTS {trigger_name} ON {vectorizer_name};
-                CREATE TRIGGER {trigger_name}
-                AFTER INSERT OR UPDATE OR DELETE ON {vectorizer_name}
-                FOR EACH ROW EXECUTE FUNCTION {trigger_fn_name}();
-                """
-            )
+            # Use try/except to handle race where worker hasn't created table yet
+            try:
+                await cur.execute(
+                    f"""
+                    DROP TRIGGER IF EXISTS {trigger_name} ON {vectorizer_name};
+                    CREATE TRIGGER {trigger_name}
+                    AFTER INSERT OR UPDATE OR DELETE ON {vectorizer_name}
+                    FOR EACH ROW EXECUTE FUNCTION {trigger_fn_name}();
+                    """
+                )
+            except Exception as e:
+                if "does not exist" in str(e):
+                    logger.warning(f"Deferred trigger setup for {vectorizer_name}: Table not yet created by worker.")
+                    return # Retry next loop
+                raise e
 
             # 3. Backfill existing rows (Handling the Race Condition)
             # Since the vectorizer might have already processed rows before we attached the trigger,
@@ -1339,9 +1355,16 @@ async def find_and_fix_ghost_records(settings: Settings, config: SearchPipeline,
         logger.debug(f"No records found for anti-entropy in {target_name}")
         return
 
-    min_id_raw, max_id_raw = min(all_ids), max(all_ids)
     source_types = await get_source_column_types(settings, config)
     id_type = source_types.get(config.ingest.p_key, "TEXT")
+
+    # Ensure all IDs are of the same type for comparison
+    if id_type in ("INT", "BIGINT"):
+        all_ids = [int(x) for x in all_ids]
+    else:
+        all_ids = [str(x) for x in all_ids]
+
+    min_id_raw, max_id_raw = min(all_ids), max(all_ids)
 
     # 2. Strategy: Set Comparison for UUIDs/Strings or Small Tables
     if id_type not in ("INT", "BIGINT"):
@@ -1405,7 +1428,7 @@ async def drop_subscription_completely(settings: Settings, config: SearchPipelin
     try:
         async with await connect_db(settings.resolved_sink_url) as conn:
             await conn.set_autocommit(True)
-            await conn.execute(f"DROP VIEW IF EXISTS {config.ingest.table}_search CASCADE")
+            await conn.execute(f"DROP VIEW IF EXISTS {target_name}_search CASCADE")
             
             # Retry loop for dropping subscription to handle "sync in progress"
             async def try_drop_subscription():
@@ -1439,7 +1462,7 @@ async def drop_subscription_completely(settings: Settings, config: SearchPipelin
                         
             # Cleanup vectorizers
             async with conn.cursor() as cur:
-                await cur.execute("SELECT id FROM ai.vectorizer WHERE name LIKE %s", (f"{config.ingest.table}_store%",))
+                await cur.execute("SELECT id FROM ai.vectorizer WHERE name LIKE %s", (f"{target_name}_store%",))
                 for (vid,) in await cur.fetchall():
                     await cur.execute(f"SELECT ai.drop_vectorizer({vid}, drop_all => true)")
     except Exception as e:

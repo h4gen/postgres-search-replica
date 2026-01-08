@@ -33,7 +33,7 @@ def test_planner_no_drift():
             config.ingest.table: set(config.ingest.columns),
             "_sink_outbox": set(),
         },
-        "views": {f"{config.ingest.table}_search"},
+        "views": {f"t1_search"},
         "view_targets": {"t1": f"{config.ingest.table}_store_v{v_id}"},
         "replica_states": {"t1": {"config_hash": config.get_config_hash()}},
         "triggers": {f"trg_outbox_t1_{v_id}"},
@@ -83,7 +83,7 @@ def test_planner_missing_column():
             config.ingest.table: {"id", "name", "description"},
             "_sink_outbox": set(),
         },
-        "views": {f"{config.ingest.table}_search"},
+        "views": {f"t1_search"},
         "view_targets": {"t1": f"{config.ingest.table}_store_v{v_id}"},
         "replica_states": {"t1": {"config_hash": config.get_config_hash()}},
         "triggers": {f"trg_outbox_t1_{v_id}"},
@@ -125,7 +125,7 @@ def test_planner_model_change_triggers_view_swap():
             "_embedding_cache": {"text_hash"},
             config.ingest.table: set(config.ingest.columns),
         },
-        "views": {f"{config.ingest.table}_search"},
+        "views": {f"t1_search"},
         "view_targets": {"t1": config.ingest.table + "_store_vold"},
         "replica_states": {"t1": {"config_hash": "old_hash"}},
         "vectorizers": {
@@ -173,7 +173,7 @@ def test_planner_missing_slot_triggers_recovery():
             "_embedding_cache": {"text_hash"},
             config.ingest.table: set(config.ingest.columns),
         },
-        "views": {f"{config.ingest.table}_search"},
+        "views": {f"t1_search"},
         "view_targets": {"t1": f"{config.ingest.table}_store_v{v_id}"},
         "replica_states": {"t1": {"config_hash": config.get_config_hash()}},
         "vectorizers": {
@@ -223,7 +223,7 @@ def test_planner_deferred_swap():
             "_replica_state": {"key", "config_hash"},
             config.ingest.table: set(config.ingest.columns),
         },
-        "views": {f"{config.ingest.table}_search"}, # View exists
+        "views": {f"t1_search"}, # View exists
         "view_targets": {"t1": "old_target"}, # Points to old target
         "replica_states": {"t1": {"config_hash": "old_hash"}},
         "vectorizers": {

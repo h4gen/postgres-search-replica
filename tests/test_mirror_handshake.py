@@ -45,7 +45,7 @@ def test_planner_blocks_promotion_if_mirrors_lag():
             "_sink_outbox": {"id"},
             config.ingest.table: set(config.ingest.columns),
         },
-        "views": {f"{config.ingest.table}_search"},
+        "views": {f"t1_search"},
         "view_targets": {"t1": "old_target"},
         "replica_states": {"t1": {"config_hash": "old_hash"}},
         "triggers": {f"trg_outbox_t1_{v_id}"},

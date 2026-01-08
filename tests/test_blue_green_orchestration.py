@@ -9,7 +9,6 @@ from pg_replica.database import get_sink_conn
 
 # Test Data
 TABLE_NAME = "products"
-REPLICA_TABLE = "products_search"
 
 @pytest.mark.asyncio
 async def test_declarative_blue_green_orchestration(clean_db, robust_slot_cleanup, internal_source_url, wait_for_pgai_sync):
@@ -22,12 +21,12 @@ async def test_declarative_blue_green_orchestration(clean_db, robust_slot_cleanu
     """
     
     # helper to inspect current view target
-    async def get_current_view_target():
+    async def get_current_view_target(target_name: str = "v1"):
         async with await get_sink_conn() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "SELECT table_name FROM information_schema.view_table_usage WHERE view_name = %s",
-                    (REPLICA_TABLE,)
+                    (f"{target_name}_search",)
                 )
                 rows = await cur.fetchall()
                 if not rows:
@@ -36,7 +35,7 @@ async def test_declarative_blue_green_orchestration(clean_db, robust_slot_cleanu
                 # We expect the view to join the raw table (e.g. products) 
                 # with the versioned embedding table/view (e.g. products_embedding_v...)
                 targets = [r[0] for r in rows]
-                print(f"DEBUG: view {REPLICA_TABLE} targets: {targets}")
+                print(f"DEBUG: view {target_name}_search targets: {targets}")
                 
                 for t in targets:
                     if "_v" in t or "_embedding" in t or "_store" in t:
@@ -92,7 +91,7 @@ async def test_declarative_blue_green_orchestration(clean_db, robust_slot_cleanu
         traceback.print_exc()
         raise e
     
-    target = await get_current_view_target()
+    target = await get_current_view_target("v1")
     assert target is not None, "View should be created on bootstrap"
     assert "nomic" in target or "_v" in target # Check it points to v1 vectorizer
     print(f"Phase 1 Success: View points to {target}")
@@ -108,7 +107,7 @@ async def test_declarative_blue_green_orchestration(clean_db, robust_slot_cleanu
     
     await reconciler.reconcile()
     
-    target = await get_current_view_target()
+    target = await get_current_view_target("v1")
     print(f"Phase 2 Success: View still points to {target}")
 
     print("\n--- Phase 3: Promote v2 (Blue-Green) ---")
@@ -119,7 +118,7 @@ async def test_declarative_blue_green_orchestration(clean_db, robust_slot_cleanu
     
     await reconciler.reconcile()
     
-    target_after_plan = await get_current_view_target()
+    target_after_plan = await get_current_view_target("v2")
     
     # Find v2 vectorizer name
     v2_id = config_v2.get_version_id()
@@ -130,7 +129,7 @@ async def test_declarative_blue_green_orchestration(clean_db, robust_slot_cleanu
     swapped = False
     for _ in range(20):
         await reconciler.reconcile()
-        current_target = await get_current_view_target()
+        current_target = await get_current_view_target("v2")
         
         # Check if versioned target matches v2
         if current_target and v2_id in current_target:
