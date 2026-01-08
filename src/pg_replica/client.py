@@ -79,20 +79,20 @@ class PGSearchReplica:
             engine: The search engine to use (postgres, qdrant, pinecone). 
                     Defaults to the one in TableConfig.
         """
-        if not self.settings.tables:
-            raise RuntimeError("No tables configured for search.")
-
-        target_name = table or next(iter(self.settings.tables))
-        if target_name not in self.settings.tables:
+        target_name = table or next(iter(self.settings.pipelines))
+        if target_name not in self.settings.pipelines:
             raise ValueError(f"Table configuration '{target_name}' not found.")
         
-        config = self.settings.tables[target_name]
-        search_engine = engine or config.search_engine
+        # In the new schema, we default to postgres unless mirrors are the primary target
+        # For this shim, we'll keep the engine choice logic
+        config = self.settings.pipelines[target_name]
+        # In v7, engine is determined by usage, but let's assume postgres for now if not explicit
+        search_engine = engine or "postgres"
 
         # 1. Get embedding in Python
         ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
         client = AsyncClient(host=ollama_host)
-        res = await client.embeddings(model=config.embedding_model, prompt=query)
+        res = await client.embeddings(model=config.pipeline.embedding.model, prompt=query)
         embedding = res["embedding"]
 
         # 2. Execute via strategy

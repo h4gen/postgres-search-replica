@@ -1,5 +1,5 @@
 import pytest
-from pg_replica.config import Settings, TableConfig
+from pg_replica.config import Settings, SearchPipeline, IngestConfig, PipelineConfig, StorageConfig, EmbeddingConfig, ChunkingConfig, PostgresStoreConfig, BranchConfig, MirrorConfig
 from pg_replica.reconciler import Planner, ActionType
 
 
@@ -7,12 +7,18 @@ def test_planner_no_drift():
     settings = Settings(
         source_url="postgresql://localhost/src",
         sink_url="postgresql://localhost/sink",
-        tables={
-            "t1": TableConfig(source_table="table1")
+        pipelines={
+            "t1": SearchPipeline(
+                ingest=IngestConfig(table="table1", columns=["id", "content"]),
+                pipeline=PipelineConfig(
+                    template="$chunk", 
+                    embedding=EmbeddingConfig(provider="ollama", model="nomic-embed-text", dimension=768)
+                )
+            )
         }
     )
     planner = Planner(settings)
-    config = settings.tables["t1"]
+    config = settings.pipelines["t1"]
     v_id = config.get_version_id()
 
     source_state = {
@@ -24,19 +30,19 @@ def test_planner_no_drift():
         "tables": {
             "_replica_state": {"key", "config_hash"},
             "_embedding_cache": {"text_hash"},
-            config.sink_raw_table: set(config.publication_columns),
+            config.ingest.table: set(config.ingest.columns),
             "_sink_outbox": set(),
         },
-        "views": {config.sink_replica_table},
-        "view_targets": {"t1": f"{config.sink_raw_table}_store_v{v_id}"},
+        "views": {f"{config.ingest.table}_search"},
+        "view_targets": {"t1": f"{config.ingest.table}_store_v{v_id}"},
         "replica_states": {"t1": {"config_hash": config.get_config_hash()}},
         "triggers": {f"trg_outbox_t1_{v_id}"},
         "vectorizers": {
-            config.sink_raw_table: [
+            config.ingest.table: [
                 {
                     "id": 1,
-                    "name": f"{config.sink_raw_table}_store_v{v_id}",
-                    "target_table": f"{config.sink_raw_table}_store_v{v_id}",
+                    "name": f"{config.ingest.table}_store_v{v_id}",
+                    "target_table": f"{config.ingest.table}_store_v{v_id}",
                 }
             ]
         },
@@ -51,15 +57,18 @@ def test_planner_missing_column():
     settings = Settings(
         source_url="postgresql://localhost/src",
         sink_url="postgresql://localhost/sink",
-        tables={
-            "t1": TableConfig(
-                source_table="table1",
-                publication_columns=["id", "name", "description", "price"]
+        pipelines={
+            "t1": SearchPipeline(
+                ingest=IngestConfig(table="table1", columns=["id", "name", "description", "price"]),
+                pipeline=PipelineConfig(
+                    template="$chunk", 
+                    embedding=EmbeddingConfig(provider="ollama", model="nomic-embed-text", dimension=768)
+                )
             )
         }
     )
     planner = Planner(settings)
-    config = settings.tables["t1"]
+    config = settings.pipelines["t1"]
     v_id = config.get_version_id()
 
     source_state = {
@@ -71,14 +80,14 @@ def test_planner_missing_column():
         "tables": {
             "_replica_state": {"key", "config_hash"},
             "_embedding_cache": {"text_hash"},
-            config.sink_raw_table: {"id", "name", "description"},
+            config.ingest.table: {"id", "name", "description"},
             "_sink_outbox": set(),
         },
-        "views": {config.sink_replica_table},
-        "view_targets": {"t1": f"{config.sink_raw_table}_store_v{v_id}"},
+        "views": {f"{config.ingest.table}_search"},
+        "view_targets": {"t1": f"{config.ingest.table}_store_v{v_id}"},
         "replica_states": {"t1": {"config_hash": config.get_config_hash()}},
         "triggers": {f"trg_outbox_t1_{v_id}"},
-        "vectorizers": {config.sink_raw_table: []},
+        "vectorizers": {config.ingest.table: []},
         "vectorizer_statuses": {},
     }
 
@@ -87,15 +96,23 @@ def test_planner_missing_column():
 
 
 def test_planner_model_change_triggers_view_swap():
+    # Simulate a drift by having the in-memory config differ from the 'state'
+    # Here we define the "new" desire state
     settings = Settings(
         source_url="postgresql://localhost/src",
         sink_url="postgresql://localhost/sink",
-        tables={
-            "t1": TableConfig(source_table="table1", embedding_model="new-model")
+        pipelines={
+            "t1": SearchPipeline(
+                ingest=IngestConfig(table="table1", columns=["id", "content"]),
+                pipeline=PipelineConfig(
+                    template="$chunk", 
+                    embedding=EmbeddingConfig(provider="ollama", model="new-model", dimension=768)
+                )
+            )
         }
     )
     planner = Planner(settings)
-    config = settings.tables["t1"]
+    config = settings.pipelines["t1"]
 
     source_state = {
         "publications": {f"pub_t1": {"tables": {"table1": {"rowfilter": None}}}},
@@ -106,21 +123,21 @@ def test_planner_model_change_triggers_view_swap():
         "tables": {
             "_replica_state": {"key", "config_hash"},
             "_embedding_cache": {"text_hash"},
-            config.sink_raw_table: set(config.publication_columns),
+            config.ingest.table: set(config.ingest.columns),
         },
-        "views": {config.sink_replica_table},
-        "view_targets": {"t1": config.sink_raw_table + "_store_vold"},
+        "views": {f"{config.ingest.table}_search"},
+        "view_targets": {"t1": config.ingest.table + "_store_vold"},
         "replica_states": {"t1": {"config_hash": "old_hash"}},
         "vectorizers": {
-            config.sink_raw_table: [
+            config.ingest.table: [
                 {
                     "id": 1,
                     "name": "old_vec",
-                    "target_table": config.sink_raw_table + "_store_vold",
+                    "target_table": config.ingest.table + "_store_vold",
                 }
             ]
         },
-        "vectorizer_statuses": {config.sink_raw_table + "_store_v" + config.get_version_id(): 0},
+        "vectorizer_statuses": {config.ingest.table + "_store_v" + config.get_version_id(): 0},
     }
 
     actions = planner.plan(source_state, sink_state)
@@ -131,12 +148,18 @@ def test_planner_missing_slot_triggers_recovery():
     settings = Settings(
         source_url="postgresql://localhost/src",
         sink_url="postgresql://localhost/sink",
-        tables={
-            "t1": TableConfig(source_table="table1")
+        pipelines={
+            "t1": SearchPipeline(
+                ingest=IngestConfig(table="table1", columns=["id", "content"]),
+                pipeline=PipelineConfig(
+                    template="$chunk", 
+                    embedding=EmbeddingConfig(provider="ollama", model="nomic-embed-text", dimension=768)
+                )
+            )
         }
     )
     planner = Planner(settings)
-    config = settings.tables["t1"]
+    config = settings.pipelines["t1"]
     v_id = config.get_version_id()
 
     source_state = {
@@ -148,17 +171,17 @@ def test_planner_missing_slot_triggers_recovery():
         "tables": {
             "_replica_state": {"key", "config_hash"},
             "_embedding_cache": {"text_hash"},
-            config.sink_raw_table: set(config.publication_columns),
+            config.ingest.table: set(config.ingest.columns),
         },
-        "views": {config.sink_replica_table},
-        "view_targets": {"t1": f"{config.sink_raw_table}_store_v{v_id}"},
+        "views": {f"{config.ingest.table}_search"},
+        "view_targets": {"t1": f"{config.ingest.table}_store_v{v_id}"},
         "replica_states": {"t1": {"config_hash": config.get_config_hash()}},
         "vectorizers": {
-            config.sink_raw_table: [
+            config.ingest.table: [
                 {
                     "id": 1,
-                    "name": f"{config.sink_raw_table}_store_v{v_id}",
-                    "target_table": f"{config.sink_raw_table}_store_v{v_id}",
+                    "name": f"{config.ingest.table}_store_v{v_id}",
+                    "target_table": f"{config.ingest.table}_store_v{v_id}",
                 }
             ]
         },
@@ -174,18 +197,21 @@ def test_planner_deferred_swap():
     settings = Settings(
         source_url="postgresql://localhost/src",
         sink_url="postgresql://localhost/sink",
-        tables={
-            "t1": TableConfig(
-                source_table="table1", 
-                embedding_model="new-model",
+        pipelines={
+            "t1": SearchPipeline(
+                ingest=IngestConfig(table="table1", columns=["id", "content"]),
+                pipeline=PipelineConfig(
+                    template="$chunk", 
+                    embedding=EmbeddingConfig(provider="ollama", model="new-model", dimension=768)
+                ),
                 active=True
             )
         }
     )
     planner = Planner(settings)
-    config = settings.tables["t1"]
+    config = settings.pipelines["t1"]
     v_id = config.get_version_id()
-    expected_target = f"{config.sink_raw_table}_store_v{v_id}"
+    expected_target = f"{config.ingest.table}_store_v{v_id}"
 
     source_state = {
         "publications": {f"pub_t1": {"tables": {"table1": {"rowfilter": None}}}},
@@ -195,13 +221,13 @@ def test_planner_deferred_swap():
         "extensions": {"ai", "vector"},
         "tables": {
             "_replica_state": {"key", "config_hash"},
-            config.sink_raw_table: set(config.publication_columns),
+            config.ingest.table: set(config.ingest.columns),
         },
-        "views": {config.sink_replica_table}, # View exists
+        "views": {f"{config.ingest.table}_search"}, # View exists
         "view_targets": {"t1": "old_target"}, # Points to old target
         "replica_states": {"t1": {"config_hash": "old_hash"}},
         "vectorizers": {
-            config.sink_raw_table: [
+            config.ingest.table: [
                 {"id": 1, "target_table": "old_target"},
                 {"id": 2, "target_table": expected_target},
             ]

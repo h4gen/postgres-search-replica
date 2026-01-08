@@ -29,18 +29,24 @@ wait-for-infra:
 	@until [ "$$(docker compose -f dev/docker-compose.yml ps -q source | head -n 1)" ]; do sleep 1; done
 	@until [ "$$(docker compose -f dev/docker-compose.yml ps -q sink | head -n 1)" ]; do sleep 1; done
 	@until [ "$$(docker compose -f dev/docker-compose.yml ps -q ollama | head -n 1)" ]; do sleep 1; done
-	@echo "Waiting for Postgres to be ready..."
-	@until docker exec $$(docker compose -f dev/docker-compose.yml ps -q source | head -n 1) pg_isready -U postgres > /dev/null 2>&1; do \
-		echo "Source DB not ready..."; \
+	@echo "Waiting for Postgres (Source) to be ready..."
+	@until [ "$$(docker compose -f dev/docker-compose.yml ps source --format json | grep -o '\"Health\":\"healthy\"')" ] || \
+	       docker compose -f dev/docker-compose.yml exec -T source pg_isready -U postgres > /dev/null 2>&1; do \
+		echo "Source DB starting..."; \
 		sleep 2; \
 	done
-	@until docker exec $$(docker compose -f dev/docker-compose.yml ps -q sink | head -n 1) pg_isready -U postgres -h localhost -p 54322 > /dev/null 2>&1; do \
-		echo "Sink DB not ready..."; \
+	@echo "Waiting for Postgres (Sink) to be ready..."
+	@until [ "$$(docker compose -f dev/docker-compose.yml ps sink --format json | grep -o '\"Health\":\"healthy\"')" ] || \
+	       docker compose -f dev/docker-compose.yml exec -T sink pg_isready -U postgres -h localhost -p 54322 > /dev/null 2>&1; do \
+		echo "Sink DB starting..."; \
 		sleep 2; \
 	done
-	@echo "Waiting for Ollama model to be pulled..."
-	@until docker exec $$(docker compose -f dev/docker-compose.yml ps -q ollama | head -n 1) ollama list | grep -q "nomic-embed-text"; do \
-		echo "Ollama model not ready..."; \
+	@echo "Waiting for Ollama model to be pulled (274MB)..."
+	@until [ "$$(docker compose -f dev/docker-compose.yml ps ollama --format json | grep -o '\"Health\":\"healthy\"')" ] || \
+	       (docker compose -f dev/docker-compose.yml exec -T ollama ollama list | grep -q 'nomic-embed-text'); do \
+		echo "Ollama status: $$(docker compose -f dev/docker-compose.yml exec -T ollama ollama list | grep 'nomic-embed-text' || echo 'Model not found yet, pulling...')"; \
+		echo "Last 3 lines of Ollama log:"; \
+		docker compose -f dev/docker-compose.yml logs --tail 3 ollama; \
 		sleep 5; \
 	done
 	@echo "Waiting for Qdrant to be ready..."

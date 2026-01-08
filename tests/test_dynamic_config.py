@@ -9,7 +9,7 @@ from pg_replica.database import (
     update_config_status,
     reconciliation_lock
 )
-from pg_replica.config import TableConfig
+
 from pg_replica.reconciler import ActionType
 
 logger = logging.getLogger(__name__)
@@ -68,17 +68,22 @@ async def test_dynamic_config_override():
     from unittest.mock import patch
     from pg_replica.database import init_pools, close_pools
     from pg_replica.reconciler import Reconciler
+    from pg_replica.config import SearchPipeline, IngestConfig, PipelineConfig, EmbeddingConfig
     
     target_name = "dynamic_test_v3"
     # Initial config (v1)
-    base_config = TableConfig(
-        source_table="products",
-        publication_columns=["name", "description"],
+    base_config = SearchPipeline(
+        ingest=IngestConfig(table="products", columns=["name", "description"]),
+        pipeline=PipelineConfig(
+            template="$chunk", 
+            content_column="description",
+            embedding=EmbeddingConfig(provider="ollama", model="nomic-embed-text", dimension=768)
+        )
     )
     
-    # Pass 'tables' directly as a keyword argument to override Settings
     with patch.dict("os.environ", {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(global_settings)}):
-        replica = PGSearchReplica(tables={target_name: base_config})
+        # Pass Pipelines via constructor
+        replica = PGSearchReplica(pipelines={target_name: base_config})
         await robust_cleanup(replica.settings) # CLEANUP FIRST
         await init_pools(replica.settings)
         reconciler = Reconciler(replica.settings)
@@ -92,14 +97,14 @@ async def test_dynamic_config_override():
             assert gen1 == initial_gen + 1
             
             await reconciler.reconcile()
-            print(f"Tables after reconcile: {list(replica.settings.tables.keys())}")
-            assert target_name in replica.settings.tables
-            assert getattr(replica.settings.tables[target_name], "_generation") == gen1
+            print(f"Tables after reconcile: {list(replica.settings.pipelines.keys())}")
+            assert target_name in replica.settings.pipelines
+            assert getattr(replica.settings.pipelines[target_name], "_generation") == gen1
             
             # 2. Update config in DB (gen + 1)
-            new_config_data = base_config.model_dump()
-            new_config_data["publication_where"] = "id < 500"
-            new_config = TableConfig(**new_config_data)
+            # Create new config object with modified filter
+            new_config = base_config.model_copy(deep=True)
+            new_config.ingest.filter = "id < 500"
             
             gen2 = await save_table_config(replica.settings, target_name, new_config)
             assert gen2 == gen1 + 1
@@ -107,8 +112,8 @@ async def test_dynamic_config_override():
             # 3. Reconcile again and verify override
             await reconciler.reconcile()
             
-            curr_config = replica.settings.tables[target_name]
-            assert curr_config.publication_where == "id < 500"
+            curr_config = replica.settings.pipelines[target_name]
+            assert curr_config.ingest.filter == "id < 500"
             assert getattr(curr_config, "_generation") == gen2
             
             # 4. Verify Status in DB is updated to Ready
@@ -142,14 +147,19 @@ async def test_failed_config_status():
     from unittest.mock import patch
     from pg_replica.database import init_pools, close_pools
     from pg_replica.reconciler import Reconciler, Action, ActionType
+    from pg_replica.config import SearchPipeline, IngestConfig, PipelineConfig, EmbeddingConfig
     
     target_name = "fail_test_v3"
-    base_config = TableConfig(
-        source_table="products", 
-        publication_columns=["name"]
+    base_config = SearchPipeline(
+        ingest=IngestConfig(table="products", columns=["name"]),
+        pipeline=PipelineConfig(
+            template="$chunk", 
+            content_column="name",
+            embedding=EmbeddingConfig(provider="ollama", model="nomic-embed-text", dimension=768)
+        )
     )
     
-    replica = PGSearchReplica(tables={target_name: base_config})
+    replica = PGSearchReplica(pipelines={target_name: base_config})
     await robust_cleanup(replica.settings) # CLEANUP FIRST
     await init_pools(replica.settings)
     reconciler = Reconciler(replica.settings)

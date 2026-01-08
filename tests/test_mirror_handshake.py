@@ -1,6 +1,7 @@
 import pytest
 import asyncio
-from pg_replica.config import Settings, TableConfig
+from pg_replica.config import Settings
+from pg_replica.config import SearchPipeline, IngestConfig, PipelineConfig, StorageConfig, MirrorConfig, EmbeddingConfig, ChunkingConfig
 from pg_replica.reconciler import Planner, ActionType
 
 def test_planner_blocks_promotion_if_mirrors_lag():
@@ -11,17 +12,23 @@ def test_planner_blocks_promotion_if_mirrors_lag():
     settings = Settings(
         source_url="postgresql://localhost/src",
         sink_url="postgresql://localhost/sink",
-        tables={
-            "t1": TableConfig(
-                source_table="table1",
-                mirrors=[{"id": "m1", "type": "qdrant", "url": "http://q1"}]
+        pipelines={
+            "t1": SearchPipeline(
+                ingest=IngestConfig(table="table1", columns=["id", "name"]),
+                pipeline=PipelineConfig(
+                    template="$chunk", 
+                    embedding=EmbeddingConfig(provider="ollama", model="nomic-embed-text", dimension=768)
+                ),
+                storage=StorageConfig(
+                     mirrors=[MirrorConfig(id="m1", type="qdrant", config={"url": "http://q1"})]
+                )
             )
         }
     )
     planner = Planner(settings)
-    config = settings.tables["t1"]
+    config = settings.pipelines["t1"]
     v_id = config.get_version_id()
-    expected_target = f"{config.sink_raw_table}_store_v{v_id}"
+    expected_target = f"{config.ingest.table}_store_v{v_id}"
 
     source_state = {
         "publications": {f"pub_t1": {"tables": {"table1": {"rowfilter": None}}}},
@@ -36,14 +43,14 @@ def test_planner_blocks_promotion_if_mirrors_lag():
             "_replica_state": {"key", "config_hash"},
             "_embedding_cache": {"text_hash"},
             "_sink_outbox": {"id"},
-            config.sink_raw_table: set(config.publication_columns),
+            config.ingest.table: set(config.ingest.columns),
         },
-        "views": {config.sink_replica_table},
+        "views": {f"{config.ingest.table}_search"},
         "view_targets": {"t1": "old_target"},
         "replica_states": {"t1": {"config_hash": "old_hash"}},
         "triggers": {f"trg_outbox_t1_{v_id}"},
         "vectorizers": {
-            config.sink_raw_table: [
+            config.ingest.table: [
                 {"id": 2, "target_table": expected_target},
             ]
         },

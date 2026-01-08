@@ -126,19 +126,26 @@ class Orchestrator:
         """Main loop for the replicator daemon logic."""
         logger.info("Starting replication watchdog...")
         while not self._stop_event.is_set():
-            for name in list(self.settings.tables.keys()):
+            for name in list(self.settings.pipelines.keys()):
                 try:
                     lag_mb = await check_and_protect_source(self.settings, name)
                     update_replication_lag(name, lag_mb)
                 except RuntimeError as e:
                     if "Self-destructed" in str(e):
                         logger.critical(f"Replicator target {name} stopped: {e}")
+                        logger.info(f"Attempting to auto-heal {name} in 2s...")
+                        try:
+                            await asyncio.sleep(2.0)
+                            await self.reconciler.reconcile()
+                            logger.info(f"Auto-heal for {name} successful.")
+                        except Exception as re:
+                            logger.error(f"Auto-heal failed: {re}")
                 except Exception as e:
                     logger.error(f"Error in watchdog for {name}: {e}")
             
             await self._log_pgai_status()
             try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=30)
+                await asyncio.wait_for(self._stop_event.wait(), timeout=2)
             except asyncio.TimeoutError:
                 continue
 
@@ -156,11 +163,11 @@ class Orchestrator:
         from .database import ensure_outbox_infrastructure
         await ensure_outbox_infrastructure(self.settings)
 
-        reconciler = Reconciler(self.settings)
+        self.reconciler = Reconciler(self.settings)
         
         async def try_reconcile():
             try:
-                await reconciler.reconcile()
+                await self.reconciler.reconcile()
                 return True
             except Exception as e:
                 logger.warning(f"Reconciliation attempt failed: {e}")
@@ -192,9 +199,11 @@ class Orchestrator:
             self._tasks = []
 
         # Drop infrastructure for ALL tables
-        for name, config in self.settings.tables.items():
+        for name in list(self.settings.pipelines.keys()):
             try:
-                await asyncio.wait_for(drop_subscription_completely(self.settings, config, name), timeout=20.0)
+                config = self.settings.pipelines.get(name)
+                if config:
+                    await asyncio.wait_for(drop_subscription_completely(self.settings, config, name), timeout=20.0)
             except Exception as e:
                 logger.debug(f"Failed to drop {name}: {e}")
 

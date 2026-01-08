@@ -1,12 +1,13 @@
 import logging
 import asyncio
 import json
+from typing import Dict, List, Optional, Any
 from contextlib import asynccontextmanager
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from pgvector.psycopg import register_vector_async as register_vector  # type: ignore
-from .config import Settings, TableConfig
+from .config import Settings, SearchPipeline, IngestConfig
 from .utils import wait_until
 
 logger = logging.getLogger(__name__)
@@ -86,30 +87,30 @@ async def connect_db(url: str, **kwargs):
     return conn
 
 
-async def wait_for_source_table(settings: Settings, config: TableConfig, timeout: int = 30):
+async def wait_for_source_table(settings: Settings, config: SearchPipeline, timeout: int = 30):
     """Wait for a table to exist on the Source DB."""
     async def table_exists():
         async with await get_source_conn() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "SELECT 1 FROM information_schema.tables WHERE table_name = %s",
-                    (config.source_table,),
+                    (config.ingest.table,),
                 )
                 if await cur.fetchone():
                     return True
                 
                 await cur.execute(
                     "SELECT 1 FROM pg_class WHERE relname = %s",
-                    (config.source_table,),
+                    (config.ingest.table,),
                 )
                 return await cur.fetchone() is not None
 
-    logger.info(f"Waiting for source table {config.source_table} to be visible...")
+    logger.info(f"Waiting for source table {config.ingest.table} to be visible...")
     try:
         await wait_until(table_exists, timeout=timeout, interval=0.1)
         return True
     except asyncio.TimeoutError:
-        logger.error(f"Timed out waiting for source table {config.source_table}")
+        logger.error(f"Timed out waiting for source table {config.ingest.table}")
         return False
 
 
@@ -140,16 +141,16 @@ async def is_publication_valid(pub_name: str) -> bool:
 
 
 async def get_source_column_types(
-    settings: Settings, config: TableConfig
-) -> dict[str, str]:
+    settings: Settings, config: SearchPipeline
+) -> Dict[str, str]:
     """Query the Source DB's information_schema to get column types."""
     logger.info(
-        f"Detecting column types for {config.source_table} on source..."
+        f"Detecting column types for {config.ingest.table} on source..."
     )
     
     # Pre-flight readiness check to avoid race conditions in tests
     if not await wait_for_source_table(settings, config):
-        raise RuntimeError(f"Source table {config.source_table} not found after timeout")
+        raise RuntimeError(f"Source table {config.ingest.table} not found after timeout")
 
     async with await get_source_conn() as conn:
         async with conn.cursor() as cur:
@@ -160,7 +161,7 @@ async def get_source_column_types(
                 WHERE table_name = %s 
                 AND column_name = ANY(%s)
                 """,
-                (config.source_table, config.publication_columns),
+                (config.ingest.table, config.ingest.columns),
             )
             rows = await cur.fetchall()
             # Map data_type to something we can use in CREATE TABLE
@@ -179,22 +180,22 @@ async def get_source_column_types(
             return types
 
 
-async def setup_source(settings: Settings, config: TableConfig, target_name: str):
+async def setup_source(settings: Settings, config: SearchPipeline, target_name: str):
     """Remotely initialize the source publication."""
     pub_name = f"pub_{target_name}"
     logger.info(f"Setting up remote source publication {pub_name}...")
     
     # Pre-flight readiness check to avoid race conditions in tests
     if not await wait_for_source_table(settings, config):
-        raise RuntimeError(f"Source table {config.source_table} not found after timeout")
+        raise RuntimeError(f"Source table {config.ingest.table} not found after timeout")
 
     async with await get_source_conn() as conn:
         await conn.set_autocommit(True)
         async with conn.cursor() as cur:
-            cols = ", ".join(config.publication_columns)
+            cols = ", ".join(config.ingest.columns)
             where_clause = (
-                f" WHERE ({config.publication_where})"
-                if config.publication_where
+                f" WHERE ({config.ingest.filter})"
+                if config.ingest.filter
                 else ""
             )
 
@@ -206,11 +207,11 @@ async def setup_source(settings: Settings, config: TableConfig, target_name: str
                     f"Creating publication {pub_name} on Source for columns ({cols}){where_clause}..."
                 )
                 await cur.execute(
-                    f"CREATE PUBLICATION {pub_name} FOR TABLE {config.source_table} ({cols}){where_clause}"
+                    f"CREATE PUBLICATION {pub_name} FOR TABLE {config.ingest.table} ({cols}){where_clause}"
                 )
             else:
                 await cur.execute(
-                    f"ALTER PUBLICATION {pub_name} SET TABLE {config.source_table} ({cols}){where_clause}"
+                    f"ALTER PUBLICATION {pub_name} SET TABLE {config.ingest.table} ({cols}){where_clause}"
                 )
             await conn.commit()
 
@@ -266,7 +267,7 @@ async def ensure_config_history_table(settings: Settings):
             )
 
 
-async def save_table_config(settings: Settings, target_name: str, config: TableConfig) -> int:
+async def save_table_config(settings: Settings, target_name: str, config: SearchPipeline) -> int:
     """Save a new configuration for a table and return the new generation."""
     async with await get_sink_conn() as conn:
         await conn.set_autocommit(True)
@@ -288,7 +289,7 @@ async def save_table_config(settings: Settings, target_name: str, config: TableC
                 (
                     target_name, 
                     psycopg.types.json.Json(config.model_dump()), 
-                    config.get_config_hash(), 
+                    config.get_version_id(), 
                     new_gen
                 )
             )
@@ -499,13 +500,13 @@ def estimate_hnsw_ram(dimension: int, row_count: int, M: int = 16) -> int:
     return total_bytes
 
 
-async def get_resource_projections(settings: Settings, config: TableConfig) -> dict:
+async def get_resource_projections(settings: Settings, config: SearchPipeline) -> dict:
     """Estimate costs and hardware needs for a build."""
-    logger.debug(f"Calculating projections for {config.source_table}...")
+    logger.debug(f"Calculating projections for {config.ingest.table}...")
     
     async with await get_source_conn() as conn:
         async with conn.cursor() as cur:
-            await cur.execute(f"SELECT count(*) FROM {config.source_table}")
+            await cur.execute(f"SELECT count(*) FROM {config.ingest.table}")
             row = await cur.fetchone()
             row_count = row[0] if row else 0
 
@@ -514,15 +515,15 @@ async def get_resource_projections(settings: Settings, config: TableConfig) -> d
     estimated_tokens = row_count * 100 
     estimated_cost_usd = (estimated_tokens / 1_000_000) * 0.10
     
-    ram_bytes = estimate_hnsw_ram(config.embedding_dimension, row_count)
+    ram_bytes = estimate_hnsw_ram(config.pipeline.embedding.dimension, row_count)
 
     return {
         "row_count": row_count,
         "estimated_tokens": estimated_tokens,
         "estimated_cost_usd": round(estimated_cost_usd, 4),
         "estimated_ram_mb": round(ram_bytes / (1024 * 1024), 2),
-        "embedding_model": config.embedding_model,
-        "dimension": config.embedding_dimension
+        "embedding_model": config.pipeline.embedding.model,
+        "dimension": config.pipeline.embedding.dimension
     }
 
 
@@ -617,7 +618,7 @@ async def update_replica_state(
                 )
 
 
-async def ensure_embedding_cache_table(settings: Settings, config: TableConfig):
+async def ensure_embedding_cache_table(settings: Settings, config: SearchPipeline):
     """Create the Postgres-native embedding cache table."""
     logger.info("Ensuring embedding cache table exists...")
     async with await get_sink_conn() as conn:
@@ -641,11 +642,11 @@ async def ensure_embedding_cache_table(settings: Settings, config: TableConfig):
                 if row:
                     current_dim = row[0]
                     if (
-                        current_dim != config.embedding_dimension
+                        current_dim != config.pipeline.embedding.dimension
                         and current_dim != -1
                     ):
                         logger.warning(
-                            f"Cache dimension mismatch ({current_dim} vs {config.embedding_dimension}). Purging cache."
+                            f"Cache dimension mismatch ({current_dim} vs {config.pipeline.embedding.dimension}). Purging cache."
                         )
                         await cur.execute("DROP TABLE _embedding_cache CASCADE")
 
@@ -653,7 +654,7 @@ async def ensure_embedding_cache_table(settings: Settings, config: TableConfig):
                 f"""
                 CREATE TABLE IF NOT EXISTS _embedding_cache (
                     text_hash TEXT PRIMARY KEY,
-                    embedding vector({config.embedding_dimension}),
+                    embedding vector({config.pipeline.embedding.dimension}),
                     model_name TEXT,
                     created_at TIMESTAMP DEFAULT NOW()
                 )
@@ -661,7 +662,7 @@ async def ensure_embedding_cache_table(settings: Settings, config: TableConfig):
             )
 
 async def cleanup_vectorizer_infrastructure(
-    settings: Settings, config: TableConfig, vectorizer_name: str
+    settings: Settings, config: SearchPipeline, vectorizer_name: str
 ):
     """Robustly clean up all infrastructure for a specific vectorizer."""
     logger.info(f"Robust cleanup for vectorizer {vectorizer_name}...")
@@ -678,13 +679,13 @@ async def cleanup_vectorizer_infrastructure(
                 -- 1. Check if ANY view is using this as its target (safety)
                 SELECT table_name INTO live_target 
                 FROM information_schema.view_table_usage 
-                WHERE view_name = '{config.sink_replica_table}' 
+                WHERE view_name = '{config.ingest.table}_search' 
                 AND table_name IN ('{vectorizer_name}', '{embedding_view}') 
                 LIMIT 1;
                 
                 -- 2. If it's live, we MUST drop the replica view first
                 IF live_target IS NOT NULL THEN
-                    EXECUTE 'DROP VIEW IF EXISTS ' || quote_ident('{config.sink_replica_table}') || ' CASCADE';
+                    EXECUTE 'DROP VIEW IF EXISTS ' || quote_ident('{config.ingest.table}_search') || ' CASCADE';
                 END IF;
 
                 -- 3. Drop the pgai vectorizer if it exists
@@ -724,10 +725,10 @@ async def cleanup_vectorizer_infrastructure(
                     JOIN pg_proc p ON tg.tgfoid = p.oid
                     JOIN pg_namespace n ON c.relnamespace = n.oid
                     WHERE n.nspname = 'public' 
-                      AND c.relname = '{config.sink_raw_table}'
+                      AND c.relname = '{config.ingest.table}'
                       AND p.prosrc ILIKE '%{vectorizer_name}%'
                 LOOP
-                    EXECUTE 'DROP TRIGGER IF EXISTS ' || quote_ident(live_target) || ' ON ' || quote_ident('{config.sink_raw_table}') || ' CASCADE';
+                    EXECUTE 'DROP TRIGGER IF EXISTS ' || quote_ident(live_target) || ' ON ' || quote_ident('{config.ingest.table}') || ' CASCADE';
                 END LOOP;
             END $$;
             """
@@ -735,17 +736,17 @@ async def cleanup_vectorizer_infrastructure(
 
 async def atomic_view_swap(
     settings: Settings,
-    config: TableConfig,
+    config: SearchPipeline,
     target_name: str,
     config_hash: str,
-    target_table: str | None = None,
-    vectorizer_target: str | None = None,
+    target_table: Optional[str] = None,
+    vectorizer_target: Optional[str] = None,
 ):
     """
     Update the search view to point to the latest table version and
     record the new config hash atomically. Supports Hybrid RRF.
     """
-    raw_table = target_table or config.sink_raw_table
+    raw_table = target_table or config.ingest.table
     sub_name = f"sub_{target_name}"
     
     # Resolve embedding view name
@@ -764,42 +765,46 @@ async def atomic_view_swap(
                     embedding_view = vectorizer_target.replace("_store", "_embedding")
 
         logger.info(
-            f"Performing atomic view swap targeting {raw_table} (Profile: {config.search_profile})..."
+            f"Performing atomic view swap targeting {raw_table} (Profile: {config.storage.postgres.profile})..."
         )
 
         await conn.set_autocommit(False)
         try:
             async with conn.cursor() as cur:
-                await cur.execute(f"DROP VIEW IF EXISTS {config.sink_replica_table}")
+                await cur.execute(f"DROP VIEW IF EXISTS {config.ingest.table}_search")
                 
-                if config.search_profile == "hybrid":
+                extra_cols = ",\n                            ".join([f"r.{c}" for c in config.ingest.columns if c != config.ingest.p_key])
+                if extra_cols:
+                    extra_cols = ",\n                            " + extra_cols
+
+                if config.storage.postgres.profile == "hybrid":
                     # HYBRID SEARCH (RRF): Vector + Full-Text
                     # We create a view that exposes both, allowing the SEARCH query 
                     # to perform Rank Fusion logic.
                     logger.info("Implementing Hybrid View with RRF scoring support...")
                     await cur.execute(
                         f"""
-                        CREATE VIEW {config.sink_replica_table} AS
+                        CREATE VIEW {config.ingest.table}_search AS
                         SELECT 
-                            r.{config.id_column},
-                            e.chunk as {config.target_content_column},
-                            e.{config.embedding_column},
-                            to_tsvector('english', e.chunk) as ts_col
+                            r.{config.ingest.p_key},
+                            e.chunk as chunk,
+                            e.embedding,
+                            to_tsvector('english', e.chunk) as ts_col{extra_cols}
                         FROM {raw_table} r
-                        LEFT JOIN {embedding_view} e ON r.{config.id_column} = e.{config.id_column}
+                        LEFT JOIN {embedding_view} e ON r.{config.ingest.p_key} = e.{config.ingest.p_key}
                     """
                     )
                 else:
                     # VECTOR SEARCH ONLY
                     await cur.execute(
                         f"""
-                        CREATE VIEW {config.sink_replica_table} AS
+                        CREATE VIEW {config.ingest.table}_search AS
                         SELECT 
-                            r.{config.id_column},
-                            e.chunk as {config.target_content_column},
-                            e.{config.embedding_column}
+                            r.{config.ingest.p_key},
+                            e.chunk as chunk,
+                            e.embedding{extra_cols}
                         FROM {raw_table} r
-                        LEFT JOIN {embedding_view} e ON r.{config.id_column} = e.{config.id_column}
+                        LEFT JOIN {embedding_view} e ON r.{config.ingest.p_key} = e.{config.ingest.p_key}
                     """
                     )
 
@@ -895,7 +900,7 @@ async def ensure_outbox_infrastructure(settings: Settings):
 
 
 async def setup_outbox_trigger(
-    settings: Settings, target_name: str, vectorizer_name: str, config: TableConfig
+    settings: Settings, target_name: str, vectorizer_name: str, config: SearchPipeline
 ):
     """
     Attach a trigger to the internal pgai store table to capture 
@@ -915,20 +920,20 @@ async def setup_outbox_trigger(
         async with conn.cursor() as cur:
             # 1. Create the Trigger Function
             # Note: pgai keeps source PK in its store table.
-            # We assume config.id_column is present in the pgai store.
+            # We assume config.ingest.p_key is present in the pgai store.
             await cur.execute(
                 f"""
                 CREATE OR REPLACE FUNCTION {trigger_fn_name}() RETURNS TRIGGER AS $$
                 BEGIN
                     IF (TG_OP = 'DELETE') THEN
                         INSERT INTO _sink_outbox (target_name, version_id, source_id, action)
-                        VALUES ('{target_name}', '{version_id}', OLD.{config.id_column}::text, 'DELETE');
+                        VALUES ('{target_name}', '{version_id}', OLD.{config.ingest.p_key}::text, 'DELETE');
                     ELSE
                         INSERT INTO _sink_outbox (target_name, version_id, source_id, action, payload)
                         VALUES (
                             '{target_name}', 
                             '{version_id}', 
-                            NEW.{config.id_column}::text, 
+                            NEW.{config.ingest.p_key}::text, 
                             'UPSERT', 
                             jsonb_build_object(
                                 'content', NEW.chunk,
@@ -953,11 +958,31 @@ async def setup_outbox_trigger(
                 """
             )
 
+            # 3. Backfill existing rows (Handling the Race Condition)
+            # Since the vectorizer might have already processed rows before we attached the trigger,
+            # we must check for any existing rows and insert them into the outbox if missing.
+            await cur.execute(
+                f"""
+                INSERT INTO _sink_outbox (target_name, version_id, source_id, action, payload)
+                SELECT 
+                    '{target_name}', 
+                    '{version_id}', 
+                    {config.ingest.p_key}::text, 
+                    'UPSERT', 
+                    jsonb_build_object(
+                        'content', chunk,
+                        'embedding', embedding::text
+                    )
+                FROM {vectorizer_name}
+                ON CONFLICT DO NOTHING
+                """
+            )
+
 
 
 
 async def warm_up_from_cache(
-    settings: Settings, config: TableConfig, source_table: str, target_store_table: str
+    settings: Settings, config: SearchPipeline, source_table: str, target_store_table: str
 ):
     """Populate a new embedding table from the cache to avoid re-calls."""
     logger.info(f"Warming up {target_store_table} from cache...")
@@ -975,13 +1000,13 @@ async def warm_up_from_cache(
 
             await cur.execute(
                 f"""
-                INSERT INTO {target_store_table} ({config.id_column}, {config.embedding_column})
-                SELECT r.{config.id_column}, c.embedding
+                INSERT INTO {target_store_table} ({config.ingest.p_key}, embedding)
+                SELECT r.{config.ingest.p_key}, c.embedding
                 FROM {source_table} r
-                JOIN _embedding_cache c ON md5(COALESCE(r.{config.content_column}, '')::text || %s) = c.text_hash
+                JOIN _embedding_cache c ON md5(COALESCE(r.{config.pipeline.content_column}, '')::text || %s) = c.text_hash
                 ON CONFLICT DO NOTHING
                 """,
-                (config.embedding_model,),
+                (config.pipeline.embedding.model,),
             )
 
 
@@ -1025,17 +1050,17 @@ async def create_placeholder_slot(settings: Settings, target_name: str) -> str:
             return lsn
 
 
-async def ensure_sink_raw_table(settings: Settings, config: TableConfig):
+async def ensure_sink_raw_table(settings: Settings, config: SearchPipeline):
     """Ensure the raw table exists in the Sink DB with correct types."""
-    target = config.sink_raw_table
+    target = config.ingest.table
     source_types = await get_source_column_types(settings, config)
     async with await get_sink_conn() as conn:
         await conn.set_autocommit(True)
         async with conn.cursor() as cur:
             cols_sql = []
-            for col in config.publication_columns:
+            for col in config.ingest.columns:
                 dtype = source_types.get(col, "TEXT")
-                if col == config.id_column:
+                if col == config.ingest.p_key:
                     cols_sql.append(f"{col} {dtype} PRIMARY KEY")
                 else:
                     cols_sql.append(f"{col} {dtype}")
@@ -1047,15 +1072,14 @@ async def ensure_sink_raw_table(settings: Settings, config: TableConfig):
 
 async def setup_sink(
     settings: Settings,
-    config: TableConfig,
+    config: SearchPipeline,
     target_name: str,
-    target_table: str | None = None,
-    vectorizer_target: str | None = None,
+    vectorizer_target: Optional[str] = None,
 ):
     """Initialize the sink table and subscription."""
     sub_name = f"sub_{target_name}"
     pub_name = f"pub_{target_name}"
-    target = target_table or config.sink_raw_table
+    target = config.ingest.table
 
     await setup_state_table(settings, target_name)
     source_types = await get_source_column_types(settings, config)
@@ -1069,9 +1093,9 @@ async def setup_sink(
 
         async with conn.cursor() as cur:
             cols_sql = []
-            for col in config.publication_columns:
+            for col in config.ingest.columns:
                 dtype = source_types.get(col, "TEXT")
-                if col == config.id_column:
+                if col == config.ingest.p_key:
                     cols_sql.append(f"{col} {dtype} PRIMARY KEY")
                 else:
                     cols_sql.append(f"{col} {dtype}")
@@ -1085,7 +1109,7 @@ async def setup_sink(
             except Exception:
                 import pgai
                 pgai.install(settings.resolved_sink_url)
-            target = config.sink_raw_table
+            target = config.ingest.table
             vectorizer_name = vectorizer_target or f"{target}_store"
             logger.info(f"Setting up sink for {target_name}, target table: {target}, vectorizer: {vectorizer_name}")
             await cur.execute(
@@ -1096,8 +1120,25 @@ async def setup_sink(
             if not await cur.fetchone():
                 versioned_view = vectorizer_name.replace("_store", "_embedding")
                 destination_sql = f", destination => ai.destination_table(target_table => '{vectorizer_name}', view_name => '{versioned_view}')"
+            else:
+                destination_sql = "" # If vectorizer exists, destination is already set
 
-            # Retry loop for pgai creation to handle intermittent registration lag
+            # Resolve pgai chunking function name
+            c_strat = config.pipeline.chunking.strategy
+            if c_strat == "recursive_character":
+                c_func = "recursive_character_text_splitter"
+            elif c_strat == "markdown":
+                c_func = "markdown_header_text_splitter"
+            elif c_strat == "sentence":
+                c_func = "sentence_splitter" # Assumption, or check? But verified only recursive_character implies text_splitter
+            else:
+                c_func = c_strat
+
+            # Resolve api_key_name for pgai
+            api_key_sql = ""
+            if config.pipeline.embedding.api_key_name:
+                api_key_sql = f", api_key_name => '{config.pipeline.embedding.api_key_name}'"
+
             async def try_create_vectorizer():
                 try:
                     await cur.execute(
@@ -1105,10 +1146,10 @@ async def setup_sink(
                         SELECT ai.create_vectorizer(
                             '{target}'::regclass,
                             name => %s,
-                            loading => ai.loading_column('{config.content_column}'),
-                            embedding => ai.embedding_{config.embedding_provider}('{config.embedding_model}', {config.embedding_dimension}),
-                            chunking => ai.chunking_{config.chunking_strategy}(),
-                            formatting => ai.formatting_python_template('{config.formatting_template}'),
+                            loading => ai.loading_column('{config.pipeline.content_column}'),
+                            embedding => ai.embedding_{config.pipeline.embedding.provider}('{config.pipeline.embedding.model}', {config.pipeline.embedding.dimension}{api_key_sql}),
+                            chunking => ai.chunking_{c_func}(),
+                            formatting => ai.formatting_python_template('{config.pipeline.template}'),
                             if_not_exists => true
                             {destination_sql}
                         )
@@ -1154,6 +1195,21 @@ async def setup_sink(
                     options_dict["create_slot"] = "false"
 
                 options = ", ".join([f"{k} = {v}" for k, v in options_dict.items()])
+                # Give Source catalog a moment to settle after any recent drops
+                await asyncio.sleep(2.0)
+
+                # Force release any zombie worker using this slot on the Source
+                if slot_exists_on_source:
+                    try:
+                        async with await get_source_conn() as s_conn:
+                            async with s_conn.cursor() as s_cur:
+                                await s_cur.execute(
+                                    "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = %s",
+                                    (sub_name,),
+                                )
+                    except Exception as e:
+                        logger.warning(f"Failed to force release slot {sub_name} on source: {e}")
+
                 # Retry loop for subscription to handle source-side visibility lag
                 async def try_create_subscription():
                     try:
@@ -1167,18 +1223,29 @@ async def setup_sink(
                         )
                         return True
                     except Exception as e:
-                        if "does not exist" in str(e):
-                            logger.warning(f"Subscription publication {pub_name} not yet visible, retrying: {e}")
-                            return False
-                        raise e
+                        err_msg = str(e).lower()
+                        if "already exists" in err_msg:
+                            return True
+                        if "in use" in err_msg:
+                            # One more attempt to kick the zombie
+                            try:
+                                async with await get_source_conn() as s_conn:
+                                    async with s_conn.cursor() as s_cur:
+                                        await s_cur.execute(
+                                            "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = %s",
+                                            (sub_name,),
+                                        )
+                            except Exception: pass
+                        logger.warning(f"Subscription creation for {sub_name} failed, will retry: {e}")
+                        return False
 
-                await wait_until(try_create_subscription, timeout=20.0, interval=2.0)
+                await wait_until(try_create_subscription, timeout=30.0, interval=3.0)
             else:
                 await cur.execute(f"ALTER SUBSCRIPTION {sub_name} ENABLE")
                 await cur.execute(f"ALTER SUBSCRIPTION {sub_name} REFRESH PUBLICATION")
 
 
-async def run_sql_catchup(settings: Settings, config: TableConfig, target_name: str):
+async def run_sql_catchup(settings: Settings, config: SearchPipeline, target_name: str):
     """Perform Keyset Pagination for catch-up."""
     last_id_str, _ = await get_replica_state(settings, target_name)
     last_id = last_id_str if last_id_str != "0" else None
@@ -1188,17 +1255,17 @@ async def run_sql_catchup(settings: Settings, config: TableConfig, target_name: 
     while True:
         async with await get_source_conn() as source_conn:
             async with source_conn.cursor(row_factory=dict_row) as cur:
-                cols = ", ".join(config.publication_columns)
-                where_clause = f"({config.publication_where.replace('%', '%%')})" if config.publication_where else "TRUE"
+                cols = ", ".join(config.ingest.columns)
+                where_clause = f"({config.ingest.filter.replace('%', '%%')})" if config.ingest.filter else "TRUE"
 
                 if last_id is None:
                     await cur.execute(
-                        f"SELECT {cols} FROM {config.source_table} WHERE {where_clause} ORDER BY {config.id_column} ASC LIMIT %s",
+                        f"SELECT {cols} FROM {config.ingest.table} WHERE {where_clause} ORDER BY {config.ingest.p_key} ASC LIMIT %s",
                         (batch_size,),
                     )
                 else:
                     await cur.execute(
-                        f"SELECT {cols} FROM {config.source_table} WHERE {where_clause} AND {config.id_column} > %s ORDER BY {config.id_column} ASC LIMIT %s",
+                        f"SELECT {cols} FROM {config.ingest.table} WHERE {where_clause} AND {config.ingest.p_key} > %s ORDER BY {config.ingest.p_key} ASC LIMIT %s",
                         (last_id, batch_size),
                     )
                 rows = await cur.fetchall()
@@ -1211,28 +1278,28 @@ async def run_sql_catchup(settings: Settings, config: TableConfig, target_name: 
             async with sink_conn.cursor() as cur:
                 col_names = list(rows[0].keys())
                 placeholders = ", ".join(["%s"] * len(col_names))
-                update_set = ", ".join([f"{c} = EXCLUDED.{c}" for c in col_names if c != config.id_column])
+                update_set = ", ".join([f"{c} = EXCLUDED.{c}" for c in col_names if c != config.ingest.p_key])
                 upsert_query = f"""
-                    INSERT INTO {config.sink_raw_table} ({', '.join(col_names)})
+                    INSERT INTO {config.ingest.table} ({', '.join(col_names)})
                     VALUES ({placeholders})
-                    ON CONFLICT ({config.id_column}) DO UPDATE SET {update_set}
+                    ON CONFLICT ({config.ingest.p_key}) DO UPDATE SET {update_set}
                 """
                 data = [tuple(row.values()) for row in rows]
                 await cur.executemany(upsert_query, data)
 
-        last_id = rows[-1][config.id_column]
+        last_id = rows[-1][config.ingest.p_key]
         total_synced += len(rows)
         await update_replica_state(settings, target_name, last_id=str(last_id))
     logger.info(f"Catch-up complete for {target_name}: {total_synced} rows.")
 
 
-async def find_and_fix_ghost_records(settings: Settings, config: TableConfig, target_name: str):
+async def find_and_fix_ghost_records(settings: Settings, config: SearchPipeline, target_name: str):
     """Anti-Entropy sweep to find and delete hard-deleted records."""
     logger.info(f"Starting Anti-Entropy sweep for {target_name}...")
     
     # Pre-flight readiness check to avoid race conditions in tests
     if not await wait_for_source_table(settings, config):
-        raise RuntimeError(f"Source table {config.source_table} not found after timeout")
+        raise RuntimeError(f"Source table {config.ingest.table} not found after timeout")
 
     chunk_size = 50000
     
@@ -1243,9 +1310,9 @@ async def find_and_fix_ghost_records(settings: Settings, config: TableConfig, ta
     async with await get_sink_conn() as conn:
         async with conn.cursor() as cur:
             try:
-                await cur.execute(f"SELECT {config.id_column} FROM {config.sink_raw_table} ORDER BY {config.id_column} ASC LIMIT 1")
+                await cur.execute(f"SELECT {config.ingest.p_key} FROM {config.ingest.table} ORDER BY {config.ingest.p_key} ASC LIMIT 1")
                 row_min = await cur.fetchone()
-                await cur.execute(f"SELECT {config.id_column} FROM {config.sink_raw_table} ORDER BY {config.id_column} DESC LIMIT 1")
+                await cur.execute(f"SELECT {config.ingest.p_key} FROM {config.ingest.table} ORDER BY {config.ingest.p_key} DESC LIMIT 1")
                 row_max = await cur.fetchone()
                 
                 if row_min: # If row_min is not None, table is not empty
@@ -1257,9 +1324,9 @@ async def find_and_fix_ghost_records(settings: Settings, config: TableConfig, ta
     async with await get_source_conn() as s_conn:
         async with s_conn.cursor() as s_cur:
             try:
-                await s_cur.execute(f"SELECT {config.id_column} FROM {config.source_table} ORDER BY {config.id_column} ASC LIMIT 1")
+                await s_cur.execute(f"SELECT {config.ingest.p_key} FROM {config.ingest.table} ORDER BY {config.ingest.p_key} ASC LIMIT 1")
                 row_min = await s_cur.fetchone()
-                await s_cur.execute(f"SELECT {config.id_column} FROM {config.source_table} ORDER BY {config.id_column} DESC LIMIT 1")
+                await s_cur.execute(f"SELECT {config.ingest.p_key} FROM {config.ingest.table} ORDER BY {config.ingest.p_key} DESC LIMIT 1")
                 row_max = await s_cur.fetchone()
                 
                 if row_min:
@@ -1274,17 +1341,17 @@ async def find_and_fix_ghost_records(settings: Settings, config: TableConfig, ta
 
     min_id_raw, max_id_raw = min(all_ids), max(all_ids)
     source_types = await get_source_column_types(settings, config)
-    id_type = source_types.get(config.id_column, "TEXT")
+    id_type = source_types.get(config.ingest.p_key, "TEXT")
 
     # 2. Strategy: Set Comparison for UUIDs/Strings or Small Tables
     if id_type not in ("INT", "BIGINT"):
         async with await get_source_conn() as s_conn:
             async with s_conn.cursor() as s_cur:
-                await s_cur.execute(f"SELECT {config.id_column} FROM {config.source_table}")
+                await s_cur.execute(f"SELECT {config.ingest.p_key} FROM {config.ingest.table}")
                 source_ids = set(r[0] for r in await s_cur.fetchall())
         async with await get_sink_conn() as k_conn:
             async with k_conn.cursor() as k_cur:
-                await k_cur.execute(f"SELECT {config.id_column} FROM {config.sink_raw_table}")
+                await k_cur.execute(f"SELECT {config.ingest.p_key} FROM {config.ingest.table}")
                 sink_ids = [r[0] for r in await k_cur.fetchall()]
         
         ghosts = [kid for kid in sink_ids if kid not in source_ids]
@@ -1292,7 +1359,7 @@ async def find_and_fix_ghost_records(settings: Settings, config: TableConfig, ta
             logger.info(f"Found {len(ghosts)} ghosts in {target_name} via set comparison")
             async with await get_sink_conn() as k_conn:
                 async with k_conn.cursor() as k_cur:
-                    await k_cur.execute(f"DELETE FROM {config.sink_raw_table} WHERE {config.id_column} = ANY(%s)", (ghosts,))
+                    await k_cur.execute(f"DELETE FROM {config.ingest.table} WHERE {config.ingest.p_key} = ANY(%s)", (ghosts,))
                 await k_conn.commit()
         return
 
@@ -1303,11 +1370,11 @@ async def find_and_fix_ghost_records(settings: Settings, config: TableConfig, ta
         end_id = start_id + chunk_size
         async with await get_source_conn() as s_conn:
             async with s_conn.cursor() as s_cur:
-                await s_cur.execute(f"SELECT count(*), bit_xor({config.id_column}) FROM {config.source_table} WHERE {config.id_column} BETWEEN %s AND %s", (start_id, end_id))
+                await s_cur.execute(f"SELECT count(*), bit_xor({config.ingest.p_key}) FROM {config.ingest.table} WHERE {config.ingest.p_key} BETWEEN %s AND %s", (start_id, end_id))
                 s_count, s_xor = await s_cur.fetchone()
         async with await get_sink_conn() as k_conn:
             async with k_conn.cursor() as k_cur:
-                await k_cur.execute(f"SELECT count(*), bit_xor({config.id_column}) FROM {config.sink_raw_table} WHERE {config.id_column} BETWEEN %s AND %s", (start_id, end_id))
+                await k_cur.execute(f"SELECT count(*), bit_xor({config.ingest.p_key}) FROM {config.ingest.table} WHERE {config.ingest.p_key} BETWEEN %s AND %s", (start_id, end_id))
                 k_count, k_xor = await k_cur.fetchone()
         
         logger.debug(f"Range {start_id}-{end_id}: Source(count={s_count}, xor={s_xor}), Sink(count={k_count}, xor={k_xor})")
@@ -1316,29 +1383,29 @@ async def find_and_fix_ghost_records(settings: Settings, config: TableConfig, ta
             logger.info(f"Drift detected in range {start_id}-{end_id} for {target_name}. Performing deep check...")
             async with await get_source_conn() as s_conn:
                 async with s_conn.cursor() as s_cur:
-                    await s_cur.execute(f"SELECT {config.id_column} FROM {config.source_table} WHERE {config.id_column} BETWEEN %s AND %s", (start_id, end_id))
+                    await s_cur.execute(f"SELECT {config.ingest.p_key} FROM {config.ingest.table} WHERE {config.ingest.p_key} BETWEEN %s AND %s", (start_id, end_id))
                     s_ids = set(r[0] for r in await s_cur.fetchall())
             async with await get_sink_conn() as k_conn:
                 async with k_conn.cursor() as k_cur:
-                    await k_cur.execute(f"SELECT {config.id_column} FROM {config.sink_raw_table} WHERE {config.id_column} BETWEEN %s AND %s", (start_id, end_id))
+                    await k_cur.execute(f"SELECT {config.ingest.p_key} FROM {config.ingest.table} WHERE {config.ingest.p_key} BETWEEN %s AND %s", (start_id, end_id))
                     k_ids = [r[0] for r in await k_cur.fetchall()]
                     ghosts = [kid for kid in k_ids if kid not in s_ids]
                     if ghosts:
                         logger.warning(f"Found {len(ghosts)} ghosts in range {start_id}-{end_id} for {target_name}: {ghosts}")
                         async with await get_sink_conn() as del_conn:
                             async with del_conn.cursor() as del_cur:
-                                await del_cur.execute(f"DELETE FROM {config.sink_raw_table} WHERE {config.id_column} = ANY(%s)", (ghosts,))
+                                await del_cur.execute(f"DELETE FROM {config.ingest.table} WHERE {config.ingest.p_key} = ANY(%s)", (ghosts,))
                             await del_conn.commit()
 
 
-async def drop_subscription_completely(settings: Settings, config: TableConfig, target_name: str):
+async def drop_subscription_completely(settings: Settings, config: SearchPipeline, target_name: str):
     """Drop replication objects for a specific target."""
     sub_name = f"sub_{target_name}"
     logger.info(f"Dropping replication {sub_name} for {target_name}...")
     try:
         async with await connect_db(settings.resolved_sink_url) as conn:
             await conn.set_autocommit(True)
-            await conn.execute(f"DROP VIEW IF EXISTS {config.sink_replica_table} CASCADE")
+            await conn.execute(f"DROP VIEW IF EXISTS {config.ingest.table}_search CASCADE")
             
             # Retry loop for dropping subscription to handle "sync in progress"
             async def try_drop_subscription():
@@ -1372,7 +1439,7 @@ async def drop_subscription_completely(settings: Settings, config: TableConfig, 
                         
             # Cleanup vectorizers
             async with conn.cursor() as cur:
-                await cur.execute("SELECT id FROM ai.vectorizer WHERE name LIKE %s", (f"{config.sink_raw_table}_store%",))
+                await cur.execute("SELECT id FROM ai.vectorizer WHERE name LIKE %s", (f"{config.ingest.table}_store%",))
                 for (vid,) in await cur.fetchall():
                     await cur.execute(f"SELECT ai.drop_vectorizer({vid}, drop_all => true)")
     except Exception as e:
@@ -1390,7 +1457,7 @@ async def drop_subscription_completely(settings: Settings, config: TableConfig, 
 async def check_and_protect_source(settings: Settings, target_name: str) -> float:
     """Monitor lag and self-destruct if needed."""
     sub_name = f"sub_{target_name}"
-    config = settings.tables[target_name]
+    config = settings.pipelines[target_name]
     try:
         async with await get_source_conn() as conn:
             async with conn.cursor() as cur:

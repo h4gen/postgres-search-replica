@@ -10,6 +10,12 @@ services:
       - ./source_mock.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
       - "5433:5432"
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   sink:
     build: 
@@ -31,23 +37,39 @@ services:
       - ollama
     ports:
       - "5434:54322"
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -h localhost -p 54322"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   ollama:
     image: ollama/ollama:latest
     ports:
       - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
     # Pull the required embedding model on startup
     entrypoint: /bin/sh
     command: -c "ollama serve & sleep 5 && ollama pull nomic-embed-text && wait"
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list | grep -q 'nomic-embed-text'"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
 
   qdrant:
     image: qdrant/qdrant:latest
     ports:
       - "6333:6333"
       - "6334:6334"
+    restart: always
     volumes:
       - qdrant_data:/qdrant/storage
 
 volumes:
   sink_data:
   qdrant_data:
+  ollama_data:

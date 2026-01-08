@@ -57,9 +57,10 @@ This document outlines the architectural and operational requirements to move th
 ## Chapter 3: Declarative Schema & Security
 *Zero-Touch configuration where the code manages the database state.*
 
-- **Automated Schema Evolution**:
-    - **Implementation**: Instead of static `CREATE TABLE`, implement a reconciliation loop at startup. Compare `PUBLICATION_COLUMNS` from settings with the existing sink table schema.
-    - **Why**: Allows users to add columns to the replication list via environment variables without manually running SQL migrations. The daemon auto-applies `ALTER TABLE ... ADD COLUMN`.
+- **Unified Configuration & Declarative Schema**:
+    - **Status**: Completed.
+    - **Implementation**: Consolidated `config.py` and `config_v2.py` into a single Pydantic-based schema. Removed legacy `TableConfig`.
+    - **Why**: Eliminates architectural confusion and provides a single source of truth for all pipeline definitions.
 - **Upstream Change Detection**:
     - **Implementation**: Perform Pre-flight checks on the Source DB to verify that configured columns exist and data types are compatible.
     - **Why**: Prevents the pipeline from starting in a broken state or crashing unexpectedly when the source schema diverges from the replica configuration.
