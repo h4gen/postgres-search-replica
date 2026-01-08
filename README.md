@@ -138,14 +138,22 @@ async def search_example():
 The client supports different search backends via the **Strategy Pattern**. This allows you to leverage specialized vector engines like Qdrant while maintaining a consistent application interface.
 
 ```python
+from pg_replica import connect
+from pg_replica.config import SearchPipeline, IngestConfig, PipelineConfig, EmbeddingConfig, StorageConfig, MirrorConfig
+
 # Configure a table to use Qdrant by default
 replica = connect(
-    tables={
-        "products": {
-            "source_table": "products",
-            "search_engine": "qdrant",
-            "mirrors": [{"id": "m1", "type": "qdrant", "url": "http://localhost:6333"}]
-        }
+    pipelines={
+        "products": SearchPipeline(
+            ingest=IngestConfig(table="products", columns=["id", "name", "description"]),
+            pipeline=PipelineConfig(
+                template="Product: $name Description: $chunk",
+                embedding=EmbeddingConfig(provider="ollama", model="nomic-embed-text", dimension=768)
+            ),
+            storage=StorageConfig(
+                mirrors=[MirrorConfig(id="m1", type="qdrant", config={"url": "http://localhost:6333"})]
+            )
+        )
     }
 )
 
@@ -155,6 +163,7 @@ res = await replica.search("high-tech accessories")
 
 ## Key Features
 
+- **Unified Configuration**: A single, declarative `config.py` using Pydantic for validation. No more split between settings and table schemas.
 - **Fault-Tolerant Reconciler**: Centralized state management that catches and reports errors per-target, preventing cascading failures.
 - **Transactional Control Plane**: Distributed locking and settings isolation for reliable multi-node operations.
 - **Production-Grade Teardown**: Robust logical replication cleanup with worker termination and retry logic to prevent zombie slots.
@@ -162,87 +171,97 @@ res = await replica.search("high-tech accessories")
 - **Hybrid Recovery & Self-Healing**: Automatically detect missing replication slots and bridge the gap using SQL catch-up followed by an LSN-anchored handover to native replication.
 - **Anti-Entropy (Ghost Cleaner)**: Checksum-based sweep to identify and prune records that were hard-deleted from the source while the daemon was offline.
 - **Source Protection (Watchdog)**: Actively monitors replication lag. If the lag exceeds `MAX_SLOT_WAL_KEEP_SIZE_MB`, it triggers a self-destruct to ensure the Source DB never runs out of disk space.
-- **Zero-Touch & Low Privilege**: No `SUPERUSER` rights required on the source. All protection and reconciliation logic is handled by the replica sidecar.
 - **Dynamic Type Detection**: Automatically detect primary key types (including **UUID**, **BIGINT**, **TEXT**) and schema from the source database at runtime.
 - **Context-Aware Embedding**: Automatically combine metadata (e.g., `name`) with chunked text (e.g., `description`) using Python-style templates to preserve context across all vectors.
-- **Connection Pooling**: Uses `psycopg-pool` for robust management of database connections, preventing exhaustion under high load.
-- **Observability Hub**: Built-in FastAPI server providing health checks and real-time status reporting from the configuration history.
-- **Structured JSON Logging**: Native support for single-line JSON logging, ready for ingestion by Datadog, ELK, or Grafana Loki.
-- **Managed Lifecycle**: Automatically handles replication slot creation/cleanup and `pgai` worker management.
-- **Smart Reconciliation**: Only updates embeddings when source data actually changes, leveraging `pgai` native state tracking.
-- **Zero-Downtime Blue-Green Swaps**: Orchestrates versioned search indices. It builds new versions (e.g. `v2` with a different model) in the background and only promotes them to the live search view when 100% of rows are vectorized.
-- **Zero-Touch Config**: Automatically synchronizes publication columns and filters from Python settings to the database on startup.
-- **Multicast CDC Bridge**: Transactionally capture embeddings and sync them to external vector databases with persistent state tracking and retry logic.
-- **Unified Search Interface (Strategy Pattern)**: Switch between `postgres` and `qdrant` search engines dynamically with a single line of code, ensuring cross-engine result consistency.
-- **Cross-Engine Consistency (Mirror Handshake)**: Guarantees that external search engines are 100% caught up before Postgres version promotion.
-- **Atomic Mirror Aliases**: Automatically synchronizes downstream search engine aliases (e.g., Qdrant "production" alias) during Postgres view swaps, ensuring zero-downtime infrastructure migratons.
- 
-## Declarative Blue-Green Swaps
-
-One of the biggest challenges in vector search is upgrading your embedding models or chunking strategies. Normally, this involves downtime or returning incomplete results while the new index builds.
-
-This library solves this using a **Declarative Blue-Green** approach:
-
-1.  **Preparation**: Deploy a new configuration (e.g., higher dimension model) with `ACTIVE=False`. The reconciler will create the new versioned vectorizer and begin building the index in the background.
-2.  **Service Continuity**: The public search View STILL points to your old version (`v1`). Search remains 100% accurate.
-3.  **Promotion**: Once the new vectorizer is synchronized (`pending_items == 0`), simply toggle `ACTIVE=True` for the new version.
-4.  **Atomic Swap**: The reconciler performs an **atomic view swap**. Applications immediately start seeing results from the new model with zero dropped requests.
-
-## Roadmap
-
-See our [Enterprise Readiness Roadmap](roadmap.md) for planned features, including:
-- **Fault Tolerance**: Poison Pill handling and Circuit Breakers.
-- **Observability**: Prometheus metrics and Structured JSON Logging.
-- **Enterprise Source Integration**: Pre-provisioned infra and Multi-Engine Polling (Oracle, MySQL, etc.).
-- **Search UX**: Hybrid Search with RRF (Reciprocal Rank Fusion).
+- **Blue-Green Data Migration (Swap Pattern)**: Zero-downtime search index updates. The system automatically builds new vector versions in the background and only swaps the public view once synchronization is complete.
+- **Multicast CDC Bridge**: Transactionally capture embeddings and sync them to external vector databases (Qdrant, etc.) with persistent state tracking and retry logic.
+- **Unified Search Interface (Strategy Pattern)**: Switch between `postgres` and `qdrant` search engines dynamically with a single line of code.
 
 ## Configuration & API Reference
 
-All settings can be configured via environment variables (e.g., `SOURCE_URL`) or a `.env` file. The library uses `pydantic-settings` for robust validation.
+All settings can be configured via environment variables (e.g., `SOURCE_URL`) or a `.env` file. Complex pipeline configurations are best defined in Python or via JSON/YAML environment variables.
 
 ### 1. Core Infrastructure
 | Environment Variable | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `SOURCE_URL` | `str` | **Required** | Connection string for the source PostgreSQL database. |
-| `SINK_URL` | `str` | `local` | Connection string for the sink (search) database. Set to `local` to use the managed sidecar Postgres. |
+| `SINK_URL` | `str` | `local` | Connection string for the sink database. `local` uses the managed sidecar. |
 | `LOCAL_PORT` | `int` | `54322` | Port for the managed Postgres instance when `SINK_URL=local`. |
-| `PG_REPLICA_DIR` | `Path` | `~/.local/share/...` | Base directory for storage, WAL data, and logs in local mode. |
-| `SUBSCRIPTION_SOURCE_URL` | `str` | `SOURCE_URL` | The URL used *by the Sink DB* to reach the Source. Useful for Docker networking (e.g. `postgresql://host.docker.internal...`). |
+| `SUBSCRIPTION_SOURCE_URL` | `str` | `SOURCE_URL` | The URL used *by the Sink DB* to reach the Source (internal Docker networking). |
+| `MAX_SLOT_WAL_KEEP_SIZE_MB` | `int` | `1024` | Safety limit for Source WAL retention before self-destruct. |
 
-### 2. Schema & Table Mapping
-| Environment Variable | Type | Default | Description |
+### 2. Multi-Pipeline Configuration
+Pipeline schemas are defined in `src/pg_replica/config.py`. You can configure multiple tables simultaneously using the `pipelines` dictionary.
+
+#### Full Python Example
+This example shows a complex setup with a custom primary key (`p_key`), row filtering, and a Qdrant mirror.
+
+```python
+from pg_replica.config import (
+    SearchPipeline, IngestConfig, PipelineConfig, 
+    EmbeddingConfig, StorageConfig, MirrorConfig
+)
+
+config = {
+    "pipelines": {
+        "legacy_products": SearchPipeline(
+            # 1. Ingest: How to pull data from Source
+            ingest=IngestConfig(
+                table="products_v1",      # Source table name
+                p_key="sku_uuid",         # REQUIRED if not 'id'. Used for catch-up & sync.
+                columns=["sku_uuid", "name", "category", "description"],
+                filter="active = true"    # SQL where clause for CDC and Catch-up
+            ),
+            # 2. Pipeline: How to transform text to vectors
+            pipeline=PipelineConfig(
+                template="Name: $name\nCategory: $category\nContext: $chunk",
+                content_column="description",
+                embedding=EmbeddingConfig(
+                    provider="openai",        # Using OpenAI instead of Ollama
+                    model="text-embedding-3-small",
+                    dimension=1536,
+                    api_key_name="OPENAI_API_KEY" # Name of environment variable in Sink DB
+                )
+            ),
+            # 3. Storage: Where to put the results
+            storage=StorageConfig(
+                postgres={"profile": "hybrid"},
+                mirrors=[
+                    MirrorConfig(
+                        id="qdrant_main",
+                        type="qdrant",
+                        config={
+                            "url": "http://qdrant:6333", 
+                            "prefix": "prod_",
+                            "api_key": "your-qdrant-secret-key" # Passed to Qdrant adapter
+                        }
+                    )
+                ]
+            )
+        )
+    }
+}
+```
+
+### 3. Secret Management
+The library handles secrets in two ways depending on the target:
+
+1.  **Internal Vectorizers (OpenAI, VoyageAI, etc.)**: These are managed by `pgai` inside the database. You provide the **`api_key_name`**, which is the name of an environment variable (or a Postgres session variable) that the Sink DB can access.
+2.  **External Mirrors (Qdrant, Pinecone)**: These are managed by the `MirrorWorker` daemon. You can pass the **`api_key`** directly in the mirror's `config` dictionary.
+
+> [!TIP]
+> For production safety, use environment variable expansion in your configuration loader rather than hardcoding keys in Python files.
+
+### 3. Schema Reference (`IngestConfig`)
+| Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `SOURCE_TABLE` | `str` | `products` | The table name on the source database to replicate. |
-| `SINK_RAW_TABLE` | `str` | `products` | The name of the raw landing table in the sink database. |
-| `SINK_REPLICA_TABLE` | `str` | `products_replica` | The name of the search-ready View that joins raw data with embeddings. |
-| `ID_COLUMN` | `str` | `id` | The Primary Key column (must be numeric, UUID, or TEXT). |
-| `CONTENT_COLUMN` | `str` | `description` | The source column that will be chunked and vectorized. |
-| `TARGET_CONTENT_COLUMN` | `str` | `transformed_description`| The name of the text column in the final search View. |
-| `SEARCH_ENGINE` | `str` | `postgres` | The default engine to use for queries (`postgres` or `qdrant`). |
-| `ACTIVE` | `bool` | `True` | Declarative state. If `False`, the version will be built but not promoted to the live View. |
+| `table` | `str` | **Required** | The table name on the source database. |
+| `p_key` | `str` | `id` | **CRITICAL**: The Primary Key. Used for Keyset Pagination and CDC tracking. |
+| `columns`| `list` | `[]` | List of columns to replicate. `p_key` is automatically added. |
+| `filter` | `str` | `None` | Optional SQL `WHERE` clause (e.g., `is_deleted = false`). |
+| `schema_name`| `str`| `public`| Source schema. |
 
-### 3. Replication & CDC Settings
-| Environment Variable | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `PUBLICATION_NAME` | `str` | `pub_products` | Name of the PostgreSQL publication on the source. |
-| `PUBLICATION_COLUMNS`| `list` | `["id", "name", "description"]` | Columns to include in the replication stream. |
-| `PUBLICATION_WHERE` | `str` | `None` | Optional SQL filter clause for row-level replication (PG 15+). |
-| `SUBSCRIPTION_NAME` | `str` | `sub_products` | Name of the PostgreSQL subscription on the sink. |
-| `SUBSCRIPTION_OPTIONS`| `dict` | `{"streaming": "'on'"}` | Additional options passed to `CREATE SUBSCRIPTION`. |
-| `MAX_SLOT_WAL_KEEP_SIZE_MB` | `int` | `1024` | Safety limit. If replication lag exceeds this, the sidecar self-destructs to protect source disk. |
-| `BATCH_SIZE` | `int` | `50` | Batch size for initial SQL catch-up and anti-entropy sweeps. |
-
-### 4. Vectorization & Context-Aware Embedding (pgai)
-| Environment Variable | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `EMBEDDING_PROVIDER` | `str` | `ollama` | The `pgai` provider (`ollama`, `openai`, `anthropic`, etc.). |
-| `EMBEDDING_MODEL` | `str` | `nomic-embed-text` | The embedding model name. |
-| `EMBEDDING_DIMENSION`| `int` | `768` | Dimension of the vectors generated by the model. |
-| `EMBEDDING_COLUMN` | `str` | `embedding` | Name of the vector column in the embedding table. |
-| `CHUNKING_STRATEGY` | `str` | `recursive_character_text_splitter` | `pgai` strategy for splitting the `CONTENT_COLUMN`. |
-| `FORMATTING_TEMPLATE`| `str` | *See below* | Python template for metadata enrichment (e.g., `Product: $name Description: $chunk`). |
-
-### 5. Multicast Sync (External Mirrors)
+### 4. Observability & System
 You can configure a list of external mirrors in your `TableConfig`. The library will ensure these stay in sync with your Postgres embeddings.
 
 ```python

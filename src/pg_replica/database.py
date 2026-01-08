@@ -1134,6 +1134,11 @@ async def setup_sink(
             else:
                 c_func = c_strat
 
+            # Resolve api_key_name for pgai
+            api_key_sql = ""
+            if config.pipeline.embedding.api_key_name:
+                api_key_sql = f", api_key_name => '{config.pipeline.embedding.api_key_name}'"
+
             async def try_create_vectorizer():
                 try:
                     await cur.execute(
@@ -1142,7 +1147,7 @@ async def setup_sink(
                             '{target}'::regclass,
                             name => %s,
                             loading => ai.loading_column('{config.pipeline.content_column}'),
-                            embedding => ai.embedding_{config.pipeline.embedding.provider}('{config.pipeline.embedding.model}', {config.pipeline.embedding.dimension}),
+                            embedding => ai.embedding_{config.pipeline.embedding.provider}('{config.pipeline.embedding.model}', {config.pipeline.embedding.dimension}{api_key_sql}),
                             chunking => ai.chunking_{c_func}(),
                             formatting => ai.formatting_python_template('{config.pipeline.template}'),
                             if_not_exists => true

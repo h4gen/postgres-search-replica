@@ -25,7 +25,8 @@ class MirrorWorker:
         if cache_key not in self.adapters:
             if m_type == "qdrant":
                 prefix = mirror_cfg.get("prefix") or config_dict.get("prefix", "")
-                self.adapters[cache_key] = QdrantSinkAdapter(m_url, collection_prefix=prefix)
+                api_key = mirror_cfg.get("api_key") or config_dict.get("api_key")
+                self.adapters[cache_key] = QdrantSinkAdapter(m_url, collection_prefix=prefix, api_key=api_key)
             else:
                 raise ValueError(f"Unsupported mirror type: {m_type}")
         return self.adapters[cache_key]

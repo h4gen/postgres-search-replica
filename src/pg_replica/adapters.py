@@ -28,8 +28,8 @@ class SinkAdapter(abc.ABC):
         pass
 
 class QdrantSinkAdapter(SinkAdapter):
-    def __init__(self, url: str, collection_prefix: str = ""):
-        self.client = QdrantClient(url)
+    def __init__(self, url: str, collection_prefix: str = "", api_key: Optional[str] = None):
+        self.client = QdrantClient(url, api_key=api_key)
         self.collection_prefix = collection_prefix
 
     def _get_collection_name(self, target_name: str, version_id: str) -> str:
