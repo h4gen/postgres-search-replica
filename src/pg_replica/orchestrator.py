@@ -216,7 +216,7 @@ class Orchestrator:
             name="mirror_worker_supervisor"
         ))
         
-         self._tasks.append(asyncio.create_task(self._replication_loop(), name="watchdog"))
+        self._tasks.append(asyncio.create_task(self._replication_loop(), name="watchdog"))
 
     async def stop(self):
         """Gracefully stop all services."""
