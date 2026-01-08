@@ -133,8 +133,9 @@ class Orchestrator:
                 except RuntimeError as e:
                     if "Self-destructed" in str(e):
                         logger.critical(f"Replicator target {name} stopped: {e}")
-                        logger.info(f"Attempting to auto-heal {name}...")
+                        logger.info(f"Attempting to auto-heal {name} in 2s...")
                         try:
+                            await asyncio.sleep(2.0)
                             await self.reconciler.reconcile()
                             logger.info(f"Auto-heal for {name} successful.")
                         except Exception as re:

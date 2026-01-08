@@ -1194,6 +1194,18 @@ async def setup_sink(
                 # Give Source catalog a moment to settle after any recent drops
                 await asyncio.sleep(2.0)
 
+                # Force release any zombie worker using this slot on the Source
+                if slot_exists_on_source:
+                    try:
+                        async with await get_source_conn() as s_conn:
+                            async with s_conn.cursor() as s_cur:
+                                await s_cur.execute(
+                                    "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = %s",
+                                    (sub_name,),
+                                )
+                    except Exception as e:
+                        logger.warning(f"Failed to force release slot {sub_name} on source: {e}")
+
                 # Retry loop for subscription to handle source-side visibility lag
                 async def try_create_subscription():
                     try:
@@ -1208,10 +1220,20 @@ async def setup_sink(
                         return True
                     except Exception as e:
                         err_msg = str(e).lower()
-                        if "does not exist" in err_msg or "not found" in err_msg:
-                            logger.warning(f"Subscription publication {pub_name} not yet visible on source, retrying...")
-                            return False
-                        raise e
+                        if "already exists" in err_msg:
+                            return True
+                        if "in use" in err_msg:
+                            # One more attempt to kick the zombie
+                            try:
+                                async with await get_source_conn() as s_conn:
+                                    async with s_conn.cursor() as s_cur:
+                                        await s_cur.execute(
+                                            "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = %s",
+                                            (sub_name,),
+                                        )
+                            except Exception: pass
+                        logger.warning(f"Subscription creation for {sub_name} failed, will retry: {e}")
+                        return False
 
                 await wait_until(try_create_subscription, timeout=30.0, interval=3.0)
             else:

@@ -143,12 +143,14 @@ async def test_self_destruct_and_auto_heal(clean_db, robust_slot_cleanup, intern
                 await asyncio.sleep(0.5)
             assert healed, "Auto-heal failed to recreate slot"
 
-    # Insert data while "dead"
-    await source_conn.execute("INSERT INTO heal_products (id, name, description) VALUES (2, 'During Gap', 'Post-destruct')")
+        # 6. Final verification after restart
+        test_logger.info("Starting final verification after restart...")
+        # Insert data while "dead" (between blocks)
+        await source_conn.execute("INSERT INTO heal_products (id, name, description) VALUES (2, 'During Gap', 'Post-destruct')")
 
-    # Restart and heal
-    custom_settings["max_slot_wal_keep_size_mb"] = 1024
-    async with PGSearchReplica(sync=True, **custom_settings) as replica:
-        assert await wait_for_pgai_sync(replica.settings, "heal", expected_count=2, timeout=60)
-        results = await replica.search("destruct", table="heal")
-        assert len(results) >= 2
+        # Restart and heal
+        custom_settings["max_slot_wal_keep_size_mb"] = 1024
+        async with PGSearchReplica(sync=True, **custom_settings) as replica:
+            assert await wait_for_pgai_sync(replica.settings, "heal", expected_count=2, timeout=60)
+            results = await replica.search("destruct", table="heal")
+            assert len(results) >= 2

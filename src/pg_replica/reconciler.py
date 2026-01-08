@@ -375,6 +375,15 @@ class Planner:
                         )
                     )
 
+            # 2.4 Vectorizer Setup (State-Based)
+            # We ALWAYS ensure the vectorizer for this config exists, even if not active.
+            vectorizers = sink_state.get("vectorizers", {}).get(raw_table, [])
+            expected_vectorizer_target = f"{raw_table}_store_v{version_id}"
+            
+            vectorizer_exists = any(
+                v.get("target_table") == expected_vectorizer_target for v in vectorizers
+            )
+
             # 2.3 Recovery (Slot check)
             if sub_name not in source_state["slots"]:
                 actions.append(
