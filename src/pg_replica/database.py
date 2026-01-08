@@ -1191,6 +1191,9 @@ async def setup_sink(
                     options_dict["create_slot"] = "false"
 
                 options = ", ".join([f"{k} = {v}" for k, v in options_dict.items()])
+                # Give Source catalog a moment to settle after any recent drops
+                await asyncio.sleep(2.0)
+
                 # Retry loop for subscription to handle source-side visibility lag
                 async def try_create_subscription():
                     try:
@@ -1204,12 +1207,13 @@ async def setup_sink(
                         )
                         return True
                     except Exception as e:
-                        if "does not exist" in str(e):
-                            logger.warning(f"Subscription publication {pub_name} not yet visible, retrying: {e}")
+                        err_msg = str(e).lower()
+                        if "does not exist" in err_msg or "not found" in err_msg:
+                            logger.warning(f"Subscription publication {pub_name} not yet visible on source, retrying...")
                             return False
                         raise e
 
-                await wait_until(try_create_subscription, timeout=20.0, interval=2.0)
+                await wait_until(try_create_subscription, timeout=30.0, interval=3.0)
             else:
                 await cur.execute(f"ALTER SUBSCRIPTION {sub_name} ENABLE")
                 await cur.execute(f"ALTER SUBSCRIPTION {sub_name} REFRESH PUBLICATION")

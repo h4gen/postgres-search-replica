@@ -58,16 +58,20 @@ async def clean_db(sink_conn, source_conn):
             """
         )
     
-    # 2. Drop Vectorizers
+    # 2. Drop Vectorizers (if pgai exists)
     async with sink_conn.cursor() as cur:
         await cur.execute(
             """
             DO $$
-            DECLARE r RECORD;
             BEGIN
-                FOR r IN (SELECT id FROM ai.vectorizer) LOOP
-                    PERFORM ai.drop_vectorizer(r.id, drop_all => true);
-                END LOOP;
+                IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'ai' AND table_name = 'vectorizer') THEN
+                    DECLARE r RECORD;
+                    BEGIN
+                        FOR r IN (SELECT id FROM ai.vectorizer) LOOP
+                            PERFORM ai.drop_vectorizer(r.id, drop_all => true);
+                        END LOOP;
+                    END;
+                END IF;
             END $$;
             """
         )
