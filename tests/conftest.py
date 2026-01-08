@@ -72,7 +72,23 @@ async def clean_db(sink_conn, source_conn):
             """
         )
         
-    # 3. Truncate Control Plane
+    # 3. Drop Subscriptions (Nuclear)
+    async with sink_conn.cursor() as cur:
+        await cur.execute(
+            """
+            DO $$
+            DECLARE r RECORD;
+            BEGIN
+                FOR r IN (SELECT subname FROM pg_subscription) LOOP
+                    EXECUTE 'ALTER SUBSCRIPTION ' || quote_ident(r.subname) || ' DISABLE';
+                    EXECUTE 'ALTER SUBSCRIPTION ' || quote_ident(r.subname) || ' SET (slot_name = NONE)';
+                    EXECUTE 'DROP SUBSCRIPTION IF EXISTS ' || quote_ident(r.subname) || ' CASCADE';
+                END LOOP;
+            END $$;
+            """
+        )
+
+    # 4. Truncate Control Plane
     try:
         await sink_conn.execute("TRUNCATE TABLE _replica_state, _replica_config_history, _sink_outbox, _sink_mirror_registry CASCADE")
     except Exception: pass

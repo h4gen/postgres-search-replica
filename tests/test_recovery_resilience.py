@@ -5,7 +5,7 @@ from pg_replica.config_v2 import SearchPipeline, IngestConfig, PipelineConfig, S
 from pg_replica.database import connect_db, check_slot_exists, check_and_protect_source, dict_row, find_and_fix_ghost_records
 
 @pytest.mark.asyncio
-async def test_uuid_recovery_flow(clean_db, robust_slot_cleanup, robust_subscription_cleanup, internal_source_url, source_conn, sink_conn, wait_for_pgai_sync):
+async def test_uuid_recovery_flow(clean_db, robust_slot_cleanup, internal_source_url, source_conn, sink_conn, wait_for_pgai_sync):
     """Test recovery and catch up with UUID primary keys."""
     from unittest.mock import patch
     custom_settings = {
@@ -23,16 +23,10 @@ async def test_uuid_recovery_flow(clean_db, robust_slot_cleanup, robust_subscrip
 
     with patch.dict("os.environ", {"SUBSCRIPTION_SOURCE_URL": internal_source_url}):
         # Setup Source
-        await robust_slot_cleanup("sub_uuid")
         await source_conn.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"')
         await source_conn.execute("DROP TABLE IF EXISTS uuid_products CASCADE")
         await source_conn.execute("CREATE TABLE uuid_products (id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), name TEXT, description TEXT)")
         await source_conn.execute("INSERT INTO uuid_products (name, description) VALUES ('UUID Item', 'Testing UUID support')")
-
-        # Cleanup Sink
-        await robust_subscription_cleanup("sub_uuid")
-        await sink_conn.execute("DROP TABLE IF EXISTS uuid_products CASCADE")
-        await sink_conn.execute("DELETE FROM _replica_state WHERE key = 'sub_uuid'")
 
         async with PGSearchReplica(sync=True, **custom_settings) as replica:
             assert await wait_for_pgai_sync(replica.settings, "uuid", expected_count=1)
@@ -42,7 +36,7 @@ async def test_uuid_recovery_flow(clean_db, robust_slot_cleanup, robust_subscrip
 
 
 @pytest.mark.asyncio
-async def test_anti_entropy_ghost_cleaner(clean_db, robust_slot_cleanup, robust_subscription_cleanup, internal_source_url, source_conn, sink_conn, wait_for_pgai_sync):
+async def test_anti_entropy_ghost_cleaner(clean_db, robust_slot_cleanup, internal_source_url, source_conn, sink_conn, wait_for_pgai_sync):
     """Test that hard-deleted records are cleaned up by Anti-Entropy."""
     from unittest.mock import patch
     custom_settings = {
@@ -60,15 +54,9 @@ async def test_anti_entropy_ghost_cleaner(clean_db, robust_slot_cleanup, robust_
 
     with patch.dict("os.environ", {"SUBSCRIPTION_SOURCE_URL": internal_source_url}):
         # Setup Source
-        await robust_slot_cleanup("sub_ghost")
         await source_conn.execute("DROP TABLE IF EXISTS ghost_products CASCADE")
         await source_conn.execute("CREATE TABLE ghost_products (id INT PRIMARY KEY, name TEXT, description TEXT)")
         await source_conn.execute("INSERT INTO ghost_products (id, name, description) VALUES (1, 'Item 1', 'Desc 1'), (2, 'Item 2', 'Desc 2')")
-
-        # Cleanup Sink
-        await robust_subscription_cleanup("sub_ghost")
-        await sink_conn.execute("DROP TABLE IF EXISTS ghost_products CASCADE")
-        await sink_conn.execute("DELETE FROM _replica_state WHERE key = 'sub_ghost'")
 
         async with PGSearchReplica(sync=True, **custom_settings) as replica:
             assert await wait_for_pgai_sync(replica.settings, "ghost", expected_count=2)
@@ -95,13 +83,13 @@ async def test_anti_entropy_ghost_cleaner(clean_db, robust_slot_cleanup, robust_
 
 
 @pytest.mark.asyncio
-async def test_self_destruct_and_auto_heal(clean_db, robust_slot_cleanup, robust_subscription_cleanup, internal_source_url, source_conn, sink_conn, wait_for_pgai_sync):
+async def test_self_destruct_and_auto_heal(clean_db, robust_slot_cleanup, internal_source_url, source_conn, sink_conn, wait_for_pgai_sync):
     """Test Watchdog self-destruct and subsequent auto-healing."""
     from unittest.mock import patch
     import logging
     test_logger = logging.getLogger(__name__)
     
-    # Start HEALTHY (No self-destruct)
+    # Start HEALTHY
     custom_settings = {
         "max_slot_wal_keep_size_mb": 1024,
         "pipelines": {
@@ -118,16 +106,9 @@ async def test_self_destruct_and_auto_heal(clean_db, robust_slot_cleanup, robust
 
     with patch.dict("os.environ", {"SUBSCRIPTION_SOURCE_URL": internal_source_url}):
         # Setup Source
-        await robust_slot_cleanup("sub_heal")
         await source_conn.execute("DROP TABLE IF EXISTS heal_products CASCADE")
         await source_conn.execute("CREATE TABLE heal_products (id INT PRIMARY KEY, name TEXT, description TEXT)")
         await source_conn.execute("INSERT INTO heal_products (id, name, description) VALUES (1, 'Initial', 'Pre-destruct')")
-
-        # Cleanup Sink
-        await robust_subscription_cleanup("sub_heal")
-        await sink_conn.execute("DROP VIEW IF EXISTS heal_products_search CASCADE")
-        await sink_conn.execute("DROP TABLE IF EXISTS heal_products CASCADE")
-        await sink_conn.execute("DELETE FROM _replica_state WHERE key = 'sub_heal'")
 
         async with PGSearchReplica(sync=True, **custom_settings) as replica:
             # 1. Verify stable start

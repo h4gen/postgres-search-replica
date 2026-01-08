@@ -42,44 +42,25 @@ async def test_search_strategies_postgres_vs_qdrant(clean_db, robust_slot_cleanu
     
     qdrant = qdrant_cleanup # Unpack fixture
     
-    # Cleanup for this specific test
-    await robust_slot_cleanup("sub_strat")
-
-    with patch.dict("os.environ", {"SUBSCRIPTION_SOURCE_URL": internal_source_url}):
-        # 1. Setup Source
-        await source_conn.execute("DROP TABLE IF EXISTS strat_products CASCADE")
-        await source_conn.execute(
-            """
-            CREATE TABLE strat_products (
-                id SERIAL PRIMARY KEY,
-                name TEXT,
-                description TEXT
-            )
-            """
+    # 1. Setup Source Schema
+    await source_conn.execute("DROP TABLE IF EXISTS strat_products CASCADE")
+    await source_conn.execute(
+        """
+        CREATE TABLE strat_products (
+            id SERIAL PRIMARY KEY,
+            name TEXT,
+            description TEXT
         )
-        await source_conn.execute("ALTER TABLE strat_products REPLICA IDENTITY DEFAULT")
-        # Ensure publication exists for the new table
-        try:
-            await source_conn.execute("DROP PUBLICATION IF EXISTS pub_strat_products")
-            await source_conn.execute("CREATE PUBLICATION pub_strat_products FOR TABLE strat_products")
-        except Exception: pass
-
-        # 2. Cleanup Sink Specifics
-        await sink_conn.execute("DROP TABLE IF EXISTS strat_products CASCADE")
-        await sink_conn.execute("DELETE FROM _replica_state WHERE key = 'sub_strat'")
-        
-
-        # Seed Source (Pre-seed to ensure snapshot picks it up)
-        product_name = "Strategy Watch"
-        logger.info(f"Connecting to source for seeding...")
-        await source_conn.execute("INSERT INTO strat_products (name, description) VALUES (%s, %s)", (product_name, "A high-tech watch for strategic planning."))
-        
-        # Verify seeding
-        async with source_conn.cursor() as cur:
-            await cur.execute("SELECT count(*) FROM strat_products")
-            count = (await cur.fetchone())[0]
-            logger.info(f"Seeded source strat_products with {count} rows")
-
+        """
+    )
+    await source_conn.execute("ALTER TABLE strat_products REPLICA IDENTITY DEFAULT")
+    
+    # 2. Seed Source (Pre-seed to ensure snapshot picks it up)
+    product_name = "Strategy Watch"
+    logger.info(f"Connecting to source for seeding...")
+    await source_conn.execute("INSERT INTO strat_products (name, description) VALUES (%s, %s)", (product_name, "A high-tech watch for strategic planning."))
+    
+    with patch.dict("os.environ", {"SUBSCRIPTION_SOURCE_URL": internal_source_url}):
         # Configure replica with a mirror
         async with connect(
             source_url=global_settings.source_url,
@@ -128,7 +109,7 @@ async def test_search_strategies_postgres_vs_qdrant(clean_db, robust_slot_cleanu
             if not await wait_for_pgai_sync(replica.settings, "strat_products", expected_count=1):
                 pytest.fail("Timed out waiting for Postgres pgai sync")
 
-            # 2. Wait for Qdrant Sync (custom check)
+            # 2. Wait for Qdrant Sync (custom check for this mirror)
             found_in_qdrant = False
             for i in range(30):
                 try:
@@ -150,7 +131,7 @@ async def test_search_strategies_postgres_vs_qdrant(clean_db, robust_slot_cleanu
             
             assert found_in_qdrant, "Qdrant sync timed out"
 
-            # Check for Postgres View (should exist if wait_for_pgai_sync passed)
+            # Check for Postgres View
             view_exists = False
             try:
                 async with sink_conn.cursor() as cur:
@@ -173,24 +154,36 @@ async def test_search_strategies_postgres_vs_qdrant(clean_db, robust_slot_cleanu
             assert res_pg[0]["id"] == res_qdrant[0]["id"]
 
 @pytest.mark.asyncio
-async def test_search_alias_promotion(clean_db, robust_slot_cleanup, internal_source_url, source_conn, sink_conn, qdrant_cleanup):
+async def test_search_alias_promotion(clean_db, robust_slot_cleanup, internal_source_url, source_conn, sink_conn, qdrant_cleanup, wait_for_pgai_sync):
     """
     Verify that Qdrant Aliases are updated when a version is promoted in Postgres.
     """
     from unittest.mock import patch
     qdrant = qdrant_cleanup
     
-    await robust_slot_cleanup("sub_alias")
+    # 1. Setup Source Schema
+    await source_conn.execute("DROP TABLE IF EXISTS products CASCADE")
+    await source_conn.execute(
+        """
+        CREATE TABLE products (
+            id SERIAL PRIMARY KEY,
+            name TEXT,
+            description TEXT
+        )
+        """
+    )
+    await source_conn.execute("ALTER TABLE products REPLICA IDENTITY DEFAULT")
 
     with patch.dict("os.environ", {"SUBSCRIPTION_SOURCE_URL": internal_source_url}):
-        # 1. Start with Version 1
+        # Phase 1: V1 Deployment
+        logger.info("--- Phase 1: V1 Deployment ---")
         async with connect(
             source_url=global_settings.source_url,
             sink_url=global_settings.resolved_sink_url,
             pipelines={
                 "products": {
                     "ingest": {
-                        "table": "products", # Using shared table name might conflict if not cleaned? clean_db handles it.
+                        "table": "products",
                         "columns": ["id", "name", "description"],
                         "p_key": "id"
                     },
@@ -214,24 +207,11 @@ async def test_search_alias_promotion(clean_db, robust_slot_cleanup, internal_so
             sync=True
         ) as replica:
             # Seed data
-            await source_conn.execute("DELETE FROM products")
             await source_conn.execute("INSERT INTO products (name, description) VALUES ('V1 Product', 'Description')")
             
-            # Force migration column if missing (legacy compat)
-            try:
-                await sink_conn.execute("ALTER TABLE _sink_mirror_registry ADD COLUMN IF NOT EXISTS promoted_version_id TEXT")
-            except Exception: pass
-
-            # Wait for promotion
-            for i in range(30):
-                try:
-                    async with sink_conn.cursor() as cur:
-                        await cur.execute("SELECT count(*) FROM products_search")
-                        break
-                except Exception: pass
-                await asyncio.sleep(1)
-            else:
-                pytest.fail("Timed out waiting for Postgres view")
+            # Wait for V1 Sync
+            if not await wait_for_pgai_sync(replica.settings, "products", expected_count=1):
+                pytest.fail("Timed out waiting for V1 Postgres sync")
             
             # Verify Qdrant Alias
             v1_collection = None
@@ -249,10 +229,8 @@ async def test_search_alias_promotion(clean_db, robust_slot_cleanup, internal_so
                 
             assert "alias_test_products_" in v1_collection
 
-        # 2. Upgrade to Version 2 (Change formatting)
-        # We need to restart the replica with new config
-        # Ideally we'd use the reconciler directly, but `connect` is a high level wrapper
-        
+        # Phase 2: V2 Deployment (Update)
+        logger.info("--- Phase 2: V2 Deployment ---")
         async with connect(
             source_url=global_settings.source_url,
             sink_url=global_settings.resolved_sink_url,
@@ -281,31 +259,22 @@ async def test_search_alias_promotion(clean_db, robust_slot_cleanup, internal_so
                 }
             },
             sync=True,
-            # IMPORTANT: Re-use state so it sees it as an update, not a fresh start?
-            # connect() creates a fresh Orchestrator. 
-            # If the DB state is preserved (which it is, clean_db fixture ran at START of function), 
-            # the new orchestrator will read metadata from _replica_config_history.
         ) as replica:
-            # Wait for promotion to V2
-            for _ in range(30):
+            # Wait for V2 Sync & Promotion
+            if not await wait_for_pgai_sync(replica.settings, "products", expected_count=1):
+                pytest.fail("Timed out waiting for V2 Postgres sync/promotion")
+            
+            # Verify Qdrant Alias swapped
+            for i in range(30):
                 try:
-                    async with sink_conn.cursor() as cur:
-                        await cur.execute("SELECT view_definition FROM information_schema.views WHERE table_name = 'products_search'")
-                        row = await cur.fetchone()
-                        if row and v1_collection not in row[0]: 
-                            break
+                    aliases = qdrant.get_aliases().aliases
+                    found = next((a for a in aliases if a.alias_name == "alias_test_products_production"), None)
+                    if found and found.collection_name != v1_collection:
+                        break
                 except Exception: pass
                 await asyncio.sleep(1)
             else:
-                 pytest.fail("Timed out waiting for Postgres V2 promotion")
-            
-            # Verify Qdrant Alias
-            for _ in range(30):
-                aliases = qdrant.get_aliases().aliases
-                found = next((a for a in aliases if a.alias_name == "alias_test_products_production"), None)
-                if found and found.collection_name != v1_collection:
-                    break
-                await asyncio.sleep(1)
+                pytest.fail("Timed out waiting for V2 Qdrant Alias swap")
                 
             aliases = qdrant.get_aliases().aliases
             found = next((a for a in aliases if a.alias_name == "alias_test_products_production"), None)
