@@ -1,4 +1,4 @@
-from src.pg_replica.config_v2 import (
+from src.pg_replica.config import (
     SearchPipeline, IngestConfig, PipelineConfig, StorageConfig, ServeConfig,
     ChunkingConfig, EmbeddingConfig, PostgresStoreConfig, SearchProfile
 )

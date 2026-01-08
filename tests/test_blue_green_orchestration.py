@@ -3,7 +3,7 @@ import asyncio
 import pytest
 import psycopg
 from pg_replica.config import Settings, settings as global_settings
-from pg_replica.config_v2 import SearchPipeline, IngestConfig, PipelineConfig, ChunkingConfig, EmbeddingConfig, StorageConfig, PostgresStoreConfig
+from pg_replica.config import SearchPipeline, IngestConfig, PipelineConfig, ChunkingConfig, EmbeddingConfig, StorageConfig, PostgresStoreConfig
 from pg_replica.reconciler import Reconciler
 from pg_replica.database import get_sink_conn
 

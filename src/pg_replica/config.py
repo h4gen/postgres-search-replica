@@ -2,81 +2,127 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Any
-from pydantic import BaseModel, Field
+from typing import Dict, List, Optional, Any, Literal
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class TableConfig(BaseModel):
-    """Configuration for a single source-to-sink replication target."""
-    
-    # Source Settings
-    source_table: str
-    publication_columns: List[str] = Field(default_factory=list)
-    publication_where: Optional[str] = None
-    
-    # Sink Settings (Optional, with defaults based on source_table)
-    sink_raw_table: Optional[str] = None
-    sink_replica_table: Optional[str] = None
- 
-    def model_post_init(self, __context) -> None:
-        if self.sink_raw_table is None:
-            ## NEVER APPEND SOMETHING HERE> NEEDED FOR LOGICAL REPLICATION IN POSTGRES
-            self.sink_raw_table = self.source_table
-        if self.sink_replica_table is None:
-            self.sink_replica_table = f"{self.source_table}_search"
-        
-        # Ensure ID and Content columns are in publication_columns
-        if self.id_column not in self.publication_columns:
-            self.publication_columns.append(self.id_column)
-        if self.content_column not in self.publication_columns:
-            self.publication_columns.append(self.content_column)
-        
-        # Add columns from formatting_template
-        import re
-        template_vars = re.findall(r"\$(\w+)", self.formatting_template)
-        for var in template_vars:
-            if var != "chunk" and var not in self.publication_columns:
-                self.publication_columns.append(var)
-        
-        # FINAL VALIDATION: pgai requires $chunk
-        if "$chunk" not in self.formatting_template:
-            raise ValueError(f"formatting_template for table {self.source_table} must contain '$chunk' placeholder")
- 
-    # Column Mapping
-    id_column: str = "id"
-    content_column: str = "description"
-    target_content_column: str = "chunk"
-    embedding_column: str = "embedding"
-    
-    # Search & Transformation
-    search_profile: str = "vector"  # options: vector, hybrid, sparse
-    search_engine: str = "postgres"  # options: postgres, qdrant, pinecone
-    embedding_provider: str = "ollama"
-    embedding_model: str = "nomic-embed-text"
-    embedding_dimension: int = 768
-    chunking_strategy: str = "recursive_character_text_splitter"
-    formatting_template: str = "Product: $name Description: $chunk"
-    
-    # Multicast Mirror Settings
-    mirrors: List[Dict[str, Any]] = Field(default_factory=list)
+# --- 1. Ingest (Source) ---
+class IngestConfig(BaseModel):
+    table: str
+    columns: List[str]
+    filter: Optional[str] = None  # SQL where clause, e.g. "active = true"
+    p_key: str = "id"
+    schema_name: str = "public"
+    # Future: distinct source connection ID
 
-    # Deployment State
+    @model_validator(mode="after")
+    def ensure_pkey_in_columns(self) -> "IngestConfig":
+        if self.p_key not in self.columns:
+            self.columns.append(self.p_key)
+        return self
+
+
+# --- 2. Pipeline (Transform) ---
+class ChunkingConfig(BaseModel):
+    strategy: Literal["recursive_character", "markdown", "sentence"] = "recursive_character"
+    size: int = 1500
+    overlap: int = 200
+    separator: Optional[str] = None
+
+
+class EmbeddingConfig(BaseModel):
+    provider: Literal["openai", "ollama", "bedrock", "voyageai"]
+    model: str
+    dimension: int
+    api_key_name: Optional[str] = None # Env var name for API key
+
+
+class PipelineConfig(BaseModel):
+    template: str # e.g. "Title: $title\n\n$content"
+    content_column: str = "content" # The main text column for change tracking
+    chunking: ChunkingConfig = Field(default_factory=ChunkingConfig)
+    embedding: EmbeddingConfig
+
+    @field_validator("template")
+    @classmethod
+    def validate_template(cls, v: str) -> str:
+        if "$chunk" not in v:
+            raise ValueError("Template must contain '$chunk' placeholder")
+        return v
+
+
+# --- 3. Storage (Persistence & Exports) ---
+class BranchConfig(BaseModel):
+    """SearchOps: A shadow index for experimentation (e.g. v2 model)."""
+    name: str                   
+    pipeline: PipelineConfig    # Override main pipeline settings (different model/chunking)
+
+
+class MirrorConfig(BaseModel):
+    """Export target (Downstream)."""
+    id: str
+    type: Literal["qdrant", "pinecone"]
+    config: Dict[str, Any]      # url, prefix, api_key
+
+
+class PostgresStoreConfig(BaseModel):
+    """Defines the internal Postgres View Schema."""
+    # hybrid = adds tsvector column. vector = vector only.
+    profile: Literal["vector", "hybrid"] = "vector" 
+    retention: str = "forever" # Placeholder for future data lifecycle
+
+
+class StorageConfig(BaseModel):
+    postgres: PostgresStoreConfig = Field(default_factory=PostgresStoreConfig)
+    branches: List[BranchConfig] = [] # "SearchOps" feature
+    mirrors: List[MirrorConfig] = []  # Export targets
+
+
+# --- 4. Serve (Runtime API) ---
+class SearchProfile(BaseModel):
+    """Declarative Search Profile (Runtime Tuning)."""
+    mode: Literal["vector", "hybrid", "keyword"]
+    weights: Optional[Dict[str, float]] = None # { "vector": 0.7, "text": 0.3 } for RRF
+    target_branch: str = "main"         # Can point to a branch!
+    limit: int = 10
+
+
+class ServeConfig(BaseModel):
+    enabled: bool = True
+    default_profile: str = "default"
+    profiles: Dict[str, SearchProfile] = {
+        "default": SearchProfile(mode="hybrid")
+    }
+
+
+# --- ROOT: The Search Pipeline ---
+class SearchPipeline(BaseModel):
+    ingest: IngestConfig
+    pipeline: PipelineConfig
+    storage: StorageConfig = Field(default_factory=StorageConfig)
+    serve: ServeConfig = Field(default_factory=ServeConfig)
+    
     active: bool = True
 
     def get_config_hash(self) -> str:
-        """Generates a SHA256 hash of the search-relevant configuration for THIS table."""
+        """
+        Generates a SHA256 hash of the 'Structural' configuration.
+        Changes here require a REBUILD (new version).
+        
+        Explicitly EXCLUDES:
+        - serve (Runtime only)
+        - storage.mirrors (Downstream only)
+        - active (Runtime state)
+        """
         relevant_config = {
-            "publication_columns": sorted(self.publication_columns),
-            "publication_where": self.publication_where,
-            "embedding_provider": self.embedding_provider,
-            "embedding_model": self.embedding_model,
-            "chunking_strategy": self.chunking_strategy,
-            "formatting_template": self.formatting_template,
-            "embedding_dimension": self.embedding_dimension,
-            "search_profile": self.search_profile,
+            "ingest": self.ingest.model_dump(),
+            "pipeline": self.pipeline.model_dump(),
+            # Only storing profile affects the View definition
+            "storage_profile": self.storage.postgres.profile,
         }
-        config_json = json.dumps(relevant_config, sort_keys=True)
+        # Sort keys for deterministic hashing
+        config_json = json.dumps(relevant_config, sort_keys=True, default=str)
         return hashlib.sha256(config_json.encode()).hexdigest()
 
     def get_version_id(self) -> str:
@@ -84,9 +130,7 @@ class TableConfig(BaseModel):
         return self.get_config_hash()[:8]
 
 
-from pydantic import model_validator
-from .config_v2 import SearchPipeline
-
+# --- SYSTEM: Runtime Environment ---
 class Settings(BaseSettings):
     source_url: str
     sink_url: str = "local"  # Default to local if not provided
@@ -149,8 +193,6 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
-    
-
 
 
 settings = Settings()  # type: ignore[call-arg]

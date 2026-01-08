@@ -1,7 +1,7 @@
 import pytest
 import asyncio
-from pg_replica import PGSearchReplica, settings as global_settings
-from pg_replica.config_v2 import SearchPipeline, IngestConfig, PipelineConfig, StorageConfig, EmbeddingConfig
+from pg_replica.client import PGSearchReplica 
+from pg_replica.config import SearchPipeline, IngestConfig, PipelineConfig, StorageConfig, EmbeddingConfig
 from pg_replica.database import connect_db, check_slot_exists, check_and_protect_source, dict_row, find_and_fix_ghost_records
 
 @pytest.mark.asyncio

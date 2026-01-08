@@ -9,7 +9,7 @@ from pg_replica.database import (
     update_config_status,
     reconciliation_lock
 )
-from pg_replica.config import TableConfig
+
 from pg_replica.reconciler import ActionType
 
 logger = logging.getLogger(__name__)
@@ -68,7 +68,7 @@ async def test_dynamic_config_override():
     from unittest.mock import patch
     from pg_replica.database import init_pools, close_pools
     from pg_replica.reconciler import Reconciler
-    from pg_replica.config_v2 import SearchPipeline, IngestConfig, PipelineConfig, EmbeddingConfig
+    from pg_replica.config import SearchPipeline, IngestConfig, PipelineConfig, EmbeddingConfig
     
     target_name = "dynamic_test_v3"
     # Initial config (v1)
@@ -147,7 +147,7 @@ async def test_failed_config_status():
     from unittest.mock import patch
     from pg_replica.database import init_pools, close_pools
     from pg_replica.reconciler import Reconciler, Action, ActionType
-    from pg_replica.config_v2 import SearchPipeline, IngestConfig, PipelineConfig, EmbeddingConfig
+    from pg_replica.config import SearchPipeline, IngestConfig, PipelineConfig, EmbeddingConfig
     
     target_name = "fail_test_v3"
     base_config = SearchPipeline(

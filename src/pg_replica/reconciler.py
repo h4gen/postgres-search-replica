@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import Any, Optional, List, Set, Dict
 from enum import Enum
 from .config import Settings
-from .config_v2 import SearchPipeline
+from .config import SearchPipeline
 from .database import (
     get_source_conn,
     get_sink_conn,

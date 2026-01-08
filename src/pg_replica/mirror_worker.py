@@ -2,7 +2,7 @@ import asyncio
 import logging
 import json
 from typing import List, Dict, Any
-from .config import Settings, TableConfig
+from .config import Settings
 from .database import get_sink_conn
 from .adapters import OutboxEntry, QdrantSinkAdapter, SinkAdapter
 

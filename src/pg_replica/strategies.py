@@ -1,7 +1,7 @@
 import abc
 import logging
 from typing import Any, Dict, List, Optional
-from .config_v2 import SearchPipeline
+from .config import SearchPipeline
 from .database import dict_row
 
 logger = logging.getLogger(__name__)

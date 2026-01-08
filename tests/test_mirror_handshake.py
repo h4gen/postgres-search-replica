@@ -1,7 +1,7 @@
 import pytest
 import asyncio
 from pg_replica.config import Settings
-from pg_replica.config_v2 import SearchPipeline, IngestConfig, PipelineConfig, StorageConfig, MirrorConfig, EmbeddingConfig, ChunkingConfig
+from pg_replica.config import SearchPipeline, IngestConfig, PipelineConfig, StorageConfig, MirrorConfig, EmbeddingConfig, ChunkingConfig
 from pg_replica.reconciler import Planner, ActionType
 
 def test_planner_blocks_promotion_if_mirrors_lag():

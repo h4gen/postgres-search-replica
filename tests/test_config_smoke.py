@@ -1,5 +1,5 @@
 from tests.factories import SearchPipelineFactory
-from src.pg_replica.config_v2 import SearchPipeline
+from src.pg_replica.config import SearchPipeline
 
 def test_pipeline_factory_smoke():
     """Verify that the factory produces valid SearchPipeline objects."""

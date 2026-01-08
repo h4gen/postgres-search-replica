@@ -1,6 +1,5 @@
 import pytest
-from pg_replica.config import Settings
-from pg_replica.config_v2 import SearchPipeline, IngestConfig, PipelineConfig, StorageConfig, EmbeddingConfig, ChunkingConfig, PostgresStoreConfig
+from pg_replica.config import Settings, SearchPipeline, IngestConfig, PipelineConfig, StorageConfig, EmbeddingConfig, ChunkingConfig, PostgresStoreConfig, BranchConfig, MirrorConfig
 from pg_replica.reconciler import Planner, ActionType
 
 

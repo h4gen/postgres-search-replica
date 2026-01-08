@@ -8,7 +8,7 @@ from pg_replica.database import (
     save_table_config,
     get_latest_table_config
 )
-from pg_replica.config import settings, TableConfig
+from pg_replica.config import settings, SearchPipeline
 from pg_replica.reconciler import Planner, Inspector
 
 logger = logging.getLogger(__name__)
@@ -81,7 +81,7 @@ async def control_plane_summary():
 
 
 @app.post("/control-plane/config/{target_name}")
-async def update_config(target_name: str, config: TableConfig):
+async def update_config(target_name: str, config: SearchPipeline):
     """
     Apply a new configuration for a table.
     Runs admission validation (Dry Run) before persisting.
@@ -122,7 +122,7 @@ async def update_config(target_name: str, config: TableConfig):
 
 
 @app.get("/control-plane/dry-run/{target_name}")
-async def dry_run(target_name: str, config: TableConfig = None):
+async def dry_run(target_name: str, config: SearchPipeline = None):
     """
     Preview actions and resource projections for a proposed configuration.
     If no config provided, uses the latest one from DB or Settings.

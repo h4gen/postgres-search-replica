@@ -7,8 +7,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from pgvector.psycopg import register_vector_async as register_vector  # type: ignore
-from .config import Settings, TableConfig
-from .config_v2 import SearchPipeline
+from .config import Settings, SearchPipeline, IngestConfig
 from .utils import wait_until
 
 logger = logging.getLogger(__name__)
