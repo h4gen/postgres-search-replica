@@ -7,14 +7,24 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+# --- CONFIG: Sources & Mirrors ---
+class SourceConfig(BaseModel):
+    type: Literal["postgres"] = "postgres"
+    connection_url: str
+
+class MirrorConfig(BaseModel):
+    id: str
+    type: Literal["qdrant", "pinecone"]
+    config: Dict[str, Any]  # url, api_key, etc.
+
 # --- 1. Ingest (Source) ---
 class IngestConfig(BaseModel):
+    source: str = "default"  # Reference to Settings.sources
     table: str
     columns: List[str]
-    filter: Optional[str] = None  # SQL where clause, e.g. "active = true"
+    filter: Optional[str] = None
     p_key: str = "id"
     schema_name: str = "public"
-    # Future: distinct source connection ID
 
     @model_validator(mode="after")
     def ensure_pkey_in_columns(self) -> "IngestConfig":
@@ -40,7 +50,7 @@ class EmbeddingConfig(BaseModel):
 
 class PipelineConfig(BaseModel):
     template: str # e.g. "Title: $title\n\n$content"
-    content_column: str = "content" # The main text column for change tracking
+    content_column: str = "content"
     chunking: ChunkingConfig = Field(default_factory=ChunkingConfig)
     embedding: EmbeddingConfig
 
@@ -54,37 +64,27 @@ class PipelineConfig(BaseModel):
 
 # --- 3. Storage (Persistence & Exports) ---
 class BranchConfig(BaseModel):
-    """SearchOps: A shadow index for experimentation (e.g. v2 model)."""
     name: str                   
-    pipeline: PipelineConfig    # Override main pipeline settings (different model/chunking)
-
-
-class MirrorConfig(BaseModel):
-    """Export target (Downstream)."""
-    id: str
-    type: Literal["qdrant", "pinecone"]
-    config: Dict[str, Any]      # url, prefix, api_key
+    pipeline: PipelineConfig
 
 
 class PostgresStoreConfig(BaseModel):
     """Defines the internal Postgres View Schema."""
-    # hybrid = adds tsvector column. vector = vector only.
     profile: Literal["vector", "hybrid"] = "vector" 
-    retention: str = "forever" # Placeholder for future data lifecycle
+    retention: str = "forever"
 
 
 class StorageConfig(BaseModel):
     postgres: PostgresStoreConfig = Field(default_factory=PostgresStoreConfig)
-    branches: List[BranchConfig] = [] # "SearchOps" feature
-    mirrors: List[MirrorConfig] = []  # Export targets
+    branches: List[BranchConfig] = []
+    mirrors: List[str] = []  # References to Settings.mirrors keys
 
 
 # --- 4. Serve (Runtime API) ---
 class SearchProfile(BaseModel):
-    """Declarative Search Profile (Runtime Tuning)."""
     mode: Literal["vector", "hybrid", "keyword"]
-    weights: Optional[Dict[str, float]] = None # { "vector": 0.7, "text": 0.3 } for RRF
-    target_branch: str = "main"         # Can point to a branch!
+    weights: Optional[Dict[str, float]] = None
+    target_branch: str = "main"
     limit: int = 10
 
 
@@ -106,45 +106,36 @@ class SearchPipeline(BaseModel):
     active: bool = True
 
     def get_config_hash(self) -> str:
-        """
-        Generates a SHA256 hash of the 'Structural' configuration.
-        Changes here require a REBUILD (new version).
-        
-        Explicitly EXCLUDES:
-        - serve (Runtime only)
-        - storage.mirrors (Downstream only)
-        - active (Runtime state)
-        """
         relevant_config = {
             "ingest": self.ingest.model_dump(),
             "pipeline": self.pipeline.model_dump(),
-            # Only storing profile affects the View definition
             "storage_profile": self.storage.postgres.profile,
         }
-        # Sort keys for deterministic hashing
         config_json = json.dumps(relevant_config, sort_keys=True, default=str)
         return hashlib.sha256(config_json.encode()).hexdigest()
 
     def get_version_id(self) -> str:
-        """Returns a short version ID based on the config hash."""
         return self.get_config_hash()[:8]
 
 
 # --- SYSTEM: Runtime Environment ---
 class Settings(BaseSettings):
-    source_url: str
-    sink_url: str = "local"  # Default to local if not provided
-    local_port: int = 54322  # Default port for local mode
+    # Registry Patterns
+    sources: Dict[str, SourceConfig] = Field(default_factory=dict)
+    mirrors: Dict[str, MirrorConfig] = Field(default_factory=dict)
 
-    # Enterprise Source Integration
+    sink_url: str = "local"
+    local_port: int = 54322
     source_managed_by_admin: bool = False
 
-    # Multi-Table Configuration
     pipelines: Dict[str, SearchPipeline] = Field(default_factory=dict)
+    
+    # Legacy Support
+    source_url: Optional[str] = None
 
     @model_validator(mode="after")
-    def validate_pipelines(self) -> "Settings":
-        # Ensure all pipelines are SearchPipeline objects
+    def validate_pipelines_and_sources(self) -> "Settings":
+        # 1. Pipeline Validation
         new_pipelines = {}
         for k, v in self.pipelines.items():
             if isinstance(v, dict):
@@ -152,9 +143,14 @@ class Settings(BaseSettings):
             else:
                 new_pipelines[k] = v
         self.pipelines = new_pipelines
+        
+        # 2. Legacy Source Support
+        # If 'default' source is missing but source_url is provided (env var), create it.
+        if "default" not in self.sources and self.source_url:
+            self.sources["default"] = SourceConfig(connection_url=self.source_url)
+            
         return self
 
-    # Storage paths for local mode
     base_dir: Path = Path(
         os.environ.get(
             "PG_REPLICA_DIR",
@@ -172,19 +168,11 @@ class Settings(BaseSettings):
             return f"postgresql://postgres@localhost:{self.local_port}/postgres"
         return self.sink_url
 
-    @property
-    def subscription_connection_url(self) -> str:
-        return os.environ.get("SUBSCRIPTION_SOURCE_URL", self.source_url)
-
     # Global replication/safety settings
     max_slot_wal_keep_size_mb: int = 1024
     subscription_options: dict = {"streaming": "'on'"}
     batch_size: int = 50
-
-    # System settings
     notify_channel: str = "new_raw_data"
-
-    # Observability
     observability_host: str = "0.0.0.0"
     observability_port: int = 8000
 

@@ -44,13 +44,12 @@ class MirrorWorker:
     async def _process_all_mirrors(self):
         # We process mirrors defined in ALL table configs
         for target_name, config in self.settings.pipelines.items():
-            for mirror_cfg in config.storage.mirrors:
-                # MirrorConfig is now an object, we need to convert to dict for legacy adapter code
-                # or update _process_mirror to handle objects.
-                # Let's check _process_mirror signature: it expects Dict[str, Any].
-                # So we verify if config.storage.mirrors is List[MirrorConfig] or List[Dict].
-                # It is List[MirrorConfig]. So we should use mirror_cfg.model_dump().
-                await self._process_mirror(target_name, mirror_cfg.model_dump())
+            for mirror_id in config.storage.mirrors:
+                if mirror_id not in self.settings.mirrors:
+                    logger.warning(f"Mirror {mirror_id} referenced in {target_name} not found in settings.")
+                    continue
+                mirror_cfg_obj = self.settings.mirrors[mirror_id]
+                await self._process_mirror(target_name, mirror_cfg_obj.model_dump())
 
     async def _process_mirror(self, target_name: str, mirror_cfg: Dict[str, Any]):
         mirror_id = mirror_cfg.get("id")

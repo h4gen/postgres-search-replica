@@ -70,7 +70,7 @@ async def test_declarative_branching_e2e(clean_db, internal_source_url):
     await ensure_outbox_infrastructure(settings)
     
     # 0. Setup Source (Cleanup & Seed)
-    async with await get_source_conn() as conn:
+    async with await get_source_conn("default") as conn:
         await conn.execute(f"DROP TABLE IF EXISTS {TABLE_NAME}")
         await conn.execute(f"CREATE TABLE {TABLE_NAME} (id TEXT PRIMARY KEY, name TEXT, description TEXT)")
         await conn.execute(f"ALTER TABLE {TABLE_NAME} REPLICA IDENTITY FULL")
@@ -143,16 +143,12 @@ async def test_declarative_branching_e2e(clean_db, internal_source_url):
                     await cur.execute(f"SELECT count(*) FROM {shadow_target_table} WHERE chunk IS NOT NULL")
                     count = (await cur.fetchone())[0]
                     
-                    # Debug: Check main vectorizer
-                    await cur.execute("SELECT count(*) FROM products_store_v4351e16f WHERE chunk IS NOT NULL")
-                    main_count = (await cur.fetchone())[0]
-                    
                     # Debug: Check errors
                     await cur.execute("SELECT count(*) FROM ai.vectorizer_errors")
                     error_count = (await cur.fetchone())[0]
 
                     if i % 5 == 0:
-                        logger.info(f"Waiting... Branch Count: {count}, Main Count: {main_count}, Errors: {error_count}")
+                        logger.info(f"Waiting... Branch Count: {count}, Errors: {error_count}")
 
                     if count >= 3:
                         synced = True

@@ -4,8 +4,8 @@ from typing import Any, Optional, List, Set, Dict
 from enum import Enum
 from .config import Settings
 from .config import SearchPipeline
+from .source import get_source_adapter
 from .database import (
-    get_source_conn,
     get_sink_conn,
     get_source_column_types,
     setup_source,
@@ -227,30 +227,50 @@ class Inspector:
         return state
 
     async def get_source_state(self) -> Dict[str, Any]:
-        state: Dict[str, Any] = {
-            "publications": {},
-            "slots": set(),
-        }
-        async with await get_source_conn() as conn:
-            async with conn.cursor() as cur:
-                # Get publications and their tables/where clauses
-                # Note: This now queries all publications on the source
-                await cur.execute(
-                    """
-                    SELECT pubname, rowfilter, tablename
-                    FROM pg_publication_tables 
-                    WHERE schemaname = 'public'
-                    """
-                )
-                for pubname, rowfilter, tablename in await cur.fetchall():
-                    if pubname not in state["publications"]:
-                        state["publications"][pubname] = {"tables": {}}
-                    state["publications"][pubname]["tables"][tablename] = {"rowfilter": rowfilter}
+        """
+        Connects to ALL registered sources and discovers their state.
+        Returns: Dict[source_id, source_state_dict]
+        """
+        all_states: Dict[str, Any] = {}
 
-                await cur.execute("SELECT slot_name FROM pg_replication_slots")
-                state["slots"] = {r[0] for r in await cur.fetchall()}
-                logger.debug(f"Discovered source slots: {state['slots']}")
-        return state
+        for source_id in self.settings.sources.keys():
+            logger.debug(f"Inspecting source: {source_id}")
+            state: Dict[str, Any] = {
+                "publications": {},
+                "slots": set(),
+                "is_reachable": False,
+            }
+            try:
+                # We need to pass source_id to get_source_conn
+                # NOTE: database.get_source_conn signature must support source_id
+                source_adapter = get_source_adapter(source_id)
+                async with source_adapter.get_connection() as conn:
+                    state["is_reachable"] = True
+                    async with conn.cursor() as cur:
+                        # Get publications and their tables/where clauses
+                        await cur.execute(
+                            """
+                            SELECT pubname, rowfilter, tablename
+                            FROM pg_publication_tables 
+                            WHERE schemaname = 'public'
+                            """
+                        )
+                        for pubname, rowfilter, tablename in await cur.fetchall():
+                            if pubname not in state["publications"]:
+                                state["publications"][pubname] = {"tables": {}}
+                            state["publications"][pubname]["tables"][tablename] = {"rowfilter": rowfilter}
+
+                        await cur.execute("SELECT slot_name FROM pg_replication_slots")
+                        state["slots"] = {r[0] for r in await cur.fetchall()}
+                        logger.debug(f"Discovered source slots for {source_id}: {state['slots']}")
+            
+            except Exception as e:
+                logger.error(f"Failed to inspect source {source_id}: {e}")
+                state["error"] = str(e)
+            
+            all_states[source_id] = state
+            
+        return all_states
 
 
 class Planner:
@@ -336,37 +356,51 @@ class Planner:
             current_hash = replica_state["config_hash"] if replica_state else None
 
             # 2.1 Source Publication Setup
-            needs_source_setup = False
-            if pub_name not in source_state["publications"]:
-                needs_source_setup = True
+            # Determine which source this pipeline uses
+            source_id = config.ingest.source
+            this_source_state = source_state.get(source_id)
+
+            if not this_source_state:
+                logger.error(f"Source {source_id} not found in state (Config: {name})")
+                continue # Skip planning for this pipeline if source is unknown
+
+            if not this_source_state.get("is_reachable"):
+                logger.warning(f"Source {source_id} is unreachable. Skipping source checks for {name}.")
+                # potentially we should not touch sinks if source is down to avoid destructive actions based on partial info?
+                # For now, we allow sink planning (vectorizers etc) but skip source actions.
+                # However, slot check (Action 2.3) depends on source.
             else:
-                pub_tables = source_state["publications"][pub_name]["tables"]
-                if config.ingest.table not in pub_tables:
+                needs_source_setup = False
+                if pub_name not in this_source_state["publications"]:
                     needs_source_setup = True
                 else:
-                    current_filter = pub_tables[config.ingest.table]["rowfilter"]
-                    desired_filter = (
-                        f"({config.ingest.filter})"
-                        if config.ingest.filter
-                        else None
-                    )
-                    if current_filter != desired_filter:
+                    pub_tables = this_source_state["publications"][pub_name]["tables"]
+                    if config.ingest.table not in pub_tables:
                         needs_source_setup = True
-
-            if needs_source_setup:
-                if self.settings.source_managed_by_admin:
-                    logger.warning(
-                        f"Publication {pub_name} drift detected and source is admin-managed."
-                    )
-                else:
-                    actions.append(
-                        Action(
-                            type=ActionType.SOURCE_SETUP,
-                            description=f"Setup/Update publication {pub_name} for {config.ingest.table}",
-                            params={},
-                            target_name=name,
+                    else:
+                        current_filter = pub_tables[config.ingest.table]["rowfilter"]
+                        desired_filter = (
+                            f"({config.ingest.filter})"
+                            if config.ingest.filter
+                            else None
                         )
-                    )
+                        if current_filter != desired_filter:
+                            needs_source_setup = True
+
+                if needs_source_setup:
+                    if self.settings.source_managed_by_admin:
+                        logger.warning(
+                            f"Publication {pub_name} drift detected and source is admin-managed."
+                        )
+                    else:
+                        actions.append(
+                            Action(
+                                type=ActionType.SOURCE_SETUP,
+                                description=f"Setup/Update publication {pub_name} for {config.ingest.table}",
+                                params={},
+                                target_name=name,
+                            )
+                        )
 
             # 2.2 Sink Table Evolution (Raw Table)
             raw_table = config.ingest.table
@@ -407,15 +441,17 @@ class Planner:
             )
 
             # 2.3 Recovery (Slot check)
-            if sub_name not in source_state["slots"]:
-                actions.append(
-                    Action(
-                        type=ActionType.SINK_RECOVERY,
-                        description=f"Perform hybrid recovery for {name} (missing slot {sub_name})",
-                        params={},
-                        target_name=name,
+            # Only check slots if source is reachable
+            if this_source_state and this_source_state.get("is_reachable"):
+                if sub_name not in this_source_state["slots"]:
+                    actions.append(
+                        Action(
+                            type=ActionType.SINK_RECOVERY,
+                            description=f"Perform hybrid recovery for {name} (missing slot {sub_name} on {source_id})",
+                            params={},
+                            target_name=name,
+                        )
                     )
-                )
 
             # 2.4 Vectorizer Setup (State-Based)
             # We ALWAYS ensure the vectorizer for this config exists, even if not active.
@@ -462,8 +498,8 @@ class Planner:
             # Mirror Handshake: Ensure external mirrors caught up to outbox watermark
             if is_synced and config.storage.mirrors:
                 outbox_watermark = sink_state.get("outbox_watermarks", {}).get(version_id, 0)
-                for mirror in config.storage.mirrors:
-                    m_id = mirror.id # Pydantic object now
+                for mirror_id in config.storage.mirrors:
+                    m_id = mirror_id
                     m_progress = sink_state.get("mirror_progress", {}).get((m_id, name), 0)
                     if m_progress < outbox_watermark:
                         logger.info(
@@ -574,15 +610,34 @@ class Planner:
                 # 2. Generate Actions
                 # 2.0 Source Publication
                 # Ensure a publication exists for this branch on the source
-                actions.append(
-                    Action(
-                        type=ActionType.SOURCE_SETUP, 
-                        description=f"Ensure publication for branch {shadow_target_name}", 
-                        params={}, 
-                        target_name=shadow_target_name,
-                        ephemeral_config=shadow_config
+                # Branches use the same source as the parent
+                source_id = shadow_config.ingest.source
+                # We can't really check source state here easily without duplicating the logic from 'plan'
+                # But SOURCE_SETUP is idempotent, so we can emit it.
+                # Ideally, we should check if it exists in source_state[source_id]["publications"]
+                
+                needs_branch_pub = True
+                this_source_state = source_state.get(source_id)
+                branch_pub_name = f"pub_{shadow_target_name}"
+                
+                if this_source_state and this_source_state.get("is_reachable"):
+                    if branch_pub_name in this_source_state["publications"]:
+                        # Deep check table?
+                         needs_branch_pub = False # Optimization: Assume if pub exists, it's fine. Or check table.
+                         pub_tables = this_source_state["publications"][branch_pub_name]["tables"]
+                         if shadow_config.ingest.table not in pub_tables:
+                             needs_branch_pub = True
+
+                if needs_branch_pub:
+                    actions.append(
+                        Action(
+                            type=ActionType.SOURCE_SETUP, 
+                            description=f"Ensure publication for branch {shadow_target_name}", 
+                            params={}, 
+                            target_name=shadow_target_name,
+                            ephemeral_config=shadow_config
+                        )
                     )
-                )
 
                 # 2.1 Sink Table
                 raw_table = shadow_config.ingest.table

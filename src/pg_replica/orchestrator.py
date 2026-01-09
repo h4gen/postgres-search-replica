@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import subprocess
+import psycopg
 from datetime import timedelta
 from typing import Optional
 
@@ -161,6 +162,13 @@ class Orchestrator:
             except asyncio.CancelledError:
                 logger.info(f"Worker {name} cancelled.")
                 break
+            except psycopg.errors.ForeignKeyViolation as e:
+                # This happens if the vectorizer was deleted while the worker was running (e.g. self-destruct)
+                logger.warning(f"Worker {name} encountered likely shutdown race (FK Violation): {e}. Restarting...")
+                try:
+                    await asyncio.sleep(2.0)
+                except asyncio.CancelledError:
+                    break
             except Exception as e:
                 logger.error(f"Worker {name} crashed: {e}. Restarting in 2s...", exc_info=True)
                 try:

@@ -113,7 +113,8 @@ class PGSearchReplica:
             limit=limit,
             config=config,
             conn_provider=self._get_conn,
-            target_name=target_name
+            target_name=target_name,
+            settings=self.settings
         )
 
     async def get_status(self) -> dict[str, Any]:
