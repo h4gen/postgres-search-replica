@@ -104,7 +104,7 @@ async def test_dynamic_config_override():
             # 2. Update config in DB (gen + 1)
             # Create new config object with modified filter
             new_config = base_config.model_copy(deep=True)
-            new_config.ingest.filter = "id < 500"
+            new_config.ingest.filter = "id < '500'"
             
             gen2 = await save_table_config(replica.settings, target_name, new_config)
             assert gen2 == gen1 + 1
@@ -113,7 +113,7 @@ async def test_dynamic_config_override():
             await reconciler.reconcile()
             
             curr_config = replica.settings.pipelines[target_name]
-            assert curr_config.ingest.filter == "id < 500"
+            assert curr_config.ingest.filter == "id < '500'"
             assert getattr(curr_config, "_generation") == gen2
             
             # 4. Verify Status in DB is updated to Ready
@@ -121,6 +121,7 @@ async def test_dynamic_config_override():
             assert db_state_after["status"] == "Ready"
             assert db_state_after["observed_generation"] == gen2
         finally:
+            await asyncio.sleep(0.1)
             await close_pools()
 
 @pytest.mark.asyncio
@@ -139,6 +140,7 @@ async def test_reconciliation_locking():
                     pass
             assert "Could not acquire reconciliation lock" in str(excinfo.value)
     finally:
+        await asyncio.sleep(0.1)
         await close_pools()
 
 @pytest.mark.asyncio
@@ -192,4 +194,5 @@ async def test_failed_config_status():
         assert db_state["status"] == "Failed"
         assert "Simulated Failure" in db_state["error_message"]
     finally:
+        await asyncio.sleep(0.1)
         await close_pools()

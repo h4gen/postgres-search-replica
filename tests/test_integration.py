@@ -136,7 +136,7 @@ async def test_hybrid_search_rrf(clean_db, robust_slot_cleanup, internal_source_
             assert await wait_for_pgai_sync(replica.settings, "hybrid")
             
             async with sink_conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute("SELECT * FROM hybrid_products_search LIMIT 1")
+                await cur.execute("SELECT * FROM hybrid_search LIMIT 1")
                 row = await cur.fetchone()
                 assert "ts_col" in row, "ts_col missing from hybrid view"
                 assert row["ts_col"] is not None
@@ -165,14 +165,14 @@ async def test_blue_green_swap(clean_db, robust_slot_cleanup, internal_source_ur
 
         await sink_conn.execute("DROP TABLE IF EXISTS swap_products CASCADE")
         await sink_conn.execute("DELETE FROM _replica_state WHERE key = 'sub_swap'")
-        await sink_conn.execute("DROP VIEW IF EXISTS swap_products_search CASCADE")
+        await sink_conn.execute("DROP VIEW IF EXISTS swap_search CASCADE")
 
         # Phase 1: Deploy V1
         async with PGSearchReplica(sync=True, **base_config) as replica:
             assert await wait_for_pgai_sync(replica.settings, "swap")
             
             async with sink_conn.cursor() as cur:
-                await cur.execute("SELECT table_name FROM information_schema.view_table_usage WHERE view_name = 'swap_products_search' AND table_name LIKE '%%_embedding_v%%'")
+                await cur.execute("SELECT table_name FROM information_schema.view_table_usage WHERE view_name = 'swap_search' AND table_name LIKE '%%_embedding_v%%'")
                 row = await cur.fetchone()
                 v1 = row[0] if row else None
             
@@ -189,7 +189,7 @@ async def test_blue_green_swap(clean_db, robust_slot_cleanup, internal_source_ur
         async with PGSearchReplica(sync=True, **new_config) as replica:
             # Reconciler runs on startup
             async with sink_conn.cursor() as cur:
-                await cur.execute("SELECT table_name FROM information_schema.view_table_usage WHERE view_name = 'swap_products_search' AND table_name LIKE '%%_embedding_v%%'")
+                await cur.execute("SELECT table_name FROM information_schema.view_table_usage WHERE view_name = 'swap_search' AND table_name LIKE '%%_embedding_v%%'")
                 row = await cur.fetchone()
                 v2 = row[0] if row else None
                 

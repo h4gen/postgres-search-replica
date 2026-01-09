@@ -149,6 +149,26 @@ class Orchestrator:
             except asyncio.TimeoutError:
                 continue
 
+    async def _supervised_run(self, name: str, factory):
+        """Supervises a worker task, restarting it on failure."""
+        logger.info(f"Starting supervised worker: {name}")
+        while not self._stop_event.is_set():
+            try:
+                worker = factory()
+                # Run the worker. If it returns, it finished (unexpected for long-running).
+                # If it raises, we catch and restart.
+                await worker.run()
+            except asyncio.CancelledError:
+                logger.info(f"Worker {name} cancelled.")
+                break
+            except Exception as e:
+                logger.error(f"Worker {name} crashed: {e}. Restarting in 2s...", exc_info=True)
+                try:
+                    await asyncio.sleep(2.0)
+                except asyncio.CancelledError:
+                    break
+        logger.info(f"Worker {name} stopped.")
+
     async def start(self):
         """Start all managed services."""
         if self.settings.sink_url == "local":
@@ -178,11 +198,23 @@ class Orchestrator:
         except asyncio.TimeoutError as e:
             raise RuntimeError(str(e))
 
-        worker = Worker(db_url=self.settings.resolved_sink_url, poll_interval=timedelta(seconds=2.0))
-        self._tasks.append(asyncio.create_task(worker.run(), name="pgai_worker"))
+        # Supervise pgai worker
+        self._tasks.append(asyncio.create_task(
+            self._supervised_run(
+                "pgai_worker", 
+                lambda: Worker(db_url=self.settings.resolved_sink_url, poll_interval=timedelta(seconds=2.0))
+            ), 
+            name="pgai_worker_supervisor"
+        ))
         
-        mirror_worker = MirrorWorker(self.settings)
-        self._tasks.append(asyncio.create_task(mirror_worker.run(), name="mirror_worker"))
+        # Supervise mirror worker
+        self._tasks.append(asyncio.create_task(
+            self._supervised_run(
+                "mirror_worker",
+                lambda: MirrorWorker(self.settings)
+            ),
+            name="mirror_worker_supervisor"
+        ))
         
         self._tasks.append(asyncio.create_task(self._replication_loop(), name="watchdog"))
 

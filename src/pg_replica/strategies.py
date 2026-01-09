@@ -14,7 +14,8 @@ class SearchStrategy(abc.ABC):
         embedding: List[float], 
         limit: int, 
         config: SearchPipeline,
-        conn_provider: Any
+        conn_provider: Any,
+        target_name: str
     ) -> List[Dict[str, Any]]:
         """Execute search using the specific engine."""
         pass
@@ -27,9 +28,10 @@ class PostgresSearchStrategy(SearchStrategy):
         embedding: List[float], 
         limit: int, 
         config: SearchPipeline,
-        conn_provider: Any
+        conn_provider: Any,
+        target_name: str
     ) -> List[Dict[str, Any]]:
-        replica_table = f"{config.ingest.table}_search"
+        replica_table = f"{target_name}_search"
         conn = await conn_provider()
         
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -89,7 +91,8 @@ class QdrantSearchStrategy(SearchStrategy):
         embedding: List[float], 
         limit: int, 
         config: SearchPipeline,
-        conn_provider: Any
+        conn_provider: Any,
+        target_name: str
     ) -> List[Dict[str, Any]]:
         # Find mirror config for Qdrant
         mirror = next((m for m in config.storage.mirrors if m.type == "qdrant"), None)
