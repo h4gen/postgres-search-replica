@@ -20,9 +20,6 @@ COPY pyproject.toml uv.lock ./
 # Use uv to manage the environment
 RUN /uv/bin/uv sync --frozen --all-extras && /uv/bin/uv cache clean
 
-# Set PYTHONPATH so PL/Python3u can find dependencies in the uv virtualenv
-ENV PYTHONPATH=/app/.venv/lib/python3.13/site-packages:/app/src
-
 
 # Copy source code and entrypoint
 
@@ -41,4 +38,4 @@ RUN mkdir -p /var/lib/postgresql/.local/share/pg-search-replica && \
 USER postgres
 
 # Set the entrypoint
-ENTRYPOINT ["./entrypoint.sh"]
+ENTRYPOINT ["/bin/sh", "./entrypoint.sh"]

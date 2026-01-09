@@ -9,14 +9,20 @@ logger = logging.getLogger(__name__)
 # Registry of initialized adapters
 _adapters: Dict[str, BaseSourceAdapter] = {}
 
-def get_adapter_class(type: str, strategy: str) -> Type[BaseSourceAdapter]:
+def get_adapter_class(type_name: str, strategy: Optional[str] = None) -> Type[BaseSourceAdapter]:
     """Factory mapping config type and strategy to Adapter Class."""
-    if type == "postgres":
+    if type_name == "postgres":
         if strategy == "cdc":
             return PostgresCDCAdapter
         elif strategy == "polling":
             return PostgresPollingAdapter
-    raise ValueError(f"Unknown source type/strategy: {type}/{strategy}")
+    elif type_name == "local":
+        from .local import LocalFileAdapter
+        return LocalFileAdapter
+    elif type_name == "s3":
+        from .s3 import S3SourceAdapter
+        return S3SourceAdapter
+    raise ValueError(f"Unknown source type/strategy: {type_name}/{strategy}")
 
 async def init_source_adapters(settings: Settings) -> None:
     """Initialize all source adapters defined in settings."""
@@ -24,8 +30,9 @@ async def init_source_adapters(settings: Settings) -> None:
     
     for name, config in settings.sources.items():
         if name not in _adapters:
-            adapter_cls = get_adapter_class(config.type, config.strategy)
-            adapter = adapter_cls(name, config)
+            strategy = getattr(config, "strategy", None)
+            adapter_cls = get_adapter_class(config.type, strategy)
+            adapter = adapter_cls(name, config) # type: ignore
             await adapter.connect()
             _adapters[name] = adapter
 

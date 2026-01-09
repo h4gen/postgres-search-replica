@@ -343,7 +343,7 @@ class Planner:
                 source_config = self.settings.sources.get(source_id)
                 if source_config:
                     needs_source_setup = False
-                    if source_config.strategy == "cdc":
+                    if getattr(source_config, "strategy", None) == "cdc":
                         if pub_name not in this_source_state.get("publications", {}):
                             needs_source_setup = True
                         else:
@@ -367,7 +367,7 @@ class Planner:
                         needs_source_setup = True
 
                     if needs_source_setup:
-                        if self.settings.source_managed_by_admin and source_config.strategy == "cdc":
+                        if self.settings.source_managed_by_admin and getattr(source_config, "strategy", None) == "cdc":
                             logger.warning(
                                 f"Publication {pub_name} drift detected and source is admin-managed."
                             )
@@ -375,7 +375,7 @@ class Planner:
                             actions.append(
                                 Action(
                                     type=ActionType.SOURCE_SETUP,
-                                    description=f"Setup/Update source {source_id} ({source_config.strategy}) for {config.ingest.table}",
+                                    description=f"Setup/Update source {source_id} ({getattr(source_config, 'strategy', source_config.type)}) for {config.ingest.table}",
                                     params={},
                                     target_name=name,
                                 )
@@ -422,7 +422,7 @@ class Planner:
             # 2.3 Recovery (Slot check)
             # Only check slots if source is reachable and using CDC
             if this_source_state and this_source_state.get("is_reachable"):
-                strategy = source_config.strategy if source_config else "cdc"
+                strategy = getattr(source_config, "strategy", "polling") if source_config else "cdc"
                 if strategy == "cdc":
                     if sub_name not in this_source_state.get("slots", set()):
                         actions.append(
@@ -433,8 +433,18 @@ class Planner:
                                 target_name=name,
                             )
                         )
-                # For Polling, we might want a SINK_RECOVERY if the table is empty 
-                # but we'll let the worker handle it for now.
+                else:
+                    # For Polling/Files, trigger if we have no state (initial sync)
+                    replica_state = sink_state.get("replica_states", {}).get(name)
+                    if not replica_state or (replica_state.get("last_id") in [None, "0"]):
+                        actions.append(
+                            Action(
+                                type=ActionType.SINK_RECOVERY,
+                                description=f"Perform initial sync for {name} (polling/file source)",
+                                params={},
+                                target_name=name,
+                            )
+                        )
 
             vectorizers = sink_state.get("vectorizers", {}).get(raw_table, [])
             expected_vectorizer_target = f"{raw_table}_store_v{version_id}"

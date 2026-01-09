@@ -1,11 +1,11 @@
 import pytest
-from pg_replica.config import Settings, SearchPipeline, IngestConfig, PipelineConfig, StorageConfig, EmbeddingConfig, ChunkingConfig, PostgresStoreConfig, BranchConfig, MirrorConfig, SourceConfig
+from pg_replica.config import Settings, SearchPipeline, IngestConfig, PipelineConfig, StorageConfig, EmbeddingConfig, ChunkingConfig, PostgresStoreConfig, BranchConfig, MirrorConfig, PostgresSourceConfig
 from pg_replica.reconciler import Planner, ActionType
 
 
 def test_planner_no_drift():
     settings = Settings(
-        sources={"default": SourceConfig(connection_url="postgresql://localhost/src")},
+        sources={"default": PostgresSourceConfig(connection_url="postgresql://localhost/src")},
         sink_url="postgresql://localhost/sink",
         pipelines={
             "t1": SearchPipeline(
@@ -56,7 +56,7 @@ def test_planner_no_drift():
 
 def test_planner_missing_column():
     settings = Settings(
-        sources={"default": SourceConfig(connection_url="postgresql://localhost/src")},
+        sources={"default": PostgresSourceConfig(connection_url="postgresql://localhost/src")},
         sink_url="postgresql://localhost/sink",
         pipelines={
             "t1": SearchPipeline(
@@ -101,7 +101,7 @@ def test_planner_model_change_triggers_view_swap():
     # Simulate a drift by having the in-memory config differ from the 'state'
     # Here we define the "new" desire state
     settings = Settings(
-        sources={"default": SourceConfig(connection_url="postgresql://localhost/src")},
+        sources={"default": PostgresSourceConfig(connection_url="postgresql://localhost/src")},
         sink_url="postgresql://localhost/sink",
         pipelines={
             "t1": SearchPipeline(
@@ -149,7 +149,7 @@ def test_planner_model_change_triggers_view_swap():
 
 def test_planner_missing_slot_triggers_recovery():
     settings = Settings(
-        sources={"default": SourceConfig(connection_url="postgresql://localhost/src")},
+        sources={"default": PostgresSourceConfig(connection_url="postgresql://localhost/src")},
         sink_url="postgresql://localhost/sink",
         pipelines={
             "t1": SearchPipeline(
@@ -199,7 +199,7 @@ def test_planner_missing_slot_triggers_recovery():
 def test_planner_deferred_swap():
     """Verify that promotion is skipped if target is NOT synced."""
     settings = Settings(
-        sources={"default": SourceConfig(connection_url="postgresql://localhost/src")},
+        sources={"default": PostgresSourceConfig(connection_url="postgresql://localhost/src")},
         sink_url="postgresql://localhost/sink",
         pipelines={
             "t1": SearchPipeline(

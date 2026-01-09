@@ -1,0 +1,3 @@
+This is a plain text file.
+It should be handled by the passing_auto configuration in pgai.
+More content for better embedding.

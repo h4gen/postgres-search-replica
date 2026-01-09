@@ -1,8 +1,7 @@
 #!/bin/sh
-# Entrypoint for pg-search-replica monolithic service
-
-# Ensure we use the right PYTHONPATH for our package
-export PYTHONPATH=$PYTHONPATH:/app/src
+# Dynamically detect the site-packages path to be robust across Python versions
+SITE_PACKAGES=$(ls -d /app/.venv/lib/python3.*/site-packages 2>/dev/null | head -n 1)
+export PYTHONPATH=$SITE_PACKAGES:/app/src
 
 # If a custom command is provided, run it
 if [ $# -gt 0 ]; then

@@ -92,7 +92,11 @@ async def connect_db(url: str, **kwargs):
 
 
 async def wait_for_source_table(settings: Settings, config: SearchPipeline, timeout: int = 30):
-    """Wait for a table to exist on the Source DB."""
+    """Wait for a table to exist on the Source DB. Skip for non-Postgres sources."""
+    source_type = settings.sources[config.ingest.source].type if config.ingest.source in settings.sources else "postgres"
+    if source_type != "postgres":
+        return True
+
     async def table_exists():
         async with await get_source_conn(config.ingest.source) as conn:
             async with conn.cursor() as cur:
@@ -1053,6 +1057,19 @@ async def setup_sink(
             else:
                 c_func = c_strat
 
+            # Resolve pgai loading and parsing
+            source_type = settings.sources[config.ingest.source].type if config.ingest.source in settings.sources else "postgres"
+            if source_type in ["local", "s3"]:
+                loading_part = f"loading => ai.loading_uri('{config.pipeline.content_column}')"
+                p_strat = config.pipeline.parsing.strategy
+                if p_strat == "auto":
+                    parsing_part = ", parsing => ai.parsing_auto()"
+                else:
+                    parsing_part = f", parsing => ai.parsing_{p_strat}()"
+            else:
+                loading_part = f"loading => ai.loading_column('{config.pipeline.content_column}')"
+                parsing_part = ""
+
             # Resolve api_key_name for pgai
             api_key_sql = ""
             if config.pipeline.embedding.api_key_name:
@@ -1065,7 +1082,8 @@ async def setup_sink(
                         SELECT ai.create_vectorizer(
                             '{target}'::regclass,
                             name => %s,
-                            loading => ai.loading_column('{config.pipeline.content_column}'),
+                            {loading_part}
+                            {parsing_part},
                             embedding => ai.embedding_{config.pipeline.embedding.provider}('{config.pipeline.embedding.model}', {config.pipeline.embedding.dimension}{api_key_sql}),
                             chunking => ai.chunking_{c_func}(),
                             formatting => ai.formatting_python_template('{config.pipeline.template}'),
@@ -1109,7 +1127,7 @@ async def setup_sink(
             )
 
             # Subscription (CDC Only)
-            strategy = settings.sources[config.ingest.source].strategy if config.ingest.source in settings.sources else "cdc"
+            strategy = getattr(settings.sources[config.ingest.source], "strategy", "polling") if config.ingest.source in settings.sources else "cdc"
             
             if strategy == "cdc":
                 await cur.execute(f"SELECT 1 FROM pg_subscription WHERE subname = '{sub_name}'")
@@ -1199,7 +1217,12 @@ async def setup_sink(
 
 
 async def find_and_fix_ghost_records(settings: Settings, config: SearchPipeline, target_name: str):
-    """Anti-Entropy sweep to find and delete hard-deleted records."""
+    """Scan for drifting or missing records in the sink."""
+    source_type = settings.sources[config.ingest.source].type if config.ingest.source in settings.sources else "postgres"
+    if source_type != "postgres":
+        logger.info(f"Skipping anti-entropy sweep for non-Postgres source: {config.ingest.source}")
+        return
+
     logger.info(f"Starting Anti-Entropy sweep for {target_name}...")
     
     # Pre-flight readiness check to avoid race conditions in tests

@@ -2,16 +2,33 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Literal
+from typing import Dict, List, Optional, Any, Literal, Union, Annotated
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 # --- CONFIG: Sources & Mirrors ---
-class SourceConfig(BaseModel):
+class PostgresSourceConfig(BaseModel):
     type: Literal["postgres"] = "postgres"
     strategy: Literal["cdc", "polling"] = "cdc"
     connection_url: str
+
+class LocalSourceConfig(BaseModel):
+    type: Literal["local"] = "local"
+    path: str
+    uri_prefix: Optional[str] = None
+
+class S3SourceConfig(BaseModel):
+    type: Literal["s3"] = "s3"
+    bucket: str
+    prefix: str = ""
+    region: Optional[str] = None
+    endpoint_url: Optional[str] = None
+
+SourceConfig = Annotated[
+    Union[PostgresSourceConfig, LocalSourceConfig, S3SourceConfig],
+    Field(discriminator="type")
+]
 
 class MirrorConfig(BaseModel):
     id: str
@@ -49,11 +66,16 @@ class EmbeddingConfig(BaseModel):
     api_key_name: Optional[str] = None # Env var name for API key
 
 
+class ParsingConfig(BaseModel):
+    strategy: Literal["auto", "pdf", "docx", "markdown", "text"] = "auto"
+
+
 class PipelineConfig(BaseModel):
     template: str # e.g. "Title: $title\n\n$content"
     content_column: str = "content"
     chunking: ChunkingConfig = Field(default_factory=ChunkingConfig)
     embedding: EmbeddingConfig
+    parsing: ParsingConfig = Field(default_factory=ParsingConfig)
 
     @field_validator("template")
     @classmethod
@@ -148,7 +170,7 @@ class Settings(BaseSettings):
         # 2. Legacy Source Support
         # If 'default' source is missing but source_url is provided (env var), create it.
         if "default" not in self.sources and self.source_url:
-            self.sources["default"] = SourceConfig(connection_url=self.source_url)
+            self.sources["default"] = PostgresSourceConfig(connection_url=self.source_url)
             
         return self
 

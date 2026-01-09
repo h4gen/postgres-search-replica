@@ -1,6 +1,6 @@
 import pytest
 import asyncio
-from pg_replica.config import SearchPipeline, IngestConfig, Settings, SourceConfig
+from pg_replica.config import SearchPipeline, IngestConfig, Settings, PostgresSourceConfig
 from pg_replica import settings as global_settings
 from pg_replica.source import init_source_adapters, get_source_adapter, close_source_adapters
 from pg_replica.reconciler import Reconciler
@@ -27,7 +27,7 @@ async def test_polling_sync_flow(settings, source_conn, sink_conn, clean_db, rob
 
     # 2. Configure a Polling source
     polling_settings = settings.model_copy(deep=True)
-    polling_settings.sources["poll_src"] = SourceConfig(
+    polling_settings.sources["poll_src"] = PostgresSourceConfig(
         connection_url=str(polling_settings.sources["default"].connection_url),
         strategy="polling"
     )
@@ -97,8 +97,8 @@ async def test_cdc_fallback_to_polling_logic(settings):
     from pg_replica.source import get_adapter_class
     from pg_replica.source.postgres import PostgresCDCAdapter, PostgresPollingAdapter
     
-    cdc_config = SourceConfig(connection_url="postgresql://...", strategy="cdc")
-    poll_config = SourceConfig(connection_url="postgresql://...", strategy="polling")
+    cdc_config = PostgresSourceConfig(connection_url="postgresql://...", strategy="cdc")
+    poll_config = PostgresSourceConfig(connection_url="postgresql://...", strategy="polling")
     
     assert get_adapter_class("postgres", "cdc") == PostgresCDCAdapter
     assert get_adapter_class("postgres", "polling") == PostgresPollingAdapter

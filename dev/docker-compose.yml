@@ -32,6 +32,7 @@ services:
       OLLAMA_HOST: http://ollama:11434
     volumes:
       - sink_data:/var/lib/postgresql/.local/share/pg-search-replica
+      - ../tests:/app/tests
     depends_on:
       - source
       - ollama

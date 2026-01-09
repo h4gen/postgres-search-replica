@@ -1,7 +1,6 @@
 import pytest
 import asyncio
-from pg_replica.config import Settings
-from pg_replica.config import SearchPipeline, IngestConfig, PipelineConfig, StorageConfig, MirrorConfig, EmbeddingConfig, ChunkingConfig, SourceConfig
+from pg_replica.config import Settings, SearchPipeline, IngestConfig, PipelineConfig, StorageConfig, EmbeddingConfig, MirrorConfig, PostgresSourceConfig
 from pg_replica.reconciler import Planner, ActionType
 
 def test_planner_blocks_promotion_if_mirrors_lag():
@@ -10,7 +9,7 @@ def test_planner_blocks_promotion_if_mirrors_lag():
     lags behind outbox watermark for that version.
     """
     settings = Settings(
-        sources={"default": SourceConfig(connection_url="postgresql://localhost/src")},
+        sources={"default": PostgresSourceConfig(connection_url="postgresql://localhost/src")},
         sink_url="postgresql://localhost/sink",
         pipelines={
             "t1": SearchPipeline(
