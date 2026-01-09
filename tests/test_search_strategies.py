@@ -5,6 +5,7 @@ import uuid
 from qdrant_client import QdrantClient
 from pg_replica import connect, settings as global_settings
 from pg_replica.database import get_sink_conn, dict_row, connect_db
+from tests.utils import wait_until_success
 import os
 
 logger = logging.getLogger(__name__)
@@ -86,18 +87,19 @@ async def test_search_strategies_postgres_vs_qdrant(clean_db, robust_slot_cleanu
                     },
                     "storage": {
                         "postgres": { "profile": "vector" },
-                        "mirrors": [
-                            {
-                                "id": "qdrant_meta",
-                                "type": "qdrant",
-                                "config": {
-                                    "url": "http://localhost:6333",
-                                    "prefix": "strat_test_"
-                                }
-                            }
-                        ]
+                        "mirrors": ["qdrant_meta"]
                     },
                     "active": True
+                }
+            },
+            mirrors={
+                "qdrant_meta": {
+                    "id": "qdrant_meta",
+                    "type": "qdrant",
+                    "config": {
+                        "url": "http://localhost:6333",
+                        "prefix": "strat_test_"
+                    }
                 }
             },
             sync=True
@@ -110,26 +112,20 @@ async def test_search_strategies_postgres_vs_qdrant(clean_db, robust_slot_cleanu
                 pytest.fail("Timed out waiting for Postgres pgai sync")
 
             # 2. Wait for Qdrant Sync (custom check for this mirror)
-            found_in_qdrant = False
-            for i in range(30):
-                try:
-                    col_name_prefix = "strat_test_strat_products_"  
-                    collections = qdrant.get_collections().collections
-                    target_cols = [c.name for c in collections if c.name.startswith(col_name_prefix)]
-                    
-                    if target_cols:
-                        for c_name in target_cols:
-                            points = qdrant.scroll(collection_name=c_name, limit=10)[0]
-                            if points:
-                                if any(product_name in (p.payload.get("content") or "") for p in points):
-                                    found_in_qdrant = True
-                                    break
-                except Exception: pass
+            async def check_qdrant_sync():
+                col_name_prefix = "strat_test_strat_products_"  
+                collections = qdrant.get_collections().collections
+                target_cols = [c.name for c in collections if c.name.startswith(col_name_prefix)]
                 
-                if found_in_qdrant: break
-                await asyncio.sleep(1)
-            
-            assert found_in_qdrant, "Qdrant sync timed out"
+                if target_cols:
+                    for c_name in target_cols:
+                        points = qdrant.scroll(collection_name=c_name, limit=10)[0]
+                        if points:
+                            if any(product_name in (p.payload.get("content") or "") for p in points):
+                                return True
+                return False
+
+            await wait_until_success(check_qdrant_sync, error_msg="Qdrant sync timed out")
 
             # Check for Postgres View
             view_exists = False
@@ -195,13 +191,19 @@ async def test_search_alias_promotion(clean_db, robust_slot_cleanup, internal_so
                     },
                     "storage": {
                         "postgres": {"profile": "vector"},
-                        "mirrors": [{
-                            "id": "m1", 
-                            "type": "qdrant", 
-                            "config": {"url": "http://localhost:6333", "prefix": "alias_test_"}
-                        }]
+                        "mirrors": ["m1"]
                     },
                     "active": True
+                }
+            },
+            mirrors={
+                "m1": {
+                    "id": "m1",
+                    "type": "qdrant",
+                    "config": {
+                        "url": "http://localhost:6333",
+                        "prefix": "alias_test_"
+                    }
                 }
             },
             sync=True
@@ -215,18 +217,14 @@ async def test_search_alias_promotion(clean_db, robust_slot_cleanup, internal_so
             
             # Verify Qdrant Alias
             v1_collection = None
-            for i in range(30):
-                try:
-                    aliases = qdrant.get_aliases().aliases
-                    found = next((a for a in aliases if a.alias_name == "alias_test_products_production"), None)
-                    if found:
-                        v1_collection = found.collection_name
-                        break
-                except Exception: pass
-                await asyncio.sleep(1)
-            else:
-                pytest.fail("Timed out waiting for V1 Qdrant Alias")
-                
+            def check_alias_v1():
+                aliases = qdrant.get_aliases().aliases
+                found = next((a for a in aliases if a.alias_name == "alias_test_products_production"), None)
+                if found:
+                    return found.collection_name
+                return None
+
+            v1_collection = await wait_until_success(check_alias_v1, error_msg="Timed out waiting for V1 Qdrant Alias")
             assert "alias_test_products_" in v1_collection
 
         # Phase 2: V2 Deployment (Update)
@@ -249,13 +247,19 @@ async def test_search_alias_promotion(clean_db, robust_slot_cleanup, internal_so
                     },
                     "storage": {
                         "postgres": {"profile": "vector"},
-                        "mirrors": [{
-                            "id": "m1", 
-                            "type": "qdrant", 
-                            "config": {"url": "http://localhost:6333", "prefix": "alias_test_"}
-                        }]
+                        "mirrors": ["m1"]
                     },
                     "active": True
+                }
+            },
+            mirrors={
+                "m1": {
+                    "id": "m1",
+                    "type": "qdrant",
+                    "config": {
+                        "url": "http://localhost:6333",
+                        "prefix": "alias_test_"
+                    }
                 }
             },
             sync=True,
@@ -265,16 +269,14 @@ async def test_search_alias_promotion(clean_db, robust_slot_cleanup, internal_so
                 pytest.fail("Timed out waiting for V2 Postgres sync/promotion")
             
             # Verify Qdrant Alias swapped
-            for i in range(30):
-                try:
-                    aliases = qdrant.get_aliases().aliases
-                    found = next((a for a in aliases if a.alias_name == "alias_test_products_production"), None)
-                    if found and found.collection_name != v1_collection:
-                        break
-                except Exception: pass
-                await asyncio.sleep(1)
-            else:
-                pytest.fail("Timed out waiting for V2 Qdrant Alias swap")
+            def check_alias_swap():
+                aliases = qdrant.get_aliases().aliases
+                found = next((a for a in aliases if a.alias_name == "alias_test_products_production"), None)
+                if found and found.collection_name != v1_collection:
+                    return True
+                return False
+
+            await wait_until_success(check_alias_swap, error_msg="Timed out waiting for V2 Qdrant Alias swap")
                 
             aliases = qdrant.get_aliases().aliases
             found = next((a for a in aliases if a.alias_name == "alias_test_products_production"), None)

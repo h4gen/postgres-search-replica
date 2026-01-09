@@ -1,7 +1,6 @@
 import pytest
 import asyncio
-from pg_replica.config import Settings
-from pg_replica.config import SearchPipeline, IngestConfig, PipelineConfig, StorageConfig, MirrorConfig, EmbeddingConfig, ChunkingConfig
+from pg_replica.config import Settings, SearchPipeline, IngestConfig, PipelineConfig, StorageConfig, EmbeddingConfig, MirrorConfig, PostgresSourceConfig
 from pg_replica.reconciler import Planner, ActionType
 
 def test_planner_blocks_promotion_if_mirrors_lag():
@@ -10,7 +9,7 @@ def test_planner_blocks_promotion_if_mirrors_lag():
     lags behind outbox watermark for that version.
     """
     settings = Settings(
-        source_url="postgresql://localhost/src",
+        sources={"default": PostgresSourceConfig(connection_url="postgresql://localhost/src")},
         sink_url="postgresql://localhost/sink",
         pipelines={
             "t1": SearchPipeline(
@@ -20,9 +19,12 @@ def test_planner_blocks_promotion_if_mirrors_lag():
                     embedding=EmbeddingConfig(provider="ollama", model="nomic-embed-text", dimension=768)
                 ),
                 storage=StorageConfig(
-                     mirrors=[MirrorConfig(id="m1", type="qdrant", config={"url": "http://q1"})]
+                     mirrors=["m1"]
                 )
             )
+        },
+        mirrors={
+            "m1": MirrorConfig(id="m1", type="qdrant", config={"url": "http://q1"})
         }
     )
     planner = Planner(settings)
@@ -30,10 +32,11 @@ def test_planner_blocks_promotion_if_mirrors_lag():
     v_id = config.get_version_id()
     expected_target = f"{config.ingest.table}_store_v{v_id}"
 
-    source_state = {
+    source_state = {"default": {
+        "is_reachable": True,
         "publications": {f"pub_t1": {"tables": {"table1": {"rowfilter": None}}}},
         "slots": {f"sub_t1"},
-    }
+    }}
     
     # State where vectorizer is synced (0 pending)
     # BUT mirror is lagging (registry=5, outbox_watermark=10)

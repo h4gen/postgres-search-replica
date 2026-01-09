@@ -12,8 +12,9 @@ from .utils import wait_until
 
 logger = logging.getLogger(__name__)
 
+from .source import init_source_adapters, close_source_adapters, get_source_connection
+
 # Global pools
-_source_pool: AsyncConnectionPool | None = None
 _sink_pool: AsyncConnectionPool | None = None
 
 # Control Plane Constants
@@ -22,23 +23,14 @@ RECONCILER_ADVISORY_LOCK_ID = 133742  # Unique ID for the reconciler lock
 
 async def init_pools(settings: Settings):
     """Initialize connection pools for source and sink."""
-    global _source_pool, _sink_pool
+    global _source_pools, _sink_pool
     
     # Check if existing pools are closed and need recreation
-    if _source_pool and _source_pool.closed:
-        _source_pool = None
     if _sink_pool and _sink_pool.closed:
         _sink_pool = None
 
-    if not _source_pool:
-        logger.info(f"Initializing source connection pool with {settings.source_url}...")
-        _source_pool = AsyncConnectionPool(
-            conninfo=settings.source_url,
-            min_size=1,
-            max_size=5,
-            open=False,
-        )
-        await _source_pool.open()
+    # Initialize source pools from registry
+    await init_source_adapters(settings)
 
     if not _sink_pool:
         logger.info("Initializing sink connection pool...")
@@ -53,14 +45,10 @@ async def init_pools(settings: Settings):
 
 async def close_pools():
     """Close connection pools."""
-    global _source_pool, _sink_pool
-    if _source_pool:
-        logger.info("Closing source connection pool...")
-        try:
-            await _source_pool.close()
-        except (asyncio.CancelledError, Exception):
-            pass
-        _source_pool = None
+    global _source_pools, _sink_pool
+    # Source adapters manage their own state
+    logger.info("Closing source connection pools...")
+    await close_source_adapters()
     if _sink_pool:
         logger.info("Closing sink connection pool...")
         try:
@@ -70,11 +58,21 @@ async def close_pools():
         _sink_pool = None
 
 
-async def get_source_conn():
+async def get_source_conn(source_id: str):
     """Get a connection from the source pool."""
-    if not _source_pool:
-        raise RuntimeError("Source pool not initialized")
-    return _source_pool.connection()
+    # Delegate to the new Source Registry
+    # get_source_connection returns an async context manager, but this function legacy was returning a context manager too
+    # Actually, the pool.connection() returns an AsyncConnectionContextManager.
+    # We need to match that behavior.
+    
+    # Wait, the pool usage was `async with await get_source_conn(...) as conn`.
+    # No, usually `async with get_source_conn(...) as conn` or `pool.connection()`.
+    
+    # Original code:
+    # return _source_pools[source_id].connection()
+    
+    # New code via bridge:
+    return await get_source_connection(source_id)
 
 
 async def get_sink_conn():
@@ -94,9 +92,13 @@ async def connect_db(url: str, **kwargs):
 
 
 async def wait_for_source_table(settings: Settings, config: SearchPipeline, timeout: int = 30):
-    """Wait for a table to exist on the Source DB."""
+    """Wait for a table to exist on the Source DB. Skip for non-Postgres sources."""
+    source_type = settings.sources[config.ingest.source].type if config.ingest.source in settings.sources else "postgres"
+    if source_type != "postgres":
+        return True
+
     async def table_exists():
-        async with await get_source_conn() as conn:
+        async with await get_source_conn(config.ingest.source) as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "SELECT 1 FROM information_schema.tables WHERE table_name = %s",
@@ -128,9 +130,9 @@ async def is_extension_loaded(ext_name: str) -> bool:
             return await cur.fetchone() is not None
 
 
-async def is_replication_slot_active(slot_name: str, on_source: bool = True) -> bool:
+async def is_replication_slot_active(slot_name: str, on_source: bool = True, source_id: str = "default") -> bool:
     """Check if a replication slot is active."""
-    get_conn = get_source_conn if on_source else get_sink_conn
+    get_conn = (lambda: get_source_conn(source_id)) if on_source else get_sink_conn
     async with await get_conn() as conn:
         async with conn.cursor() as cur:
             await cur.execute("SELECT active FROM pg_replication_slots WHERE slot_name = %s", (slot_name,))
@@ -138,91 +140,9 @@ async def is_replication_slot_active(slot_name: str, on_source: bool = True) -> 
             return row[0] if row else False
 
 
-async def is_publication_valid(pub_name: str) -> bool:
+async def is_publication_valid(pub_name: str, source_id: str = "default") -> bool:
     """Check if a publication exists on the Source DB."""
-    async with await get_source_conn() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("SELECT 1 FROM pg_publication WHERE pubname = %s", (pub_name,))
-            return await cur.fetchone() is not None
 
-
-async def get_source_column_types(
-    settings: Settings, config: SearchPipeline
-) -> Dict[str, str]:
-    """Query the Source DB's information_schema to get column types."""
-    logger.info(
-        f"Detecting column types for {config.ingest.table} on source..."
-    )
-    
-    # Pre-flight readiness check to avoid race conditions in tests
-    if not await wait_for_source_table(settings, config):
-        raise RuntimeError(f"Source table {config.ingest.table} not found after timeout")
-
-    async with await get_source_conn() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                SELECT column_name, data_type, udt_name
-                FROM information_schema.columns 
-                WHERE table_name = %s 
-                AND column_name = ANY(%s)
-                """,
-                (config.ingest.table, config.ingest.columns),
-            )
-            rows = await cur.fetchall()
-            # Map data_type to something we can use in CREATE TABLE
-            types = {}
-            for name, dtype, udt in rows:
-                if udt == "uuid":
-                    types[name] = "UUID"
-                elif dtype == "integer":
-                    types[name] = "INT"
-                elif dtype == "bigint":
-                    types[name] = "BIGINT"
-                elif "character" in dtype or dtype == "text":
-                    types[name] = "TEXT"
-                else:
-                    types[name] = dtype
-            return types
-
-
-async def setup_source(settings: Settings, config: SearchPipeline, target_name: str):
-    """Remotely initialize the source publication."""
-    pub_name = f"pub_{target_name}"
-    print(f"DEBUG: setup_source called for {pub_name}")
-    logger.info(f"Setting up remote source publication {pub_name}...")
-    
-    # Pre-flight readiness check to avoid race conditions in tests
-    if not await wait_for_source_table(settings, config):
-        raise RuntimeError(f"Source table {config.ingest.table} not found after timeout")
-
-    async with await get_source_conn() as conn:
-        await conn.set_autocommit(True)
-        async with conn.cursor() as cur:
-            cols = ", ".join(config.ingest.columns)
-            where_clause = (
-                f" WHERE ({config.ingest.filter})"
-                if config.ingest.filter
-                else ""
-            )
-
-            # Ensure publication exists (idempotent check)
-            await cur.execute(
-                f"SELECT 1 FROM pg_publication WHERE pubname = '{pub_name}'"
-            )
-            if not await cur.fetchone():
-                logger.info(
-                    f"Creating publication {pub_name} on Source for columns ({cols}){where_clause}..."
-                )
-                await cur.execute(
-                    f"CREATE PUBLICATION {pub_name} FOR TABLE {config.ingest.table} ({cols}){where_clause}"
-                )
-            else:
-                logger.debug(f"Publication {pub_name} exists. Updating definition...")
-                await cur.execute(
-                    f"ALTER PUBLICATION {pub_name} SET TABLE {config.ingest.table} ({cols}){where_clause}"
-                )
-            await conn.commit()
 
 
 async def setup_state_table(settings: Settings, target_name: str):
@@ -393,34 +313,36 @@ async def get_replica_state(
             return None, None
 
 
-    return statuses
-
-
 async def get_source_health(settings: Settings) -> dict:
-    """Query current health state of the Source DB replication."""
+    """Query current health state of ALL Source DBs."""
     logger.debug("Fetching source health metadata...")
-    try:
-        async with await get_source_conn() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                # 1. Check replication slots
-                await cur.execute(
-                    "SELECT slot_name, active, restart_lsn, confirmed_flush_lsn FROM pg_replication_slots"
-                )
-                slots = await cur.fetchall()
+    health_status = {}
+    
+    for source_id in settings.sources.keys():
+        try:
+            async with await get_source_conn(source_id) as conn:
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    # 1. Check replication slots
+                    await cur.execute(
+                        "SELECT slot_name, active, restart_lsn, confirmed_flush_lsn FROM pg_replication_slots"
+                    )
+                    slots = await cur.fetchall()
 
-                # 2. Get current WAL LSN
-                await cur.execute("SELECT pg_current_wal_lsn() as current_lsn")
-                row = await cur.fetchone()
-                current_lsn = str(row["current_lsn"]) if row and row["current_lsn"] else None
+                    # 2. Get current WAL LSN
+                    await cur.execute("SELECT pg_current_wal_lsn() as current_lsn")
+                    row = await cur.fetchone()
+                    current_lsn = str(row["current_lsn"]) if row and row["current_lsn"] else None
 
-                return {
-                    "slots": slots,
-                    "current_lsn": current_lsn,
-                    "is_connected": True
-                }
-    except Exception as e:
-        logger.error(f"Failed to fetch source health: {e}")
-        return {"is_connected": False, "error": str(e)}
+                    health_status[source_id] = {
+                        "slots": slots,
+                        "current_lsn": current_lsn,
+                        "is_connected": True
+                    }
+        except Exception as e:
+            logger.error(f"Failed to fetch source health for {source_id}: {e}")
+            health_status[source_id] = {"is_connected": False, "error": str(e)}
+            
+    return health_status
 
 
 async def get_vectorizer_statuses(settings: Settings) -> dict[str, int]:
@@ -513,7 +435,7 @@ async def get_resource_projections(settings: Settings, config: SearchPipeline) -
     """Estimate costs and hardware needs for a build."""
     logger.debug(f"Calculating projections for {config.ingest.table}...")
     
-    async with await get_source_conn() as conn:
+    async with await get_source_conn(config.ingest.source) as conn:
         async with conn.cursor() as cur:
             await cur.execute(f"SELECT count(*) FROM {config.ingest.table}")
             row = await cur.fetchone()
@@ -1026,66 +948,6 @@ async def warm_up_from_cache(
             )
 
 
-async def check_slot_exists(settings: Settings, target_name: str) -> bool:
-    """Check if the replication slot exists on the Source DB."""
-    sub_name = f"sub_{target_name}"
-    async with await get_source_conn() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT 1 FROM pg_replication_slots WHERE slot_name = %s",
-                (sub_name,),
-            )
-            return await cur.fetchone() is not None
-
-
-async def create_placeholder_slot(settings: Settings, target_name: str) -> str:
-    """Create a logical replication slot on Source and return its consistent LSN."""
-    sub_name = f"sub_{target_name}"
-    logger.info(f"Creating placeholder replication slot {sub_name} on Source...")
-    async with await get_source_conn() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT restart_lsn FROM pg_replication_slots WHERE slot_name = %s",
-                (sub_name,),
-            )
-            res = await cur.fetchone()
-            if res:
-                lsn = str(res[0])
-                logger.info(f"Slot already exists at LSN: {lsn}")
-                return lsn
-
-            await cur.execute(
-                "SELECT lsn FROM pg_create_logical_replication_slot(%s, 'pgoutput', false, true)",
-                (sub_name,),
-            )
-            res = await cur.fetchone()
-            if not res:
-                raise RuntimeError("Failed to create replication slot")
-            lsn = str(res[0])
-            logger.info(f"Created slot at LSN: {lsn}")
-            return lsn
-
-
-async def ensure_sink_raw_table(settings: Settings, config: SearchPipeline):
-    """Ensure the raw table exists in the Sink DB with correct types."""
-    target = config.ingest.table
-    source_types = await get_source_column_types(settings, config)
-    async with await get_sink_conn() as conn:
-        await conn.set_autocommit(True)
-        async with conn.cursor() as cur:
-            cols_sql = []
-            for col in config.ingest.columns:
-                dtype = source_types.get(col, "TEXT")
-                if col == config.ingest.p_key:
-                    cols_sql.append(f"{col} {dtype} PRIMARY KEY")
-                else:
-                    cols_sql.append(f"{col} {dtype}")
-
-            await cur.execute(
-                f"CREATE TABLE IF NOT EXISTS {target} ({', '.join(cols_sql)})"
-            )
-
-
 async def setup_sink(
     settings: Settings,
     config: SearchPipeline,
@@ -1098,7 +960,9 @@ async def setup_sink(
     target = config.ingest.table
 
     await setup_state_table(settings, target_name)
-    source_types = await get_source_column_types(settings, config)
+    from .source import get_source_adapter
+    adapter = get_source_adapter(config.ingest.source)
+    source_types = await adapter.get_table_columns(config.ingest.table)
 
     async with await get_sink_conn() as conn:
         await conn.set_autocommit(True)
@@ -1121,10 +985,53 @@ async def setup_sink(
             )
 
             try:
+                # Try standard extension install
                 await cur.execute("CREATE EXTENSION IF NOT EXISTS ai CASCADE")
             except Exception:
+                # Fallback: Manual install from python package
+                # This bypasses 'MultiplexedPath' errors and 'missing ai.control'
                 import pgai
-                pgai.install(settings.resolved_sink_url)
+                import os
+                
+                logger.info("Installing pgai manually from python package data...")
+                # Find ai.sql in pgai/data/ai.sql
+                base_dir = os.path.dirname(pgai.__file__)
+                sql_path = os.path.join(base_dir, "data", "ai.sql")
+                if not os.path.exists(sql_path):
+                     raise RuntimeError(f"Could not find ai.sql at {sql_path}")
+                     
+                with open(sql_path, "r") as f:
+                    sql_content = f.read()
+                    
+                # Replace placeholders (assuming vector is in public or same schema)
+                # pgai installer replaces @extschema:vector@ with actual schema
+                # We assume public for now or discover it
+                await cur.execute("SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'vector'")
+                res = await cur.fetchone()
+                vector_schema = res[0] if res else "public"
+                
+                # Replace placeholders
+                sql_content = sql_content.replace("@extschema:vector@", vector_schema)
+                from pgai import __version__
+                sql_content = sql_content.replace("__version__", __version__)
+                
+                try:
+                    await cur.execute(sql_content)
+                except Exception as e:
+                    # Check if it's the "already installed" error from pgai's SQL script
+                    # The script uses RAISE EXCEPTION using ERRCODE_DUPLICATE_OBJECT (42710)
+                    # We check the message or the sqlstate if possible.
+                    # psycopg exception hierarchy: DuplicateObject
+                    is_duplicate = False
+                    if type(e).__name__ == "DuplicateObject":
+                        is_duplicate = True
+                    elif hasattr(e, "pgcode") and e.pgcode == "42710":
+                         is_duplicate = True
+                    
+                    if is_duplicate and "pgai library has already been installed" in str(e):
+                        logger.info("pgai manual install: Library already installed, skipping.")
+                    else:
+                        raise e
             target = config.ingest.table
             vectorizer_name = vectorizer_target or f"{target}_store"
             logger.info(f"Setting up sink for {target_name}, target table: {target}, vectorizer: {vectorizer_name}")
@@ -1150,6 +1057,19 @@ async def setup_sink(
             else:
                 c_func = c_strat
 
+            # Resolve pgai loading and parsing
+            source_type = settings.sources[config.ingest.source].type if config.ingest.source in settings.sources else "postgres"
+            if source_type in ["local", "s3"]:
+                loading_part = f"loading => ai.loading_uri('{config.pipeline.content_column}')"
+                p_strat = config.pipeline.parsing.strategy
+                if p_strat == "auto":
+                    parsing_part = ", parsing => ai.parsing_auto()"
+                else:
+                    parsing_part = f", parsing => ai.parsing_{p_strat}()"
+            else:
+                loading_part = f"loading => ai.loading_column('{config.pipeline.content_column}')"
+                parsing_part = ""
+
             # Resolve api_key_name for pgai
             api_key_sql = ""
             if config.pipeline.embedding.api_key_name:
@@ -1162,7 +1082,8 @@ async def setup_sink(
                         SELECT ai.create_vectorizer(
                             '{target}'::regclass,
                             name => %s,
-                            loading => ai.loading_column('{config.pipeline.content_column}'),
+                            {loading_part}
+                            {parsing_part},
                             embedding => ai.embedding_{config.pipeline.embedding.provider}('{config.pipeline.embedding.model}', {config.pipeline.embedding.dimension}{api_key_sql}),
                             chunking => ai.chunking_{c_func}(),
                             formatting => ai.formatting_python_template('{config.pipeline.template}'),
@@ -1174,7 +1095,14 @@ async def setup_sink(
                     )
                     return True
                 except Exception as e:
-                    if "does not exist" in str(e):
+                    err_msg = str(e).lower()
+                    if "column" in err_msg and "does not exist" in err_msg:
+                        # Specific configuration error (e.g. wrong content_column)
+                        # We must fail fast here to avoid spinning for 20s
+                        logger.error(f"Permanent configuration error in vectorizer: {e}")
+                        raise e
+                    if "does not exist" in err_msg:
+                        # Common transient error during bootstrap or schema migration
                         logger.warning(f"Relation not yet visible to pgai, retrying: {e}")
                         return False
                     raise e
@@ -1198,119 +1126,103 @@ async def setup_sink(
                 """
             )
 
-            # Subscription
-            await cur.execute(f"SELECT 1 FROM pg_subscription WHERE subname = '{sub_name}'")
-            if not await cur.fetchone():
-                last_id, last_lsn = await get_replica_state(settings, target_name)
-                slot_exists_on_source = await check_slot_exists(settings, target_name)
-                
-                copy_data = "false" if (slot_exists_on_source or last_id != "0" or last_lsn is not None) else "true"
-                options_dict = settings.subscription_options.copy()
-                options_dict["copy_data"] = f"'{copy_data}'"
-                if slot_exists_on_source:
-                    options_dict["create_slot"] = "false"
+            # Subscription (CDC Only)
+            strategy = getattr(settings.sources[config.ingest.source], "strategy", "polling") if config.ingest.source in settings.sources else "cdc"
+            
+            if strategy == "cdc":
+                await cur.execute(f"SELECT 1 FROM pg_subscription WHERE subname = '{sub_name}'")
+                if not await cur.fetchone():
+                    last_id, last_lsn = await get_replica_state(settings, target_name)
+                    
+                    slot_exists_on_source = False
+                    source_id = "default"
+                    if target_name in settings.pipelines:
+                        source_id = settings.pipelines[target_name].ingest.source
+                    
+                    async with await get_source_conn(source_id) as conn:
+                        async with conn.cursor() as cur_slot_check:
+                            await cur_slot_check.execute(
+                                "SELECT 1 FROM pg_replication_slots WHERE slot_name = %s",
+                                (sub_name,),
+                            )
+                            slot_exists_on_source = await cur_slot_check.fetchone() is not None
 
-                options = ", ".join([f"{k} = {v}" for k, v in options_dict.items()])
-                # Give Source catalog a moment to settle after any recent drops
-                await asyncio.sleep(2.0)
+                    copy_data = "false" if (slot_exists_on_source or last_id != "0" or last_lsn is not None) else "true"
+                    options_dict = settings.subscription_options.copy()
+                    options_dict["copy_data"] = f"'{copy_data}'"
+                    if slot_exists_on_source:
+                        options_dict["create_slot"] = "false"
 
-                # Force release any zombie worker using this slot on the Source
-                if slot_exists_on_source:
-                    try:
-                        async with await get_source_conn() as s_conn:
-                            async with s_conn.cursor() as s_cur:
-                                await s_cur.execute(
-                                    "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = %s",
-                                    (sub_name,),
-                                )
-                    except Exception as e:
-                        logger.warning(f"Failed to force release slot {sub_name} on source: {e}")
+                    options = ", ".join([f"{k} = {v}" for k, v in options_dict.items()])
+                    # Give Source catalog a moment to settle after any recent drops
+                    await asyncio.sleep(2.0)
 
-                # Retry loop for subscription to handle source-side visibility lag
-                async def try_create_subscription():
-                    try:
-                        await cur.execute(
-                            f"""
-                            CREATE SUBSCRIPTION {sub_name} 
-                            CONNECTION '{settings.subscription_connection_url}' 
-                            PUBLICATION {pub_name}
-                            WITH ({options})
-                            """
-                        )
-                        return True
-                    except Exception as e:
-                        err_msg = str(e).lower()
-                        if "already exists" in err_msg:
+                    # Force release any zombie worker using this slot on the Source
+                    if slot_exists_on_source:
+                        try:
+                            async with await get_source_conn(config.ingest.source) as s_conn:
+                                async with s_conn.cursor() as s_cur:
+                                    await s_cur.execute(
+                                        "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = %s",
+                                        (sub_name,),
+                                    )
+                        except Exception as e:
+                            logger.warning(f"Failed to force release slot {sub_name} on source: {e}")
+
+                    # Retry loop for subscription to handle source-side visibility lag
+                    async def try_create_subscription():
+                        try:
+                            # Resolve connection URL for Docker networking
+                            source_url = settings.sources[config.ingest.source].connection_url
+                            # Fix for container-to-container networking
+                            # Host sees localhost:5433, but Sink container needs source:5432
+                            sub_conn_url = source_url.replace("localhost:5433", "source:5432") \
+                                                     .replace("127.0.0.1:5433", "source:5432") \
+                                                     .replace("localhost", "source") \
+                                                     .replace("127.0.0.1", "source")
+
+                            await cur.execute(
+                                f"""
+                                CREATE SUBSCRIPTION {sub_name} 
+                                CONNECTION '{sub_conn_url}' 
+                                PUBLICATION {pub_name}
+                                WITH ({options})
+                                """
+                            )
                             return True
-                        if "in use" in err_msg:
-                            # One more attempt to kick the zombie
-                            try:
-                                async with await get_source_conn() as s_conn:
-                                    async with s_conn.cursor() as s_cur:
-                                        await s_cur.execute(
-                                            "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = %s",
-                                            (sub_name,),
-                                        )
-                            except Exception: pass
-                        logger.warning(f"Subscription creation for {sub_name} failed, will retry: {e}")
-                        return False
+                        except Exception as e:
+                            err_msg = str(e).lower()
+                            if "already exists" in err_msg:
+                                return True
+                            if "in use" in err_msg:
+                                # One more attempt to kick the zombie
+                                try:
+                                    async with await get_source_conn(config.ingest.source) as s_conn:
+                                        async with s_conn.cursor() as s_cur:
+                                            await s_cur.execute(
+                                                "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = %s",
+                                                (sub_name,),
+                                            )
+                                except Exception: pass
+                            logger.warning(f"Subscription creation for {sub_name} failed, will retry: {e}")
+                            return False
 
-                await wait_until(try_create_subscription, timeout=30.0, interval=3.0)
-            else:
-                await cur.execute(f"ALTER SUBSCRIPTION {sub_name} ENABLE")
-                await cur.execute(f"ALTER SUBSCRIPTION {sub_name} REFRESH PUBLICATION")
-
-
-async def run_sql_catchup(settings: Settings, config: SearchPipeline, target_name: str):
-    """Perform Keyset Pagination for catch-up."""
-    last_id_str, _ = await get_replica_state(settings, target_name)
-    last_id = last_id_str if last_id_str != "0" else None
-    batch_size = 5000
-    total_synced = 0
-
-    while True:
-        async with await get_source_conn() as source_conn:
-            async with source_conn.cursor(row_factory=dict_row) as cur:
-                cols = ", ".join(config.ingest.columns)
-                where_clause = f"({config.ingest.filter.replace('%', '%%')})" if config.ingest.filter else "TRUE"
-
-                if last_id is None:
-                    await cur.execute(
-                        f"SELECT {cols} FROM {config.ingest.table} WHERE {where_clause} ORDER BY {config.ingest.p_key} ASC LIMIT %s",
-                        (batch_size,),
-                    )
+                    await wait_until(try_create_subscription, timeout=30.0, interval=3.0)
                 else:
-                    await cur.execute(
-                        f"SELECT {cols} FROM {config.ingest.table} WHERE {where_clause} AND {config.ingest.p_key} > %s ORDER BY {config.ingest.p_key} ASC LIMIT %s",
-                        (last_id, batch_size),
-                    )
-                rows = await cur.fetchall()
+                    await cur.execute(f"ALTER SUBSCRIPTION {sub_name} ENABLE")
+                    await cur.execute(f"ALTER SUBSCRIPTION {sub_name} REFRESH PUBLICATION")
 
-        if not rows:
-            break
 
-        async with await get_sink_conn() as sink_conn:
-            await sink_conn.set_autocommit(True)
-            async with sink_conn.cursor() as cur:
-                col_names = list(rows[0].keys())
-                placeholders = ", ".join(["%s"] * len(col_names))
-                update_set = ", ".join([f"{c} = EXCLUDED.{c}" for c in col_names if c != config.ingest.p_key])
-                upsert_query = f"""
-                    INSERT INTO {config.ingest.table} ({', '.join(col_names)})
-                    VALUES ({placeholders})
-                    ON CONFLICT ({config.ingest.p_key}) DO UPDATE SET {update_set}
-                """
-                data = [tuple(row.values()) for row in rows]
-                await cur.executemany(upsert_query, data)
 
-        last_id = rows[-1][config.ingest.p_key]
-        total_synced += len(rows)
-        await update_replica_state(settings, target_name, last_id=str(last_id))
-    logger.info(f"Catch-up complete for {target_name}: {total_synced} rows.")
 
 
 async def find_and_fix_ghost_records(settings: Settings, config: SearchPipeline, target_name: str):
-    """Anti-Entropy sweep to find and delete hard-deleted records."""
+    """Scan for drifting or missing records in the sink."""
+    source_type = settings.sources[config.ingest.source].type if config.ingest.source in settings.sources else "postgres"
+    if source_type != "postgres":
+        logger.info(f"Skipping anti-entropy sweep for non-Postgres source: {config.ingest.source}")
+        return
+
     logger.info(f"Starting Anti-Entropy sweep for {target_name}...")
     
     # Pre-flight readiness check to avoid race conditions in tests
@@ -1337,7 +1249,7 @@ async def find_and_fix_ghost_records(settings: Settings, config: SearchPipeline,
             except Exception as e:
                 logger.warning(f"Failed to discover ID range from sink: {e}")
             
-    async with await get_source_conn() as s_conn:
+    async with await get_source_conn(config.ingest.source) as s_conn:
         async with s_conn.cursor() as s_cur:
             try:
                 await s_cur.execute(f"SELECT {config.ingest.p_key} FROM {config.ingest.table} ORDER BY {config.ingest.p_key} ASC LIMIT 1")
@@ -1355,7 +1267,9 @@ async def find_and_fix_ghost_records(settings: Settings, config: SearchPipeline,
         logger.debug(f"No records found for anti-entropy in {target_name}")
         return
 
-    source_types = await get_source_column_types(settings, config)
+    from .source import get_source_adapter
+    adapter = get_source_adapter(config.ingest.source)
+    source_types = await adapter.get_table_columns(config.ingest.table)
     id_type = source_types.get(config.ingest.p_key, "TEXT")
 
     # Ensure all IDs are of the same type for comparison
@@ -1368,7 +1282,7 @@ async def find_and_fix_ghost_records(settings: Settings, config: SearchPipeline,
 
     # 2. Strategy: Set Comparison for UUIDs/Strings or Small Tables
     if id_type not in ("INT", "BIGINT"):
-        async with await get_source_conn() as s_conn:
+        async with await get_source_conn(config.ingest.source) as s_conn:
             async with s_conn.cursor() as s_cur:
                 await s_cur.execute(f"SELECT {config.ingest.p_key} FROM {config.ingest.table}")
                 source_ids = set(r[0] for r in await s_cur.fetchall())
@@ -1391,7 +1305,7 @@ async def find_and_fix_ghost_records(settings: Settings, config: SearchPipeline,
     logger.info(f"Starting Anti-Entropy bit_xor sweep for {target_name} range {min_id}-{max_id}")
     for start_id in range(min_id, max_id + 1, chunk_size):
         end_id = start_id + chunk_size
-        async with await get_source_conn() as s_conn:
+        async with await get_source_conn(config.ingest.source) as s_conn:
             async with s_conn.cursor() as s_cur:
                 await s_cur.execute(f"SELECT count(*), bit_xor({config.ingest.p_key}) FROM {config.ingest.table} WHERE {config.ingest.p_key} BETWEEN %s AND %s", (start_id, end_id))
                 s_count, s_xor = await s_cur.fetchone()
@@ -1404,7 +1318,7 @@ async def find_and_fix_ghost_records(settings: Settings, config: SearchPipeline,
         
         if s_count != k_count or s_xor != k_xor:
             logger.info(f"Drift detected in range {start_id}-{end_id} for {target_name}. Performing deep check...")
-            async with await get_source_conn() as s_conn:
+            async with await get_source_conn(config.ingest.source) as s_conn:
                 async with s_conn.cursor() as s_cur:
                     await s_cur.execute(f"SELECT {config.ingest.p_key} FROM {config.ingest.table} WHERE {config.ingest.p_key} BETWEEN %s AND %s", (start_id, end_id))
                     s_ids = set(r[0] for r in await s_cur.fetchall())
@@ -1469,27 +1383,9 @@ async def drop_subscription_completely(settings: Settings, config: SearchPipelin
         logger.warning(f"teardown sink error: {e}")
 
     try:
-        async with await connect_db(settings.source_url) as conn:
+        async with await get_source_conn(config.ingest.source) as conn:
             await conn.set_autocommit(True)
             async with conn.cursor() as cur:
                 await cur.execute("SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = %s", (sub_name,))
                 await cur.execute(f"SELECT pg_drop_replication_slot('{sub_name}')")
     except Exception as e: logger.warning(f"teardown source error: {e}")
-
-
-async def check_and_protect_source(settings: Settings, target_name: str) -> float:
-    """Monitor lag and self-destruct if needed."""
-    sub_name = f"sub_{target_name}"
-    config = settings.pipelines[target_name]
-    try:
-        async with await get_source_conn() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) / 1024 / 1024 FROM pg_replication_slots WHERE slot_name = %s", (sub_name,))
-                res = await cur.fetchone()
-                if res and float(res[0]) > settings.max_slot_wal_keep_size_mb:
-                    await drop_subscription_completely(settings, config, target_name)
-                    raise RuntimeError("Self-destructed to protect Source DB.")
-                return float(res[0]) if res else 0.0
-    except Exception as e:
-        if "Self-destructed" in str(e): raise
-        return 0.0

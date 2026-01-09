@@ -2,7 +2,15 @@ import pytest
 import asyncio
 from pg_replica.client import PGSearchReplica 
 from pg_replica.config import SearchPipeline, IngestConfig, PipelineConfig, StorageConfig, EmbeddingConfig
-from pg_replica.database import connect_db, check_slot_exists, check_and_protect_source, dict_row, find_and_fix_ghost_records
+from pg_replica.database import connect_db, dict_row, find_and_fix_ghost_records
+
+async def check_slot_exists(settings, target_name):
+    """Local helper to check slot existence via adapter."""
+    from pg_replica.source import get_source_adapter
+    pipeline = settings.pipelines[target_name]
+    adapter = get_source_adapter(pipeline.ingest.source)
+    state = await adapter.discovery_state()
+    return f"sub_{target_name}" in state.get("slots", [])
 
 @pytest.mark.asyncio
 async def test_uuid_recovery_flow(clean_db, robust_slot_cleanup, internal_source_url, source_conn, sink_conn, wait_for_pgai_sync):

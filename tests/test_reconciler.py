@@ -1,11 +1,11 @@
 import pytest
-from pg_replica.config import Settings, SearchPipeline, IngestConfig, PipelineConfig, StorageConfig, EmbeddingConfig, ChunkingConfig, PostgresStoreConfig, BranchConfig, MirrorConfig
+from pg_replica.config import Settings, SearchPipeline, IngestConfig, PipelineConfig, StorageConfig, EmbeddingConfig, ChunkingConfig, PostgresStoreConfig, BranchConfig, MirrorConfig, PostgresSourceConfig
 from pg_replica.reconciler import Planner, ActionType
 
 
 def test_planner_no_drift():
     settings = Settings(
-        source_url="postgresql://localhost/src",
+        sources={"default": PostgresSourceConfig(connection_url="postgresql://localhost/src")},
         sink_url="postgresql://localhost/sink",
         pipelines={
             "t1": SearchPipeline(
@@ -21,10 +21,11 @@ def test_planner_no_drift():
     config = settings.pipelines["t1"]
     v_id = config.get_version_id()
 
-    source_state = {
+    source_state = {"default": {
+        "is_reachable": True,
         "publications": {f"pub_t1": {"tables": {"table1": {"rowfilter": None}}}},
         "slots": {f"sub_t1"},
-    }
+    }}
     sink_state = {
         "extensions": {"ai", "vector"},
         "tables": {
@@ -55,7 +56,7 @@ def test_planner_no_drift():
 
 def test_planner_missing_column():
     settings = Settings(
-        source_url="postgresql://localhost/src",
+        sources={"default": PostgresSourceConfig(connection_url="postgresql://localhost/src")},
         sink_url="postgresql://localhost/sink",
         pipelines={
             "t1": SearchPipeline(
@@ -71,10 +72,11 @@ def test_planner_missing_column():
     config = settings.pipelines["t1"]
     v_id = config.get_version_id()
 
-    source_state = {
+    source_state = {"default": {
+        "is_reachable": True,
         "publications": {f"pub_t1": {"tables": {"table1": {"rowfilter": None}}}},
         "slots": {f"sub_t1"},
-    }
+    }}
     sink_state = {
         "extensions": {"ai", "vector"},
         "tables": {
@@ -99,7 +101,7 @@ def test_planner_model_change_triggers_view_swap():
     # Simulate a drift by having the in-memory config differ from the 'state'
     # Here we define the "new" desire state
     settings = Settings(
-        source_url="postgresql://localhost/src",
+        sources={"default": PostgresSourceConfig(connection_url="postgresql://localhost/src")},
         sink_url="postgresql://localhost/sink",
         pipelines={
             "t1": SearchPipeline(
@@ -114,10 +116,11 @@ def test_planner_model_change_triggers_view_swap():
     planner = Planner(settings)
     config = settings.pipelines["t1"]
 
-    source_state = {
+    source_state = {"default": {
+        "is_reachable": True,
         "publications": {f"pub_t1": {"tables": {"table1": {"rowfilter": None}}}},
         "slots": {f"sub_t1"},
-    }
+    }}
     sink_state = {
         "extensions": {"ai", "vector"},
         "tables": {
@@ -146,7 +149,7 @@ def test_planner_model_change_triggers_view_swap():
 
 def test_planner_missing_slot_triggers_recovery():
     settings = Settings(
-        source_url="postgresql://localhost/src",
+        sources={"default": PostgresSourceConfig(connection_url="postgresql://localhost/src")},
         sink_url="postgresql://localhost/sink",
         pipelines={
             "t1": SearchPipeline(
@@ -162,10 +165,11 @@ def test_planner_missing_slot_triggers_recovery():
     config = settings.pipelines["t1"]
     v_id = config.get_version_id()
 
-    source_state = {
+    source_state = {"default": {
+        "is_reachable": True,
         "publications": {f"pub_t1": {"tables": {"table1": {"rowfilter": None}}}},
         "slots": set(),  # Missing slot
-    }
+    }}
     sink_state = {
         "extensions": {"ai", "vector"},
         "tables": {
@@ -195,7 +199,7 @@ def test_planner_missing_slot_triggers_recovery():
 def test_planner_deferred_swap():
     """Verify that promotion is skipped if target is NOT synced."""
     settings = Settings(
-        source_url="postgresql://localhost/src",
+        sources={"default": PostgresSourceConfig(connection_url="postgresql://localhost/src")},
         sink_url="postgresql://localhost/sink",
         pipelines={
             "t1": SearchPipeline(
@@ -213,10 +217,11 @@ def test_planner_deferred_swap():
     v_id = config.get_version_id()
     expected_target = f"{config.ingest.table}_store_v{v_id}"
 
-    source_state = {
+    source_state = {"default": {
+        "is_reachable": True,
         "publications": {f"pub_t1": {"tables": {"table1": {"rowfilter": None}}}},
         "slots": {f"sub_t1"},
-    }
+    }}
     sink_state = {
         "extensions": {"ai", "vector"},
         "tables": {

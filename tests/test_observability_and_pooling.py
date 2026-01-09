@@ -77,7 +77,7 @@ async def test_connection_pool_lifecycle():
     # Use default settings from global_settings (already patched in conftest if needed)
     await init_pools(settings)
     try:
-        source_conn_ctx = await get_source_conn()
+        source_conn_ctx = await get_source_conn("default")
         sink_conn_ctx = await get_sink_conn()
 
         async with source_conn_ctx as conn:

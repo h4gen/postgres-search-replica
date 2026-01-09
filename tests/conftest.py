@@ -19,8 +19,10 @@ def event_loop():
 
 @pytest.fixture
 def internal_source_url():
-    return global_settings.source_url.replace("localhost:5433", "source:5432") \
-                                     .replace("127.0.0.1:5433", "source:5432")
+    # Fallback to default source for tests
+    url = global_settings.sources["default"].connection_url
+    return url.replace("localhost:5433", "source:5432") \
+              .replace("127.0.0.1:5433", "source:5432")
 
 @pytest.fixture
 async def sink_conn():
@@ -29,7 +31,8 @@ async def sink_conn():
 
 @pytest.fixture
 async def source_conn():
-    async with await connect_db(global_settings.source_url, autocommit=True) as conn:
+    url = global_settings.sources["default"].connection_url
+    async with await connect_db(url, autocommit=True) as conn:
         yield conn
 
 @pytest.fixture

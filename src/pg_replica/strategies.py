@@ -1,7 +1,7 @@
 import abc
 import logging
 from typing import Any, Dict, List, Optional
-from .config import SearchPipeline
+from .config import SearchPipeline, Settings
 from .database import dict_row
 
 logger = logging.getLogger(__name__)
@@ -15,7 +15,8 @@ class SearchStrategy(abc.ABC):
         limit: int, 
         config: SearchPipeline,
         conn_provider: Any,
-        target_name: str
+        target_name: str,
+        settings: Settings
     ) -> List[Dict[str, Any]]:
         """Execute search using the specific engine."""
         pass
@@ -29,7 +30,8 @@ class PostgresSearchStrategy(SearchStrategy):
         limit: int, 
         config: SearchPipeline,
         conn_provider: Any,
-        target_name: str
+        target_name: str,
+        settings: Settings
     ) -> List[Dict[str, Any]]:
         replica_table = f"{target_name}_search"
         conn = await conn_provider()
@@ -92,10 +94,17 @@ class QdrantSearchStrategy(SearchStrategy):
         limit: int, 
         config: SearchPipeline,
         conn_provider: Any,
-        target_name: str
+        target_name: str,
+        settings: Settings
     ) -> List[Dict[str, Any]]:
         # Find mirror config for Qdrant
-        mirror = next((m for m in config.storage.mirrors if m.type == "qdrant"), None)
+        # Resolve mirror IDs from config.storage.mirrors using settings.mirrors
+        mirror = None
+        for m_id in config.storage.mirrors:
+            if m_id in settings.mirrors and settings.mirrors[m_id].type == "qdrant":
+                mirror = settings.mirrors[m_id]
+                break
+        
         if not mirror:
             raise ValueError(f"No Qdrant mirror configured for table '{config.ingest.table}'")
         

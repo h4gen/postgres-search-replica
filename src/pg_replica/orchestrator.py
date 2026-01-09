@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import subprocess
+import psycopg
 from datetime import timedelta
 from typing import Optional
 
@@ -8,7 +9,6 @@ from .config import Settings
 from .reconciler import Reconciler
 from .database import (
     drop_subscription_completely,
-    check_and_protect_source,
     connect_db,
     init_pools,
     close_pools,
@@ -125,14 +125,19 @@ class Orchestrator:
     async def _replication_loop(self):
         """Main loop for the replicator daemon logic."""
         logger.info("Starting replication watchdog...")
+        from .source import get_source_adapter
         while not self._stop_event.is_set():
             for name in list(self.settings.pipelines.keys()):
+                config = self.settings.pipelines[name]
                 try:
-                    lag_mb = await check_and_protect_source(self.settings, name)
+                    adapter = get_source_adapter(config.ingest.source)
+                    lag_mb = await adapter.monitor_lag(name, self.settings.max_slot_wal_keep_size_mb)
                     update_replication_lag(name, lag_mb)
                 except RuntimeError as e:
                     if "Self-destructed" in str(e):
                         logger.critical(f"Replicator target {name} stopped: {e}")
+                        # Final protection: drop the subscription to ensure the slot is gone
+                        await drop_subscription_completely(self.settings, config, name)
                         logger.info(f"Attempting to auto-heal {name} in 2s...")
                         try:
                             await asyncio.sleep(2.0)
@@ -161,6 +166,13 @@ class Orchestrator:
             except asyncio.CancelledError:
                 logger.info(f"Worker {name} cancelled.")
                 break
+            except psycopg.errors.ForeignKeyViolation as e:
+                # This happens if the vectorizer was deleted while the worker was running (e.g. self-destruct)
+                logger.warning(f"Worker {name} encountered likely shutdown race (FK Violation): {e}. Restarting...")
+                try:
+                    await asyncio.sleep(2.0)
+                except asyncio.CancelledError:
+                    break
             except Exception as e:
                 logger.error(f"Worker {name} crashed: {e}. Restarting in 2s...", exc_info=True)
                 try:
