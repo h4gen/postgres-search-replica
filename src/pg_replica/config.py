@@ -10,6 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # --- CONFIG: Sources & Mirrors ---
 class SourceConfig(BaseModel):
     type: Literal["postgres"] = "postgres"
+    strategy: Literal["cdc", "polling"] = "cdc"
     connection_url: str
 
 class MirrorConfig(BaseModel):

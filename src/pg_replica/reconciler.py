@@ -7,13 +7,9 @@ from .config import SearchPipeline
 from .source import get_source_adapter
 from .database import (
     get_sink_conn,
-    get_source_column_types,
-    setup_source,
     setup_state_table,
-    ensure_sink_raw_table,
     setup_sink,
-    create_placeholder_slot,
-    run_sql_catchup,
+    get_replica_state,
     find_and_fix_ghost_records,
     update_replica_state,
     warm_up_from_cache,
@@ -235,40 +231,12 @@ class Inspector:
 
         for source_id in self.settings.sources.keys():
             logger.debug(f"Inspecting source: {source_id}")
-            state: Dict[str, Any] = {
-                "publications": {},
-                "slots": set(),
-                "is_reachable": False,
-            }
             try:
-                # We need to pass source_id to get_source_conn
-                # NOTE: database.get_source_conn signature must support source_id
                 source_adapter = get_source_adapter(source_id)
-                async with source_adapter.get_connection() as conn:
-                    state["is_reachable"] = True
-                    async with conn.cursor() as cur:
-                        # Get publications and their tables/where clauses
-                        await cur.execute(
-                            """
-                            SELECT pubname, rowfilter, tablename
-                            FROM pg_publication_tables 
-                            WHERE schemaname = 'public'
-                            """
-                        )
-                        for pubname, rowfilter, tablename in await cur.fetchall():
-                            if pubname not in state["publications"]:
-                                state["publications"][pubname] = {"tables": {}}
-                            state["publications"][pubname]["tables"][tablename] = {"rowfilter": rowfilter}
-
-                        await cur.execute("SELECT slot_name FROM pg_replication_slots")
-                        state["slots"] = {r[0] for r in await cur.fetchall()}
-                        logger.debug(f"Discovered source slots for {source_id}: {state['slots']}")
-            
+                all_states[source_id] = await source_adapter.discovery_state()
             except Exception as e:
-                logger.error(f"Failed to inspect source {source_id}: {e}")
-                state["error"] = str(e)
-            
-            all_states[source_id] = state
+                logger.error(f"Failed to discover state for source {source_id}: {e}")
+                all_states[source_id] = {"is_reachable": False, "publications": {}, "slots": set(), "error": str(e)}
             
         return all_states
 
@@ -355,6 +323,7 @@ class Planner:
             replica_state = sink_state["replica_states"].get(name)
             current_hash = replica_state["config_hash"] if replica_state else None
 
+
             # 2.1 Source Publication Setup
             # Determine which source this pipeline uses
             source_id = config.ingest.source
@@ -370,37 +339,47 @@ class Planner:
                 # For now, we allow sink planning (vectorizers etc) but skip source actions.
                 # However, slot check (Action 2.3) depends on source.
             else:
-                needs_source_setup = False
-                if pub_name not in this_source_state["publications"]:
-                    needs_source_setup = True
-                else:
-                    pub_tables = this_source_state["publications"][pub_name]["tables"]
-                    if config.ingest.table not in pub_tables:
-                        needs_source_setup = True
-                    else:
-                        current_filter = pub_tables[config.ingest.table]["rowfilter"]
-                        desired_filter = (
-                            f"({config.ingest.filter})"
-                            if config.ingest.filter
-                            else None
-                        )
-                        if current_filter != desired_filter:
+                # 2.1 Source Setup (Publication/Indices)
+                source_config = self.settings.sources.get(source_id)
+                if source_config:
+                    needs_source_setup = False
+                    if source_config.strategy == "cdc":
+                        if pub_name not in this_source_state.get("publications", {}):
                             needs_source_setup = True
-
-                if needs_source_setup:
-                    if self.settings.source_managed_by_admin:
-                        logger.warning(
-                            f"Publication {pub_name} drift detected and source is admin-managed."
-                        )
+                        else:
+                            pub_tables = this_source_state["publications"][pub_name]["tables"]
+                            if config.ingest.table not in pub_tables:
+                                needs_source_setup = True
+                            else:
+                                current_filter = pub_tables[config.ingest.table]["rowfilter"]
+                                desired_filter = (
+                                    f"({config.ingest.filter})"
+                                    if config.ingest.filter
+                                    else None
+                                )
+                                if current_filter != desired_filter:
+                                    needs_source_setup = True
                     else:
-                        actions.append(
-                            Action(
-                                type=ActionType.SOURCE_SETUP,
-                                description=f"Setup/Update publication {pub_name} for {config.ingest.table}",
-                                params={},
-                                target_name=name,
+                        # For Polling, we always call setup periodically or once? 
+                        # Let's say we call it once to verify indices if not already done.
+                        # For now, let's just assume we always call it to be safe, 
+                        # as it's a lightweight index check.
+                        needs_source_setup = True
+
+                    if needs_source_setup:
+                        if self.settings.source_managed_by_admin and source_config.strategy == "cdc":
+                            logger.warning(
+                                f"Publication {pub_name} drift detected and source is admin-managed."
                             )
-                        )
+                        else:
+                            actions.append(
+                                Action(
+                                    type=ActionType.SOURCE_SETUP,
+                                    description=f"Setup/Update source {source_id} ({source_config.strategy}) for {config.ingest.table}",
+                                    params={},
+                                    target_name=name,
+                                )
+                            )
 
             # 2.2 Sink Table Evolution (Raw Table)
             raw_table = config.ingest.table
@@ -441,20 +420,22 @@ class Planner:
             )
 
             # 2.3 Recovery (Slot check)
-            # Only check slots if source is reachable
+            # Only check slots if source is reachable and using CDC
             if this_source_state and this_source_state.get("is_reachable"):
-                if sub_name not in this_source_state["slots"]:
-                    actions.append(
-                        Action(
-                            type=ActionType.SINK_RECOVERY,
-                            description=f"Perform hybrid recovery for {name} (missing slot {sub_name} on {source_id})",
-                            params={},
-                            target_name=name,
+                strategy = source_config.strategy if source_config else "cdc"
+                if strategy == "cdc":
+                    if sub_name not in this_source_state.get("slots", set()):
+                        actions.append(
+                            Action(
+                                type=ActionType.SINK_RECOVERY,
+                                description=f"Perform hybrid recovery for {name} (missing slot {sub_name} on {source_id})",
+                                params={},
+                                target_name=name,
+                            )
                         )
-                    )
+                # For Polling, we might want a SINK_RECOVERY if the table is empty 
+                # but we'll let the worker handle it for now.
 
-            # 2.4 Vectorizer Setup (State-Based)
-            # We ALWAYS ensure the vectorizer for this config exists, even if not active.
             vectorizers = sink_state.get("vectorizers", {}).get(raw_table, [])
             expected_vectorizer_target = f"{raw_table}_store_v{version_id}"
             
@@ -725,7 +706,14 @@ class Applier:
 
 
                 if action.type == ActionType.SOURCE_SETUP:
-                    await setup_source(self.settings, config, target_name)
+                    source_id = config.ingest.source
+                    adapter = get_source_adapter(source_id)
+                    await adapter.prepare_sync(
+                        target_name,
+                        table_name=config.ingest.table,
+                        columns=config.ingest.columns,
+                        p_key=config.ingest.p_key
+                    )
 
                 elif action.type == ActionType.SINK_STATE_INIT:
                     # This could be triggered for a specific table or globally
@@ -734,13 +722,31 @@ class Applier:
 
                 elif action.type == ActionType.SINK_TABLE_EVOLVE:
                     table = action.params["table"]
+                    source_id = config.ingest.source
+                    adapter = get_source_adapter(source_id)
+
                     if action.params["mode"] == "create":
-                        await ensure_sink_raw_table(self.settings, config)
+                        # Logic migrated from ensure_sink_raw_table
+                        source_types = await adapter.get_table_columns(config.ingest.table)
+                        async with await get_sink_conn() as conn:
+                            await conn.set_autocommit(True)
+                            async with conn.cursor() as cur:
+                                cols_sql = []
+                                for col in config.ingest.columns:
+                                    dtype = source_types.get(col, "TEXT")
+                                    if col == config.ingest.p_key:
+                                        cols_sql.append(f"{col} {dtype} PRIMARY KEY")
+                                    else:
+                                        cols_sql.append(f"{col} {dtype}")
+
+                                await cur.execute(
+                                    f"CREATE TABLE IF NOT EXISTS {table} ({', '.join(cols_sql)})"
+                                )
                     else:
                         source_types = (
                             {"config_hash": "TEXT"}
                             if table == "_replica_state"
-                            else await get_source_column_types(self.settings, config)
+                            else await adapter.get_table_columns(config.ingest.table)
                         )
 
                         async with await get_sink_conn() as conn:
@@ -800,10 +806,59 @@ class Applier:
                     await log_experiment_finish(self.settings, target_name, action.params["version_id"])
 
                 elif action.type == ActionType.SINK_RECOVERY:
-                    lsn = await create_placeholder_slot(self.settings, target_name)
+                    source_id = config.ingest.source
+                    adapter = get_source_adapter(source_id)
+                    
+                    # 1. Source Slot Setup (if CDC)
+                    lsn = "0"
+                    if hasattr(adapter, "create_slot"):
+                        lsn = await adapter.create_slot(f"sub_{target_name}")
+                    
+                    # 2. Update Sink state
                     await update_replica_state(self.settings, target_name, lsn=lsn)
-                    await run_sql_catchup(self.settings, config, target_name)
-                    # Anti-entropy cleanup
+                    
+                    # 3. Catch-up Sync
+                    # Logic moved from run_sql_catchup but optimized to use adapter fetch
+                    
+                    last_id_str, _ = await get_replica_state(self.settings, target_name)
+                    last_id = last_id_str if last_id_str != "0" else None
+                    batch_size = 5000
+                    total_synced = 0
+                    
+                    while True:
+                        rows = await adapter.fetch_batch(
+                            config.ingest.table,
+                            config.ingest.columns,
+                            config.ingest.p_key,
+                            last_id,
+                            batch_size,
+                            filter_str=config.ingest.filter
+                        )
+                        if not rows:
+                            break
+                        
+                        async with await get_sink_conn() as sink_conn:
+                            await sink_conn.set_autocommit(True)
+                            async with sink_conn.cursor() as cur:
+                                col_names = list(rows[0].keys())
+                                placeholders = ", ".join(["%s"] * len(col_names))
+                                update_set = ", ".join([f"{c} = EXCLUDED.{c}" for c in col_names if c != config.ingest.p_key])
+                                upsert_query = f"""
+                                    INSERT INTO {config.ingest.table} ({', '.join(col_names)})
+                                    VALUES ({placeholders})
+                                    ON CONFLICT ({config.ingest.p_key}) DO UPDATE SET {update_set}
+                                """
+                                data = [tuple(row.values()) for row in rows]
+                                await cur.executemany(upsert_query, data)
+                        
+                        last_id = rows[-1][config.ingest.p_key]
+                        total_synced += len(rows)
+                        await update_replica_state(self.settings, target_name, last_id=str(last_id))
+                    
+                    logger.info(f"Catch-up complete for {target_name}: {total_synced} rows.")
+                    
+                    # 4. Anti-entropy cleanup
+                    from .database import find_and_fix_ghost_records
                     await find_and_fix_ghost_records(self.settings, config, target_name)
 
                 elif action.type == ActionType.SINK_CACHE_SETUP:

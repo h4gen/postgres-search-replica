@@ -138,89 +138,7 @@ async def is_replication_slot_active(slot_name: str, on_source: bool = True, sou
 
 async def is_publication_valid(pub_name: str, source_id: str = "default") -> bool:
     """Check if a publication exists on the Source DB."""
-    async with await get_source_conn(source_id) as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("SELECT 1 FROM pg_publication WHERE pubname = %s", (pub_name,))
-            return await cur.fetchone() is not None
 
-
-async def get_source_column_types(
-    settings: Settings, config: SearchPipeline
-) -> Dict[str, str]:
-    """Query the Source DB's information_schema to get column types."""
-    logger.info(
-        f"Detecting column types for {config.ingest.table} on source..."
-    )
-    
-    # Pre-flight readiness check to avoid race conditions in tests
-    if not await wait_for_source_table(settings, config):
-        raise RuntimeError(f"Source table {config.ingest.table} not found after timeout")
-
-    async with await get_source_conn(config.ingest.source) as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                SELECT column_name, data_type, udt_name
-                FROM information_schema.columns 
-                WHERE table_name = %s 
-                AND column_name = ANY(%s)
-                """,
-                (config.ingest.table, config.ingest.columns),
-            )
-            rows = await cur.fetchall()
-            # Map data_type to something we can use in CREATE TABLE
-            types = {}
-            for name, dtype, udt in rows:
-                if udt == "uuid":
-                    types[name] = "UUID"
-                elif dtype == "integer":
-                    types[name] = "INT"
-                elif dtype == "bigint":
-                    types[name] = "BIGINT"
-                elif "character" in dtype or dtype == "text":
-                    types[name] = "TEXT"
-                else:
-                    types[name] = dtype
-            return types
-
-
-async def setup_source(settings: Settings, config: SearchPipeline, target_name: str):
-    """Remotely initialize the source publication."""
-    pub_name = f"pub_{target_name}"
-    print(f"DEBUG: setup_source called for {pub_name}")
-    logger.info(f"Setting up remote source publication {pub_name}...")
-    
-    # Pre-flight readiness check to avoid race conditions in tests
-    if not await wait_for_source_table(settings, config):
-        raise RuntimeError(f"Source table {config.ingest.table} not found after timeout")
-
-    async with await get_source_conn(config.ingest.source) as conn:
-        await conn.set_autocommit(True)
-        async with conn.cursor() as cur:
-            cols = ", ".join(config.ingest.columns)
-            where_clause = (
-                f" WHERE ({config.ingest.filter})"
-                if config.ingest.filter
-                else ""
-            )
-
-            # Ensure publication exists (idempotent check)
-            await cur.execute(
-                f"SELECT 1 FROM pg_publication WHERE pubname = '{pub_name}'"
-            )
-            if not await cur.fetchone():
-                logger.info(
-                    f"Creating publication {pub_name} on Source for columns ({cols}){where_clause}..."
-                )
-                await cur.execute(
-                    f"CREATE PUBLICATION {pub_name} FOR TABLE {config.ingest.table} ({cols}){where_clause}"
-                )
-            else:
-                logger.debug(f"Publication {pub_name} exists. Updating definition...")
-                await cur.execute(
-                    f"ALTER PUBLICATION {pub_name} SET TABLE {config.ingest.table} ({cols}){where_clause}"
-                )
-            await conn.commit()
 
 
 async def setup_state_table(settings: Settings, target_name: str):
@@ -389,9 +307,6 @@ async def get_replica_state(
                     str(row[1]) if row[1] is not None else None
                 )
             return None, None
-
-
-    return statuses
 
 
 async def get_source_health(settings: Settings) -> dict:
@@ -1029,74 +944,6 @@ async def warm_up_from_cache(
             )
 
 
-async def check_slot_exists(settings: Settings, target_name: str) -> bool:
-    """Check if the replication slot exists on the configured Source DB."""
-    sub_name = f"sub_{target_name}"
-    source_id = "default"
-    if target_name in settings.pipelines:
-        source_id = settings.pipelines[target_name].ingest.source
-    
-    async with await get_source_conn(source_id) as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT 1 FROM pg_replication_slots WHERE slot_name = %s",
-                (sub_name,),
-            )
-            return await cur.fetchone() is not None
-
-
-async def create_placeholder_slot(settings: Settings, target_name: str) -> str:
-    """Create a logical replication slot on Source and return its consistent LSN."""
-    sub_name = f"sub_{target_name}"
-    source_id = "default"
-    if target_name in settings.pipelines:
-        source_id = settings.pipelines[target_name].ingest.source
-        
-    logger.info(f"Creating placeholder replication slot {sub_name} on Source ({source_id})...")
-    async with await get_source_conn(source_id) as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT restart_lsn FROM pg_replication_slots WHERE slot_name = %s",
-                (sub_name,),
-            )
-            res = await cur.fetchone()
-            if res:
-                lsn = str(res[0])
-                logger.info(f"Slot already exists at LSN: {lsn}")
-                return lsn
-
-            await cur.execute(
-                "SELECT lsn FROM pg_create_logical_replication_slot(%s, 'pgoutput', false, true)",
-                (sub_name,),
-            )
-            res = await cur.fetchone()
-            if not res:
-                raise RuntimeError("Failed to create replication slot")
-            lsn = str(res[0])
-            logger.info(f"Created slot at LSN: {lsn}")
-            return lsn
-
-
-async def ensure_sink_raw_table(settings: Settings, config: SearchPipeline):
-    """Ensure the raw table exists in the Sink DB with correct types."""
-    target = config.ingest.table
-    source_types = await get_source_column_types(settings, config)
-    async with await get_sink_conn() as conn:
-        await conn.set_autocommit(True)
-        async with conn.cursor() as cur:
-            cols_sql = []
-            for col in config.ingest.columns:
-                dtype = source_types.get(col, "TEXT")
-                if col == config.ingest.p_key:
-                    cols_sql.append(f"{col} {dtype} PRIMARY KEY")
-                else:
-                    cols_sql.append(f"{col} {dtype}")
-
-            await cur.execute(
-                f"CREATE TABLE IF NOT EXISTS {target} ({', '.join(cols_sql)})"
-            )
-
-
 async def setup_sink(
     settings: Settings,
     config: SearchPipeline,
@@ -1109,7 +956,9 @@ async def setup_sink(
     target = config.ingest.table
 
     await setup_state_table(settings, target_name)
-    source_types = await get_source_column_types(settings, config)
+    from .source import get_source_adapter
+    adapter = get_source_adapter(config.ingest.source)
+    source_types = await adapter.get_table_columns(config.ingest.table)
 
     async with await get_sink_conn() as conn:
         await conn.set_autocommit(True)
@@ -1228,7 +1077,14 @@ async def setup_sink(
                     )
                     return True
                 except Exception as e:
-                    if "does not exist" in str(e):
+                    err_msg = str(e).lower()
+                    if "column" in err_msg and "does not exist" in err_msg:
+                        # Specific configuration error (e.g. wrong content_column)
+                        # We must fail fast here to avoid spinning for 20s
+                        logger.error(f"Permanent configuration error in vectorizer: {e}")
+                        raise e
+                    if "does not exist" in err_msg:
+                        # Common transient error during bootstrap or schema migration
                         logger.warning(f"Relation not yet visible to pgai, retrying: {e}")
                         return False
                     raise e
@@ -1252,124 +1108,94 @@ async def setup_sink(
                 """
             )
 
-            # Subscription
-            await cur.execute(f"SELECT 1 FROM pg_subscription WHERE subname = '{sub_name}'")
-            if not await cur.fetchone():
-                last_id, last_lsn = await get_replica_state(settings, target_name)
-                slot_exists_on_source = await check_slot_exists(settings, target_name)
-                
-                copy_data = "false" if (slot_exists_on_source or last_id != "0" or last_lsn is not None) else "true"
-                options_dict = settings.subscription_options.copy()
-                options_dict["copy_data"] = f"'{copy_data}'"
-                if slot_exists_on_source:
-                    options_dict["create_slot"] = "false"
+            # Subscription (CDC Only)
+            strategy = settings.sources[config.ingest.source].strategy if config.ingest.source in settings.sources else "cdc"
+            
+            if strategy == "cdc":
+                await cur.execute(f"SELECT 1 FROM pg_subscription WHERE subname = '{sub_name}'")
+                if not await cur.fetchone():
+                    last_id, last_lsn = await get_replica_state(settings, target_name)
+                    
+                    slot_exists_on_source = False
+                    source_id = "default"
+                    if target_name in settings.pipelines:
+                        source_id = settings.pipelines[target_name].ingest.source
+                    
+                    async with await get_source_conn(source_id) as conn:
+                        async with conn.cursor() as cur_slot_check:
+                            await cur_slot_check.execute(
+                                "SELECT 1 FROM pg_replication_slots WHERE slot_name = %s",
+                                (sub_name,),
+                            )
+                            slot_exists_on_source = await cur_slot_check.fetchone() is not None
 
-                options = ", ".join([f"{k} = {v}" for k, v in options_dict.items()])
-                # Give Source catalog a moment to settle after any recent drops
-                await asyncio.sleep(2.0)
+                    copy_data = "false" if (slot_exists_on_source or last_id != "0" or last_lsn is not None) else "true"
+                    options_dict = settings.subscription_options.copy()
+                    options_dict["copy_data"] = f"'{copy_data}'"
+                    if slot_exists_on_source:
+                        options_dict["create_slot"] = "false"
 
-                # Force release any zombie worker using this slot on the Source
-                if slot_exists_on_source:
-                    try:
-                        async with await get_source_conn(config.ingest.source) as s_conn:
-                            async with s_conn.cursor() as s_cur:
-                                await s_cur.execute(
-                                    "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = %s",
-                                    (sub_name,),
-                                )
-                    except Exception as e:
-                        logger.warning(f"Failed to force release slot {sub_name} on source: {e}")
+                    options = ", ".join([f"{k} = {v}" for k, v in options_dict.items()])
+                    # Give Source catalog a moment to settle after any recent drops
+                    await asyncio.sleep(2.0)
 
-                # Retry loop for subscription to handle source-side visibility lag
-                async def try_create_subscription():
-                    try:
-                        # Resolve connection URL for Docker networking
-                        source_url = settings.sources[config.ingest.source].connection_url
-                        # Fix for container-to-container networking
-                        # Host sees localhost:5433, but Sink container needs source:5432
-                        sub_conn_url = source_url.replace("localhost:5433", "source:5432") \
-                                                 .replace("127.0.0.1:5433", "source:5432") \
-                                                 .replace("localhost", "source") \
-                                                 .replace("127.0.0.1", "source")
+                    # Force release any zombie worker using this slot on the Source
+                    if slot_exists_on_source:
+                        try:
+                            async with await get_source_conn(config.ingest.source) as s_conn:
+                                async with s_conn.cursor() as s_cur:
+                                    await s_cur.execute(
+                                        "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = %s",
+                                        (sub_name,),
+                                    )
+                        except Exception as e:
+                            logger.warning(f"Failed to force release slot {sub_name} on source: {e}")
 
-                        await cur.execute(
-                            f"""
-                            CREATE SUBSCRIPTION {sub_name} 
-                            CONNECTION '{sub_conn_url}' 
-                            PUBLICATION {pub_name}
-                            WITH ({options})
-                            """
-                        )
-                        return True
-                    except Exception as e:
-                        err_msg = str(e).lower()
-                        if "already exists" in err_msg:
+                    # Retry loop for subscription to handle source-side visibility lag
+                    async def try_create_subscription():
+                        try:
+                            # Resolve connection URL for Docker networking
+                            source_url = settings.sources[config.ingest.source].connection_url
+                            # Fix for container-to-container networking
+                            # Host sees localhost:5433, but Sink container needs source:5432
+                            sub_conn_url = source_url.replace("localhost:5433", "source:5432") \
+                                                     .replace("127.0.0.1:5433", "source:5432") \
+                                                     .replace("localhost", "source") \
+                                                     .replace("127.0.0.1", "source")
+
+                            await cur.execute(
+                                f"""
+                                CREATE SUBSCRIPTION {sub_name} 
+                                CONNECTION '{sub_conn_url}' 
+                                PUBLICATION {pub_name}
+                                WITH ({options})
+                                """
+                            )
                             return True
-                        if "in use" in err_msg:
-                            # One more attempt to kick the zombie
-                            try:
-                                async with await get_source_conn(config.ingest.source) as s_conn:
-                                    async with s_conn.cursor() as s_cur:
-                                        await s_cur.execute(
-                                            "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = %s",
-                                            (sub_name,),
-                                        )
-                            except Exception: pass
-                        logger.warning(f"Subscription creation for {sub_name} failed, will retry: {e}")
-                        return False
+                        except Exception as e:
+                            err_msg = str(e).lower()
+                            if "already exists" in err_msg:
+                                return True
+                            if "in use" in err_msg:
+                                # One more attempt to kick the zombie
+                                try:
+                                    async with await get_source_conn(config.ingest.source) as s_conn:
+                                        async with s_conn.cursor() as s_cur:
+                                            await s_cur.execute(
+                                                "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = %s",
+                                                (sub_name,),
+                                            )
+                                except Exception: pass
+                            logger.warning(f"Subscription creation for {sub_name} failed, will retry: {e}")
+                            return False
 
-                await wait_until(try_create_subscription, timeout=30.0, interval=3.0)
-            else:
-                await cur.execute(f"ALTER SUBSCRIPTION {sub_name} ENABLE")
-                await cur.execute(f"ALTER SUBSCRIPTION {sub_name} REFRESH PUBLICATION")
-
-
-async def run_sql_catchup(settings: Settings, config: SearchPipeline, target_name: str):
-    """Perform Keyset Pagination for catch-up."""
-    last_id_str, _ = await get_replica_state(settings, target_name)
-    last_id = last_id_str if last_id_str != "0" else None
-    batch_size = 5000
-    total_synced = 0
-
-    while True:
-        async with await get_source_conn(config.ingest.source) as source_conn:
-            async with source_conn.cursor(row_factory=dict_row) as cur:
-                cols = ", ".join(config.ingest.columns)
-                where_clause = f"({config.ingest.filter.replace('%', '%%')})" if config.ingest.filter else "TRUE"
-
-                if last_id is None:
-                    await cur.execute(
-                        f"SELECT {cols} FROM {config.ingest.table} WHERE {where_clause} ORDER BY {config.ingest.p_key} ASC LIMIT %s",
-                        (batch_size,),
-                    )
+                    await wait_until(try_create_subscription, timeout=30.0, interval=3.0)
                 else:
-                    await cur.execute(
-                        f"SELECT {cols} FROM {config.ingest.table} WHERE {where_clause} AND {config.ingest.p_key} > %s ORDER BY {config.ingest.p_key} ASC LIMIT %s",
-                        (last_id, batch_size),
-                    )
-                rows = await cur.fetchall()
+                    await cur.execute(f"ALTER SUBSCRIPTION {sub_name} ENABLE")
+                    await cur.execute(f"ALTER SUBSCRIPTION {sub_name} REFRESH PUBLICATION")
 
-        if not rows:
-            break
 
-        async with await get_sink_conn() as sink_conn:
-            await sink_conn.set_autocommit(True)
-            async with sink_conn.cursor() as cur:
-                col_names = list(rows[0].keys())
-                placeholders = ", ".join(["%s"] * len(col_names))
-                update_set = ", ".join([f"{c} = EXCLUDED.{c}" for c in col_names if c != config.ingest.p_key])
-                upsert_query = f"""
-                    INSERT INTO {config.ingest.table} ({', '.join(col_names)})
-                    VALUES ({placeholders})
-                    ON CONFLICT ({config.ingest.p_key}) DO UPDATE SET {update_set}
-                """
-                data = [tuple(row.values()) for row in rows]
-                await cur.executemany(upsert_query, data)
 
-        last_id = rows[-1][config.ingest.p_key]
-        total_synced += len(rows)
-        await update_replica_state(settings, target_name, last_id=str(last_id))
-    logger.info(f"Catch-up complete for {target_name}: {total_synced} rows.")
 
 
 async def find_and_fix_ghost_records(settings: Settings, config: SearchPipeline, target_name: str):
@@ -1418,7 +1244,9 @@ async def find_and_fix_ghost_records(settings: Settings, config: SearchPipeline,
         logger.debug(f"No records found for anti-entropy in {target_name}")
         return
 
-    source_types = await get_source_column_types(settings, config)
+    from .source import get_source_adapter
+    adapter = get_source_adapter(config.ingest.source)
+    source_types = await adapter.get_table_columns(config.ingest.table)
     id_type = source_types.get(config.ingest.p_key, "TEXT")
 
     # Ensure all IDs are of the same type for comparison
@@ -1538,21 +1366,3 @@ async def drop_subscription_completely(settings: Settings, config: SearchPipelin
                 await cur.execute("SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = %s", (sub_name,))
                 await cur.execute(f"SELECT pg_drop_replication_slot('{sub_name}')")
     except Exception as e: logger.warning(f"teardown source error: {e}")
-
-
-async def check_and_protect_source(settings: Settings, target_name: str) -> float:
-    """Monitor lag and self-destruct if needed."""
-    sub_name = f"sub_{target_name}"
-    config = settings.pipelines[target_name]
-    try:
-        async with await get_source_conn(config.ingest.source) as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) / 1024 / 1024 FROM pg_replication_slots WHERE slot_name = %s", (sub_name,))
-                res = await cur.fetchone()
-                if res and float(res[0]) > settings.max_slot_wal_keep_size_mb:
-                    await drop_subscription_completely(settings, config, target_name)
-                    raise RuntimeError("Self-destructed to protect Source DB.")
-                return float(res[0]) if res else 0.0
-    except Exception as e:
-        if "Self-destructed" in str(e): raise
-        return 0.0

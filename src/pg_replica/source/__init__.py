@@ -2,18 +2,21 @@ from typing import Dict, Optional, Type
 import logging
 from ..config import SourceConfig, Settings
 from .base import BaseSourceAdapter
-from .postgres import PostgresSourceAdapter
+from .postgres import PostgresCDCAdapter, PostgresPollingAdapter
 
 logger = logging.getLogger(__name__)
 
 # Registry of initialized adapters
 _adapters: Dict[str, BaseSourceAdapter] = {}
 
-def get_adapter_class(type: str) -> Type[BaseSourceAdapter]:
-    """Factory mapping config type to Adapter Class."""
+def get_adapter_class(type: str, strategy: str) -> Type[BaseSourceAdapter]:
+    """Factory mapping config type and strategy to Adapter Class."""
     if type == "postgres":
-        return PostgresSourceAdapter
-    raise ValueError(f"Unknown source type: {type}")
+        if strategy == "cdc":
+            return PostgresCDCAdapter
+        elif strategy == "polling":
+            return PostgresPollingAdapter
+    raise ValueError(f"Unknown source type/strategy: {type}/{strategy}")
 
 async def init_source_adapters(settings: Settings) -> None:
     """Initialize all source adapters defined in settings."""
@@ -21,7 +24,7 @@ async def init_source_adapters(settings: Settings) -> None:
     
     for name, config in settings.sources.items():
         if name not in _adapters:
-            adapter_cls = get_adapter_class(config.type)
+            adapter_cls = get_adapter_class(config.type, config.strategy)
             adapter = adapter_cls(name, config)
             await adapter.connect()
             _adapters[name] = adapter
