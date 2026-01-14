@@ -34,8 +34,22 @@ PGAI_PENDING_ITEMS = _get_or_create_gauge(
     "pgai_pending_items", "Number of items pending in pgai vectorizer", ["table"]
 )
 
+from contextlib import asynccontextmanager
+from pg_replica.database import init_pools, close_pools
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Initialize DB pools on startup
+    try:
+        await init_pools(settings)
+    except Exception as e:
+        logger.error(f"Failed to initialize DB pools: {e}")
+    yield
+    # Clean up on shutdown
+    await close_pools()
+
 # FastAPI App
-app = FastAPI(title="Search Replica Observability")
+app = FastAPI(title="Search Replica Observability", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -71,8 +85,8 @@ async def control_plane_summary():
         "projections": projections,
         "config_summaries": {
             k: {
-                "search_profile": v.search_profile,
-                "model": v.embedding_model,
+                "search_profile": v.serve.profiles.get(v.serve.default_profile, {}).mode if v.serve.default_profile in v.serve.profiles else "unknown",
+                "model": v.pipeline.embedding.model,
                 "version_id": v.get_version_id(),
                 "generation": getattr(v, "_generation", 0)
             } for k, v in settings.pipelines.items()
@@ -86,8 +100,10 @@ async def update_config(target_name: str, config: SearchPipeline):
     Apply a new configuration for a table.
     Runs admission validation (Dry Run) before persisting.
     """
-    if target_name not in settings.pipelines:
-        raise HTTPException(status_code=404, detail=f"Target {target_name} not found in current settings")
+    # If target doesn't exist, we allow creating it.
+    # if target_name not in settings.pipelines:
+    #    raise HTTPException(status_code=404, detail=f"Target {target_name} not found in current settings")
+    pass
 
     # 1. Admission Control / Dry Run
     inspector = Inspector(settings)
@@ -95,7 +111,7 @@ async def update_config(target_name: str, config: SearchPipeline):
     sink_state = await inspector.get_sink_state()
     
     # Temporarily override to see if it plans correctly
-    orig_config = settings.pipelines[target_name]
+    orig_config = settings.pipelines.get(target_name)
     settings.pipelines[target_name] = config
     
     planner = Planner(settings)
@@ -103,15 +119,24 @@ async def update_config(target_name: str, config: SearchPipeline):
         actions = planner.plan(source_state, sink_state)
         # If planning succeeds, we consider it valid for now
     except Exception as e:
-        settings.pipelines[target_name] = orig_config
+        if orig_config:
+            settings.pipelines[target_name] = orig_config
+        else:
+            settings.pipelines.pop(target_name, None)
         raise HTTPException(status_code=400, detail=f"Configuration rejected by Planner: {e}")
     finally:
         # Restore original config for the main process loop
-        settings.pipelines[target_name] = orig_config
+        if orig_config:
+            settings.pipelines[target_name] = orig_config
+        else:
+            settings.pipelines.pop(target_name, None)
 
     # 2. Persist
     generation = await save_table_config(settings, target_name, config)
     
+    # 3. Update In-Memory State (Critical for subsequent reads like promote)
+    settings.pipelines[target_name] = config
+
     return {
         "status": "accepted",
         "target_name": target_name,
@@ -121,39 +146,131 @@ async def update_config(target_name: str, config: SearchPipeline):
     }
 
 
-@app.get("/control-plane/dry-run/{target_name}")
+@app.post("/control-plane/dry-run/{target_name}")
 async def dry_run(target_name: str, config: SearchPipeline = None):
     """
     Preview actions and resource projections for a proposed configuration.
     If no config provided, uses the latest one from DB or Settings.
     """
-    if target_name not in settings.pipelines:
-        raise HTTPException(status_code=404, detail=f"Target {target_name} not found")
+    if target_name not in settings.pipelines and not config:
+        raise HTTPException(status_code=404, detail=f"Target {target_name} not found and no config provided")
 
     target_config = config or settings.pipelines[target_name]
     
     inspector = Inspector(settings)
-    source_state = await inspector.get_source_state()
-    sink_state = await inspector.get_sink_state()
-    
+    try:
+        source_state = await inspector.get_source_state()
+        sink_state = await inspector.get_sink_state()
+    except Exception as e:
+        logger.warning(f"DB Inspection failed: {e}. Proceeding with empty state (Offline Mode).")
+        source_state = {"tables": {}, "publications": {}}
+        sink_state = {"tables": {}, "vectorizers": {}}
+
+    inspector = Inspector(settings) # Re-init might be needed if stateful, but it's not.
+    # Actually we just needed the states.
+
     # Override
-    orig_config = settings.pipelines[target_name]
+    orig_config = settings.pipelines.get(target_name)
     settings.pipelines[target_name] = target_config
     
     planner = Planner(settings)
     actions = planner.plan(source_state, sink_state)
     
     # Projections
-    projections = await get_resource_projections(settings, target_config)
+    try:
+        projections = await get_resource_projections(settings, target_config)
+    except Exception:
+        projections = {}
     
     # Restore
-    settings.pipelines[target_name] = orig_config
+    if orig_config:
+        settings.pipelines[target_name] = orig_config
+    else:
+        # If it was new, remove it to clean up
+        settings.pipelines.pop(target_name, None)
     
     return {
         "target_name": target_name,
         "actions": [a.description for a in actions],
         "projections": projections
     }
+
+
+@app.post("/control-plane/promote/{target_name}/{branch_name}")
+async def promote_branch(target_name: str, branch_name: str):
+    """
+    SearchOps: Atomic Promotion of a Branch to Live.
+    Clones branch config to parent and removes the branch.
+    """
+    # 1. Get current config
+    current_config = settings.pipelines.get(target_name)
+    if not current_config:
+        # Try to fetch from DB if not in memory
+        db_config_row = await get_latest_table_config(settings, target_name)
+        if not db_config_row:
+             raise HTTPException(status_code=404, detail=f"Pipeline {target_name} not found")
+        current_config = SearchPipeline.model_validate(db_config_row["config_json"])
+
+    # 2. Find the branch
+    branch = next((b for b in current_config.storage.branches if b.name == branch_name), None)
+    if not branch:
+         raise HTTPException(status_code=404, detail=f"Branch '{branch_name}' not found for pipeline '{target_name}'")
+
+    # 3. Create promoted config
+    promoted_config = current_config.model_copy(deep=True)
+    promoted_config.pipeline = branch.pipeline.model_copy(deep=True)
+    
+    # 4. Remove the branch from storage
+    promoted_config.storage.branches = [b for b in promoted_config.storage.branches if b.name != branch_name]
+
+    # 5. Admission Control (Dry Run)
+    inspector = Inspector(settings)
+    source_state = await inspector.get_source_state()
+    sink_state = await inspector.get_sink_state()
+    
+    planner = Planner(settings)
+    try:
+        # Temporarily inject to plan
+        settings.pipelines[target_name] = promoted_config
+        actions = planner.plan(source_state, sink_state)
+    except Exception as e:
+        settings.pipelines[target_name] = current_config # Restore
+        raise HTTPException(status_code=400, detail=f"Promotion rejected by Planner: {e}")
+    finally:
+        settings.pipelines[target_name] = current_config # Restore
+
+    # 6. Persist
+    generation = await save_table_config(settings, target_name, promoted_config)
+    
+    # 7. Update In-Memory State
+    settings.pipelines[target_name] = promoted_config
+    
+    return {
+        "status": "accepted",
+        "target_name": target_name,
+        "promoted_branch": branch_name,
+        "generation": generation,
+        "actions_planned": len(actions),
+        "config": promoted_config.model_dump()
+    }
+
+
+@app.post("/control-plane/settings")
+async def update_settings(updates: dict):
+    """
+    Update global settings (e.g. max_slot_wal_keep_size_mb).
+    """
+    try:
+        # Update properites on the existing settings object
+        for k, v in updates.items():
+            if hasattr(settings, k) and k != "pipelines": # pipelines handled separately
+                 setattr(settings, k, v)
+        
+        logger.info(f"Updated global settings: {updates.keys()}")
+        return {"status": "updated", "updated_keys": list(updates.keys())}
+    except Exception as e:
+        logger.error(f"Failed to update settings: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 def update_replication_lag(table_name: str, lag_mb: float):

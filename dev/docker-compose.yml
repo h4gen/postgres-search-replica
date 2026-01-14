@@ -5,7 +5,7 @@ services:
       POSTGRES_PASSWORD: password
       POSTGRES_DB: production_db
     # Enable logical replication on the source
-    command: ["postgres", "-c", "wal_level=logical"]
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=50"]
     volumes:
       - ./source_mock.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
@@ -24,8 +24,8 @@ services:
     environment:
       POSTGRES_PASSWORD: password
       POSTGRES_DB: search_replica_db
-      # Using 'local' tells PGSearchReplica to manage its own isolated Postgres
-      SINK_URL: local
+      # Point to the container's internal Postgres with the correct DB
+      SINK_URL: postgresql://postgres:password@localhost:5432/search_replica_db
       # We still need the internal source URL for the subscription
       SUBSCRIPTION_SOURCE_URL: postgresql://postgres:password@source:5432/production_db
       SOURCE_URL: postgresql://postgres:password@source:5432/production_db
@@ -35,8 +35,10 @@ services:
     depends_on:
       - source
       - ollama
+    command: ["/uv/bin/uv", "run", "python", "-m", "pg_replica.main"]
     ports:
-      - "5434:54322"
+      - "5434:5432"
+      - "8000:8000"
     restart: always
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -h localhost -p 54322"]

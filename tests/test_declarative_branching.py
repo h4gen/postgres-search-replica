@@ -3,6 +3,7 @@ import asyncio
 import pytest
 from pg_replica.config import (
     Settings,
+    settings as global_settings,
     SearchPipeline,
     IngestConfig,
     PipelineConfig,
@@ -57,11 +58,9 @@ async def test_declarative_branching_e2e(clean_db, internal_source_url):
         )
     )
 
-    settings = Settings(
-        source_url=os.environ.get("SOURCE_URL", "postgresql://postgres:postgres@localhost:5433/production_db"),
-        sink_url=os.environ.get("SINK_URL", "postgresql://postgres:postgres@localhost:5433/sink"),
-        pipelines={"products": config}
-    )
+    # Use global settings for connectivity, but override pipelines
+    settings = global_settings.model_copy()
+    settings.pipelines = {"products": config}
 
     await init_pools(settings)
     

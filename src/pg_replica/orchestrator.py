@@ -27,6 +27,7 @@ class Orchestrator:
         self._pg_process: Optional[subprocess.Popen] = None
         self._tasks: list[asyncio.Task] = []
         self._stop_event = asyncio.Event()
+        self._reconcile_lock = asyncio.Lock()
 
     async def _is_port_open(self, port: int) -> bool:
         try:
@@ -136,7 +137,8 @@ class Orchestrator:
                         logger.info(f"Attempting to auto-heal {name} in 2s...")
                         try:
                             await asyncio.sleep(2.0)
-                            await self.reconciler.reconcile()
+                            async with self._reconcile_lock:
+                                await self.reconciler.reconcile()
                             logger.info(f"Auto-heal for {name} successful.")
                         except Exception as re:
                             logger.error(f"Auto-heal failed: {re}")
@@ -146,6 +148,25 @@ class Orchestrator:
             await self._log_pgai_status()
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                continue
+
+    async def _controller_loop(self):
+        """
+        Main Control Loop (Kubernetes Style).
+        Periodically reconciles Desired State (DB) with Actual State.
+        """
+        logger.info("Starting controller loop (2s period)...")
+        while not self._stop_event.is_set():
+            try:
+                # Use lock to prevent race with auto-heal or manual triggers
+                async with self._reconcile_lock:
+                    await self.reconciler.reconcile()
+            except Exception as e:
+                logger.error(f"Controller loop error: {e}")
+            
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=2.0)
             except asyncio.TimeoutError:
                 continue
 
@@ -217,6 +238,7 @@ class Orchestrator:
         ))
         
         self._tasks.append(asyncio.create_task(self._replication_loop(), name="watchdog"))
+        self._tasks.append(asyncio.create_task(self._controller_loop(), name="controller"))
 
     async def stop(self):
         """Gracefully stop all services."""

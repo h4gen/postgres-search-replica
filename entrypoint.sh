@@ -4,6 +4,19 @@
 # Ensure we use the right PYTHONPATH for our package
 export PYTHONPATH=$PYTHONPATH:/app/src
 
+# Start Postgres in background (using original entrypoint)
+/usr/local/bin/docker-entrypoint.sh postgres &
+
+# Wait for Postgres to be ready
+echo "Waiting for Postgres..."
+for i in {1..30}; do
+    if pg_isready -h localhost -U postgres; then
+        echo "Postgres is ready!"
+        break
+    fi
+    sleep 1
+done
+
 # If a custom command is provided, run it
 if [ $# -gt 0 ]; then
     echo "Running custom command: $@"

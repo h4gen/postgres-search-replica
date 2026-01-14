@@ -6,7 +6,7 @@ import uvicorn
 from typing import Callable
 from pythonjsonlogger.json import JsonFormatter
 from .config import settings
-from .reconciler import Reconciler
+from .orchestrator import Orchestrator
 from .database import (
     drop_subscription_completely,
     connect_db,
@@ -76,47 +76,38 @@ async def run_daemon(loop: asyncio.AbstractEventLoop, handle_exit: Callable[[], 
 
 async def main():
     loop = asyncio.get_running_loop()
-    await init_pools(settings)
-
+    
+    # 1. Start Control Plane API
     config = uvicorn.Config(observability_app, host=settings.observability_host, port=settings.observability_port, log_level="error")
     server = uvicorn.Server(config)
     server_task = asyncio.create_task(server.serve())
 
-    reconciler = Reconciler(settings)
+    # 2. Start Orchestrator (Manages DB, Workers, Reconciliation)
+    orchestrator = Orchestrator(settings)
     
-    async def try_reconcile():
-        try:
-            await reconciler.reconcile()
-            return True
-        except Exception as e:
-            logger.warning(f"Reconciliation attempt failed: {e}")
-            return False
-
-    try:
-        await wait_until(try_reconcile, timeout=60.0, interval=5.0, message="Failed to reconcile search infrastructure")
-    except asyncio.TimeoutError as e:
-        logger.critical(str(e))
-        await close_pools()
-        return
-
+    # Handle Shutdown
     def handle_exit():
         logger.info("Shutdown signal received...")
-        task.cancel()
         server.should_exit = True
+        asyncio.create_task(orchestrator.stop())
 
-    task = asyncio.create_task(run_daemon(loop, handle_exit))
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, handle_exit)
 
+    # 3. Running
+    logger.info("Starting PGSearchReplica Orchestrator...")
     try:
-        await task
-    except asyncio.CancelledError:
-        logger.info("Daemon task cancelled.")
-    finally:
-        for name, config_obj in settings.pipelines.items():
-            await drop_subscription_completely(settings, config_obj, name)
-        await close_pools()
+        await orchestrator.start()
+        # Wait for API server to finish (it finishes on SIGTERM)
         await server_task
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.critical(f"Orchestrator failed: {e}")
+        await orchestrator.stop()
+        sys.exit(1)
+    finally:
+        await orchestrator.stop()
 
 
 if __name__ == "__main__":

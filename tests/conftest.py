@@ -39,6 +39,19 @@ async def clean_db(sink_conn, source_conn):
     """
     logger.info("FIXTURE: clean_db starting...")
     
+    # 0. Terminate Existing Backends (NUCLEAR OPTION)
+    # This prevents AccessExclusiveLock contension from zombie workers/Orchestrators
+    async with sink_conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT pg_terminate_backend(pid) 
+            FROM pg_stat_activity 
+            WHERE datname = current_database() 
+              AND pid <> pg_backend_pid()
+              AND application_name != 'test_suite' 
+            """
+        )
+
     # 1. Drop Search Views
     async with sink_conn.cursor() as cur:
         await cur.execute(
@@ -84,8 +97,12 @@ async def clean_db(sink_conn, source_conn):
             DECLARE r RECORD;
             BEGIN
                 FOR r IN (SELECT subname FROM pg_subscription) LOOP
-                    EXECUTE 'ALTER SUBSCRIPTION ' || quote_ident(r.subname) || ' DISABLE';
-                    EXECUTE 'ALTER SUBSCRIPTION ' || quote_ident(r.subname) || ' SET (slot_name = NONE)';
+                    BEGIN
+                        EXECUTE 'ALTER SUBSCRIPTION ' || quote_ident(r.subname) || ' DISABLE';
+                        EXECUTE 'ALTER SUBSCRIPTION ' || quote_ident(r.subname) || ' SET (slot_name = NONE)';
+                    EXCEPTION WHEN OTHERS THEN
+                        RAISE NOTICE 'Skipping subscription % cleanup due to error: %', r.subname, SQLERRM;
+                    END;
                     EXECUTE 'DROP SUBSCRIPTION IF EXISTS ' || quote_ident(r.subname) || ' CASCADE';
                 END LOOP;
             END $$;
@@ -95,6 +112,21 @@ async def clean_db(sink_conn, source_conn):
     # 4. Truncate Control Plane
     try:
         await sink_conn.execute("TRUNCATE TABLE _replica_state, _replica_config_history, _sink_outbox, _sink_mirror_registry CASCADE")
+    except Exception: pass
+    
+    # 5. Drop Source Slots (Nuclear)
+    # This prevents 'all replication slots are in use' errors
+    try:
+        async with source_conn.cursor() as cur:
+            await cur.execute("SELECT slot_name, active, active_pid FROM pg_replication_slots")
+            slots = await cur.fetchall()
+            for slot, active, pid in slots:
+                try:
+                    if active and pid:
+                        await cur.execute("SELECT pg_terminate_backend(%s)", (pid,))
+                        await asyncio.sleep(0.1)
+                    await cur.execute("SELECT pg_drop_replication_slot(%s)", (slot,))
+                except Exception: pass
     except Exception: pass
 
     yield

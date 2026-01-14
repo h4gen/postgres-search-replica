@@ -14,56 +14,13 @@ from pg_replica.reconciler import ActionType
 
 logger = logging.getLogger(__name__)
 
-async def robust_cleanup(settings):
-    """Aggressively clear all slots and subscriptions for clean test state."""
-    from pg_replica.database import connect_db, get_source_conn
-    import asyncio
-    
-    # 1. Clear Sink subscriptions
-    try:
-        async with await connect_db(settings.resolved_sink_url) as conn:
-            await conn.set_autocommit(True)
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT subname FROM pg_subscription")
-                subs = [r[0] for r in await cur.fetchall()]
-                for sub in subs:
-                    logger.info(f"Cleaning up subscription {sub}...")
-                    try:
-                        await cur.execute(f"ALTER SUBSCRIPTION {sub} DISABLE")
-                        await cur.execute(f"ALTER SUBSCRIPTION {sub} SET (slot_name = NONE)")
-                        await cur.execute(f"DROP SUBSCRIPTION IF EXISTS {sub}")
-                    except Exception: pass
-    except Exception: pass
-    
-    # 3. Clear Control Plane History (Prevent Zombies)
-    try:
-        async with await connect_db(settings.resolved_sink_url) as conn:
-            await conn.set_autocommit(True)
-            await conn.execute("TRUNCATE _replica_config_history CASCADE")
-    except Exception: pass
-
-    # 2. Clear Source slots
-    try:
-        async with await connect_db(settings.source_url) as conn:
-            await conn.set_autocommit(True)
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT slot_name, active, active_pid FROM pg_replication_slots")
-                slots = await cur.fetchall()
-                for slot, active, pid in slots:
-                    logger.info(f"Cleaning up slot {slot}...")
-                    if active and pid:
-                        try: await cur.execute("SELECT pg_terminate_backend(%s)", (pid,))
-                        except Exception: pass
-                    try: await cur.execute("SELECT pg_drop_replication_slot(%s)", (slot,))
-                    except Exception: pass
-    except Exception: pass
-    await asyncio.sleep(1)
+# Removed local robust_cleanup in favor of conftest.py's clean_db
 
 def get_internal_source_url(settings):
     return settings.source_url.replace("localhost:5433", "source:5432").replace("127.0.0.1:5433", "source:5432")
 
 @pytest.mark.asyncio
-async def test_dynamic_config_override():
+async def test_dynamic_config_override(clean_db):
     """Verify that the Reconciler picks up config changes from the DB."""
     from unittest.mock import patch
     from pg_replica.database import init_pools, close_pools
@@ -82,9 +39,11 @@ async def test_dynamic_config_override():
     )
     
     with patch.dict("os.environ", {"SUBSCRIPTION_SOURCE_URL": get_internal_source_url(global_settings)}):
-        # Pass Pipelines via constructor
-        replica = PGSearchReplica(pipelines={target_name: base_config})
-        await robust_cleanup(replica.settings) # CLEANUP FIRST
+        # Pass Pipelines via constructor, using global settings to ensure correct ports
+        settings = global_settings.model_copy()
+        settings.pipelines = {target_name: base_config}
+        replica = PGSearchReplica(verbose=True, **settings.model_dump())
+        # clean_db fixture already ran, but we need to init pools for the test
         await init_pools(replica.settings)
         reconciler = Reconciler(replica.settings)
         
@@ -125,7 +84,7 @@ async def test_dynamic_config_override():
             await close_pools()
 
 @pytest.mark.asyncio
-async def test_reconciliation_locking():
+async def test_reconciliation_locking(clean_db):
     """Verify that two Reconcilers cannot run simultaneously (Advisory Lock)."""
     from pg_replica.database import init_pools, close_pools
     replica = PGSearchReplica()
@@ -144,7 +103,7 @@ async def test_reconciliation_locking():
         await close_pools()
 
 @pytest.mark.asyncio
-async def test_failed_config_status():
+async def test_failed_config_status(clean_db):
     """Verify that if reconciliation fails, the status is updated to 'Failed'."""
     from unittest.mock import patch
     from pg_replica.database import init_pools, close_pools
@@ -161,14 +120,19 @@ async def test_failed_config_status():
         )
     )
     
-    replica = PGSearchReplica(pipelines={target_name: base_config})
-    await robust_cleanup(replica.settings) # CLEANUP FIRST
+    settings = global_settings.model_copy()
+    settings.pipelines = {target_name: base_config}
+    replica = PGSearchReplica(verbose=True, **settings.model_dump())
+    # clean_db fixture handles cleanup
     await init_pools(replica.settings)
+    
     reconciler = Reconciler(replica.settings)
     
     try:
-        # Insert a config that we'll try to apply
-        gen = await save_table_config(replica.settings, target_name, base_config)
+        # Patch the lock ID to avoid conflicts with previous tests
+        with patch("pg_replica.database.RECONCILER_ADVISORY_LOCK_ID", 999999):
+            # Insert a config that we'll try to apply
+            gen = await save_table_config(replica.settings, target_name, base_config)
         
         # Mock planning to ALWAYS return one action for our target
         mock_action = Action(

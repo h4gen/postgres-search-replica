@@ -44,12 +44,18 @@ async def test_full_replication_flow(clean_db, robust_slot_cleanup, internal_sou
             # 4. Verify Raw Replication
             found = False
             for _ in range(10):
+                import psycopg
                 async with sink_conn.cursor() as cur:
-                    await cur.execute(f"SELECT count(*) FROM {config.ingest.table} WHERE name = 'SuperGadget'")
-                    if (await cur.fetchone())[0] > 0:
-                        found = True
-                        break
-                await asyncio.sleep(1)
+                    # Robust wait for table creation
+                    for _ in range(30):
+                        try:
+                            await cur.execute(f"SELECT count(*) FROM {config.ingest.table} WHERE name = 'SuperGadget'")
+                            if (await cur.fetchone())[0] > 0:
+                                found = True
+                                break
+                        except psycopg.errors.UndefinedTable:
+                            pass
+                        await asyncio.sleep(1)
             assert found, "Native replication failed"
 
             # 5. Verify pgai Vectorization
@@ -188,10 +194,17 @@ async def test_blue_green_swap(clean_db, robust_slot_cleanup, internal_source_ur
         }
         async with PGSearchReplica(sync=True, **new_config) as replica:
             # Reconciler runs on startup
-            async with sink_conn.cursor() as cur:
-                await cur.execute("SELECT table_name FROM information_schema.view_table_usage WHERE view_name = 'swap_search' AND table_name LIKE '%%_embedding_v%%'")
-                row = await cur.fetchone()
-                v2 = row[0] if row else None
+            # Give the orchestrator time to pick up the change and reconcile
+            v2 = None
+            for _ in range(30):
+                async with sink_conn.cursor() as cur:
+                    await cur.execute("SELECT table_name FROM information_schema.view_table_usage WHERE view_name = 'swap_search' AND table_name LIKE '%%_embedding_v%%'")
+                    row = await cur.fetchone()
+                    current_v = row[0] if row else None
+                    if current_v and current_v != v1:
+                        v2 = current_v
+                        break
+                await asyncio.sleep(1)
                 
             assert v1 is not None and v2 is not None, f"Metadata views not created (v1={v1}, v2={v2})"
             assert v1 != v2, "Blue-Green swap failed"

@@ -3,7 +3,7 @@ import logging
 import pytest
 from qdrant_client import QdrantClient
 from pg_replica import connect
-from pg_replica.database import get_sink_conn, dict_row
+from pg_replica.database import get_sink_conn, dict_row, init_pools, close_pools
 
 logger = logging.getLogger(__name__)
 
@@ -64,57 +64,63 @@ async def test_universal_outbox_capture_and_sync():
         },
         sync=True
     ) as replica:
-        # 1. Wait for infrastructure to be ready
-        logger.info("Waiting for replica to be ready...")
-        await asyncio.sleep(5) 
+        # Initialize pools for backend function usage in test process (get_sink_conn)
+        await init_pools(replica.settings)
+        try:
+            # 1. Wait for infrastructure to be ready
+            logger.info("Waiting for replica to be ready...")
+            await asyncio.sleep(5) 
         
-        # 2. Insert data into Source
-        async with await connect_db(source_url_host) as conn:
-            await conn.execute(
-                "INSERT INTO products (name, description) VALUES (%s, %s)",
-                ("Outbox Test Product", "This product should end up in the outbox and then in Qdrant.")
-            )
-            await conn.commit()
+            # 2. Insert data into Source
+            async with await connect_db(source_url_host) as conn:
+                await conn.execute(
+                    "INSERT INTO products (name, description) VALUES (%s, %s)",
+                    ("Outbox Test Product", "This product should end up in the outbox and then in Qdrant.")
+                )
+                await conn.commit()
 
-        # 3. Verify transactional capture into _sink_outbox
-        # This will fail initially because _sink_outbox and triggers don't exist
-        logger.info("Checking _sink_outbox for captured changes...")
-        found_in_outbox = False
-        for _ in range(30):
-            try:
-                async with await get_sink_conn() as conn:
-                    async with conn.cursor(row_factory=dict_row) as cur:
-                        await cur.execute("SELECT count(*) FROM _sink_outbox")
-                        count = (await cur.fetchone())["count"]
-                        if count > 0:
-                            found_in_outbox = True
-                            break
-            except Exception as e:
-                logger.debug(f"Outbox not ready yet: {e}")
-            await asyncio.sleep(2)
-        
-        assert found_in_outbox, "Data was not captured in _sink_outbox"
+            # 3. Verify transactional capture into _sink_outbox
+            # This will fail initially because _sink_outbox and triggers don't exist
+            logger.info("Checking _sink_outbox for captured changes...")
+            found_in_outbox = False
+            for _ in range(30):
+                try:
+                    async with await get_sink_conn() as conn:
+                        async with conn.cursor(row_factory=dict_row) as cur:
+                            await cur.execute("SELECT count(*) FROM _sink_outbox")
+                            count = (await cur.fetchone())["count"]
+                            if count > 0:
+                                found_in_outbox = True
+                                break
+                except Exception as e:
+                    logger.debug(f"Outbox not ready yet: {e}")
+                await asyncio.sleep(2)
+            
+            assert found_in_outbox, "Data was not captured in _sink_outbox"
 
-        # 4. Verify downstream delivery to Qdrant
-        logger.info("Checking Qdrant for synced vectors...")
-        qdrant = QdrantClient("http://localhost:6333")
-        
-        found_in_qdrant = False
-        for _ in range(30):
-            try:
-                # We expect a collection named 'products_v...'
-                collections = qdrant.get_collections().collections
-                for col in collections:
-                    if col.name.startswith("test_products_"):
-                        points = qdrant.scroll(collection_name=col.name, limit=1)[0]
-                        if points:
-                            found_in_qdrant = True
-                            break
-                if found_in_qdrant: break
-            except Exception: pass
-            await asyncio.sleep(2)
+            # 4. Verify downstream delivery to Qdrant
+            logger.info("Checking Qdrant for synced vectors...")
+            qdrant = QdrantClient("http://localhost:6333")
+            
+            found_in_qdrant = False
+            for _ in range(30):
+                try:
+                    # We expect a collection named 'products_v...'
+                    collections = qdrant.get_collections().collections
+                    for col in collections:
+                        if col.name.startswith("test_products_"):
+                            points = qdrant.scroll(collection_name=col.name, limit=1)[0]
+                            if points:
+                                found_in_qdrant = True
+                                break
+                    if found_in_qdrant: break
+                except Exception: pass
+                await asyncio.sleep(2)
 
-        assert found_in_qdrant, "Data was not synced to Qdrant"
+            assert found_in_qdrant, "Data was not synced to Qdrant"
+            
+        finally:
+            await close_pools()
 
 async def connect_db(url):
     import psycopg

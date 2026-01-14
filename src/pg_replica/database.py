@@ -189,7 +189,6 @@ async def get_source_column_types(
 async def setup_source(settings: Settings, config: SearchPipeline, target_name: str):
     """Remotely initialize the source publication."""
     pub_name = f"pub_{target_name}"
-    print(f"DEBUG: setup_source called for {pub_name}")
     logger.info(f"Setting up remote source publication {pub_name}...")
     
     # Pre-flight readiness check to avoid race conditions in tests
@@ -434,11 +433,13 @@ async def get_vectorizer_statuses(settings: Settings) -> dict[str, int]:
             # 1. Try generic ai.vectorizer_status (pgai 0.4.0+)
             try:
                 await cur.execute(
-                    "SELECT source_table, pending_items FROM ai.vectorizer_status"
+                    "SELECT target_table, pending_items FROM ai.vectorizer_status"
                 )
                 rows = await cur.fetchall()
                 for table, pending in rows:
-                    statuses[table] = pending
+                    if table:
+                        # Strip schema if present (e.g. public.products_real -> products_real)
+                        statuses[table.split(".")[-1]] = pending
             except Exception:
                 # Fallback implementation if specific view unavailable
                 pass
@@ -495,6 +496,12 @@ async def get_pipeline_summary(settings: Settings) -> dict:
             await cur.execute("SELECT MAX(id) as max_id FROM _sink_outbox")
             row = await cur.fetchone()
             max_outbox_id = row["max_id"] if row and row["max_id"] else 0
+            
+            # 4. Get Active Search Views (for readiness checks)
+            await cur.execute(
+                "SELECT table_name FROM information_schema.views WHERE table_schema = 'public' AND table_name LIKE '%_search'"
+            )
+            summary["active_views"] = [r["table_name"] for r in await cur.fetchall()]
             
     return summary
 
@@ -592,7 +599,7 @@ async def audit_pipeline_failures(settings: Settings):
                         e.message, 
                         e.details
                     FROM ai.vectorizer_errors e
-                    JOIN ai.vectorizer v ON e.vectorizer_id = v.id
+                    JOIN ai.vectorizer v ON e.name = v.name
                     ON CONFLICT DO NOTHING
                     """
                 )
@@ -743,6 +750,35 @@ async def cleanup_vectorizer_infrastructure(
             """
             await cur.execute(cleanup_sql)
 
+
+async def ensure_sink_extensions(settings: Settings):
+    """Ensure required extensions (vector, pgai) are installed in the Sink DB."""
+    async with await get_sink_conn() as conn:
+        await conn.set_autocommit(True)
+        async with conn.cursor() as cur:
+            await cur.execute("CREATE EXTENSION IF NOT EXISTS vector CASCADE")
+            await cur.execute("CREATE EXTENSION IF NOT EXISTS pgai CASCADE")
+
+
+async def setup_state_table(settings: Settings):
+    """Ensure the state tracking table exists in the Sink DB."""
+    await ensure_sink_extensions(settings)
+    
+    async with await get_sink_conn() as conn:
+        await conn.set_autocommit(True)
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS _replica_state (
+                    key TEXT PRIMARY KEY,
+                    last_id TEXT,
+                    last_lsn TEXT,
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+                """
+            )
+            await cur.execute(cleanup_sql)
+
 async def atomic_view_swap(
     settings: Settings,
     config: SearchPipeline,
@@ -777,7 +813,11 @@ async def atomic_view_swap(
             f"Performing atomic view swap targeting {raw_table} (Profile: {config.storage.postgres.profile})..."
         )
 
-        await conn.set_autocommit(False)
+        # Check if we are already in a transaction
+        from psycopg.pq import TransactionStatus
+        if conn.info.transaction_status == TransactionStatus.IDLE:
+             await conn.set_autocommit(False)
+        
         try:
             async with conn.cursor() as cur:
                 await cur.execute(f"DROP VIEW IF EXISTS {target_name}_search")

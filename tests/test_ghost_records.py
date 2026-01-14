@@ -2,12 +2,12 @@ import pytest
 import asyncio
 import logging
 from pg_replica import PGSearchReplica, settings as global_settings
-from pg_replica.database import connect_db, find_and_fix_ghost_records
+from pg_replica.database import connect_db, find_and_fix_ghost_records, init_pools, close_pools
 
 logger = logging.getLogger(__name__)
 
 @pytest.mark.asyncio
-async def test_ghost_fix_uuid_regression(internal_source_url, robust_slot_cleanup, robust_subscription_cleanup, source_conn, sink_conn):
+async def test_ghost_fix_uuid_regression(internal_source_url, robust_slot_cleanup, robust_subscription_cleanup, source_conn, sink_conn, wait_for_pgai_sync):
     """Reproduce the NameError in find_and_fix_ghost_records with UUID IDs."""
     from unittest.mock import patch
     custom_settings = {
@@ -41,9 +41,17 @@ async def test_ghost_fix_uuid_regression(internal_source_url, robust_slot_cleanu
             # This SHOULD trigger Strategy 2 in find_and_fix_ghost_records
             # because ID type is UUID (non-numeric).
             
-            logger = logging.getLogger("pg_replica.database")
-            logger.info("Manually triggering anti-entropy sweep to check for NameError...")
-            
-            await find_and_fix_ghost_records(replica.settings, config, "uuid_ghost")
-            
-            logger.info("Anti-entropy sweep completed successfully.")
+            # Initialize pools for backend function usage in test process
+            await init_pools(replica.settings)
+            try:
+                logger = logging.getLogger("pg_replica.database")
+                logger.info("Manually triggering anti-entropy sweep to check for NameError...")
+                
+                # Wait for sync to ensure sink table exists
+                await wait_for_pgai_sync(replica.settings, "uuid_ghost", expected_count=1)
+                
+                await find_and_fix_ghost_records(replica.settings, config, "uuid_ghost")
+                
+                logger.info("Anti-entropy sweep completed successfully.")
+            finally:
+                await close_pools()

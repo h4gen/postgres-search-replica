@@ -12,6 +12,9 @@ TABLE_NAME = "products"
 
 @pytest.mark.asyncio
 async def test_declarative_blue_green_orchestration(clean_db, robust_slot_cleanup, internal_source_url, wait_for_pgai_sync):
+    import logging
+    logging.basicConfig(level=logging.DEBUG)
+    logging.getLogger("pg_replica").setLevel(logging.DEBUG)
     """
     Verifies the full lifecycle of a Blue-Green deployment using declarative state:
     1. Initial Deployment (v1, active=True) -> Wait for Sync -> View Created
@@ -53,11 +56,8 @@ async def test_declarative_blue_green_orchestration(clean_db, robust_slot_cleanu
     # Fix: Use fixture value instead of import
     os.environ["SUBSCRIPTION_SOURCE_URL"] = internal_source_url
 
-    settings = Settings(
-        source_url=source_url,
-        sink_url=sink_url,
-        pipelines={}
-    )
+    settings = global_settings.model_copy()
+    settings.pipelines = {}
     
     # Initialize connection pools
     await init_pools(settings)

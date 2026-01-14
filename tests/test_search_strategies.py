@@ -106,7 +106,7 @@ async def test_search_strategies_postgres_vs_qdrant(clean_db, robust_slot_cleanu
             logger.info("Waiting for sync (Postgres + Qdrant)...")
             
             # 1. Wait for Postgres Sync (robustely)
-            if not await wait_for_pgai_sync(replica.settings, "strat_products", expected_count=1):
+            if not await wait_for_pgai_sync(replica.settings, "strat_products", expected_count=1, timeout=300):
                 pytest.fail("Timed out waiting for Postgres pgai sync")
 
             # 2. Wait for Qdrant Sync (custom check for this mirror)

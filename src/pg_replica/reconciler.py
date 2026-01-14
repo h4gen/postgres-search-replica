@@ -71,6 +71,7 @@ class Inspector:
             "views": set(),
             "view_targets": {},  # Map: config_name -> current_view_target
             "extensions": set(),
+            "schemas": set(),
             "replica_states": {}, # Map: config_name -> replica_state
             "vectorizers": {},
             "vectorizer_statuses": {},
@@ -80,6 +81,10 @@ class Inspector:
                 # 1. Extensions
                 await cur.execute("SELECT extname FROM pg_extension")
                 state["extensions"] = {r[0] for r in await cur.fetchall()}
+
+                # 1.5 Schemas
+                await cur.execute("SELECT schema_name FROM information_schema.schemata")
+                state["schemas"] = {r[0] for r in await cur.fetchall()}
 
                 # 2. Tables & Columns
                 await cur.execute(
@@ -188,7 +193,8 @@ class Inspector:
                     state["mirror_progress"] = {(r[0], r[1]): r[2] for r in await cur.fetchall()}
 
                 # 5. Vectorizers
-                if "ai" in state["extensions"]:
+                # Check extension OR schema (pgai python installer might just create schema)
+                if "ai" in state["extensions"] or "ai" in state["schemas"]:
                     await cur.execute(
                         """
                         SELECT 
@@ -204,11 +210,16 @@ class Inspector:
                         clean_src = src.split(".")[-1]
                         if clean_src not in state["vectorizers"]:
                             state["vectorizers"][clean_src] = []
+                        
+                        # Normalize target/view names (strip public. if present)
+                        clean_target = target.split(".")[-1] if target else None
+                        clean_view = view.split(".")[-1] if view else None
+                        
                         state["vectorizers"][clean_src].append(
                             {
                                 "id": vid,
-                                "target_table": target,
-                                "view_name": view,
+                                "target_table": clean_target,
+                                "view_name": clean_view,
                                 "name": v_name,
                             }
                         )
